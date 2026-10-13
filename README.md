@@ -53,8 +53,8 @@ microSD / postmarketOS half is untouched.
 | Userspace | Arch Linux ARM aarch64, systemd, 0 failed units, root grown to 53 G on `USERDATA` |
 | Boot | normal power-on → Arch; `reboot recovery` → TWRP; a panic or watchdog reset → TWRP |
 | Reached over | USB: `ssh alarm@172.16.42.1` (the host gets 172.16.42.2) and a serial console on `/dev/ttyACM0` |
-| Works | all 8 cores with frequency scaling (M3 to 2704 MHz, thermal capped), UFS, USB gadget (NCM + ACM), **GPU: Mesa 26.2 Panfrost on Mali-G72 MC18, GLES 3.1, glmark2 570**, **DECON scanout 1440x2960**, touch (S6SY761), battery + charger (MAX17042 / MAX77705), **Wi-Fi (BCM4361)**, watchdog |
-| Still missing | audio, camera, modem, Bluetooth, suspend (the M3 cores do not come back), Wi-Fi needs its password set once |
+| Works | all 8 cores with frequency scaling (M3 to 2704 MHz, thermal capped), UFS, USB gadget (NCM + ACM), **GPU: Mesa 26.2 Panfrost on Mali-G72 MC18, GLES 3.1, glmark2 570**, **DECON scanout 1440x2960**, touch (S6SY761), battery + charger (MAX17042 / MAX77705), **Wi-Fi (BCM4361), joined from Settings**, watchdog, **sound: speaker and DSP (ztOSCirrusAudio)**, **mobile network: 4G data, SMS, placing and answering calls (ztOSCoreNetworking)**, sensors (ztOSCoreSensorFramework), notification light, vibration, core power-down |
+| Still missing | camera, Bluetooth, the sound of calls (a call connects, but its audio is not routed yet), suspend (the M3 cores do not come back) |
 
 Login: `alarm` / `alarm`, root password `root` (Arch Linux ARM defaults,
 unchanged — change them). `sudo` is installed. An SSH key is in place for both
