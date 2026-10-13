@@ -5,6 +5,10 @@ look and motion) on Arch Linux ARM and mainline Linux, with its own apps, an
 updater and an SDK for apps in Python and Qt. It runs on the Samsung Galaxy
 S9 (starlte) and in the QEMU emulator.
 
+> This ROM is in very much Alpha, The installer is not tested on real hardware, open a issue in this github repo if you have any issues with it
+
+>Your warranty is now void. I am not responsible for bricked devices, dead SD cards, thermonuclear war, or you getting fired because the alarm app failed. Please do some research if you have any concerns about features included in this ROM before flashing it! YOU are choosing to make these modifications, and if you point the finger at me for messing up your device, I will laugh at you.
+
 **To install it:** `installer/ztos` (see [installer/README.md](installer/README.md)).
 
 ## What is where
@@ -34,6 +38,66 @@ S9 (starlte) and in the QEMU emulator.
 | ztos-update | the updater, with the Updates app |
 
 ---
+
+## Status
+
+Samsung Galaxy S9 (SM-G960N, `starlte`, Exynos 9810), mainline Linux 7.1. In
+the style of postmarketOS's device pages: what was tried on the phone itself
+(*tested*) and what is written but not yet exercised with real use (*untested*).
+
+**Works**: tried, and does what it should. **Partial**: some of it works; the
+notes say what. **Broken**: tried, does not work. **Not started**: nothing yet.
+
+### Hardware
+
+| Category | Feature | Status | Notes |
+|---|---|---|---|
+| Boot | Booting from internal storage (UFS) | Works | Falls back to TWRP by itself after a crash or watchdog reset |
+| Boot | Charging while off | Partial | Off with a charger in, it stays in a minimal start until the battery reaches 10 %; written, and not yet tried from below 10 % |
+| Display | Panel, 1440x2960 | Works | DECON scanout |
+| Display | Brightness | Works | Manual, and automatic from the light sensor |
+| Display | Colour tone | Partial | The shell sets the screen's colour temperature; following the room's light (OpenTone, in `third_party/AutoBrightnessLinux`) is written, and untested |
+| Input | Touchscreen | Works | S6SY761, multi-touch |
+| Input | Power and volume keys | Works | Screen off and on; volume steps with the on-screen indicator |
+| Input | Vibration | Works | Strength per kind of touch, set in Settings > haptics |
+| Input | Notification light | Works | Charging, charged, low battery (breathing), rapid boost (white blink) |
+| 3D | GPU | Works | Mali-G72 MC18 through Panfrost, OpenGL ES 3.1 |
+| CPU | All 8 cores, frequency scaling | Works | The big cores are powered down when idle and brought back on demand (zrnperfd) |
+| CPU | Suspend | Broken | The M3 cores do not come back; idle power-down (`zrn-cpuidle`) is an opt-in experiment |
+| Power | Battery and charger | Works | MAX17042 gauge, MAX77705 charger |
+| Network | Wi-Fi | Works | BCM4361; join, forget, details and per-network signal in Settings |
+| Network | Bluetooth | Not started | |
+| Network | Mobile data (4G) | Works | Samsung IPC through ztOSCoreNetworking; access point set in Settings |
+| Network | USB networking to a computer | Works | 172.16.42.1 (the computer gets 172.16.42.2), plus a serial console |
+| Modem | SIM, registration, signal | Works | The modem runs exactly as stock does; EFS (IMEI, calibration) is never altered |
+| Modem | SMS | Partial | Sending works; receiving is written and untested with a real message |
+| Modem | Calls | Partial | Placing and answering connect; the call's sound is not routed, so nobody is heard |
+| Audio | Speaker | Works | The audio DSP and the Cirrus amplifiers, through ztOSCirrusAudio |
+| Audio | Microphone, headphones | Not started | |
+| Sensors | Ambient light | Works | Through the sensor hub (ztOSCoreSensorFramework) |
+| Sensors | Motion (accelerometer, gyroscope) | Partial | Readable in ZrnDevTest; nothing in the shell uses it yet |
+| Camera | Cameras | Not started | |
+| Location | GPS | Not started | |
+| Other | NFC, fingerprint, Bixby key | Not started | |
+
+### Software
+
+| Category | Feature | Status | Notes |
+|---|---|---|---|
+| Shell | ztMETRO: Start, tiles, app list, search, lock screen | Works | Windows Phone 8.1's look and motion, measured against reference video |
+| Shell | App switcher, action centre | Works | |
+| Shell | On-screen keyboard | Partial | Works; the new behaviour (it lies over the app and lifts it so the text box stays in sight, instead of resizing the app) is written and not yet seen working |
+| Shell | Notifications, media banner | Works | A freedesktop notification service, plus a push client (ntfy) |
+| Shell | Haptics | Works | |
+| Power | Dynamic boost | Works | Efficiency cores only until the app in front needs more; then big cores, then everything |
+| Apps | Settings | Works | Wi-Fi, mobile, haptics, quick actions, theme and more |
+| Apps | Phone, Messaging, People | Works | In the same style as Settings |
+| Apps | ZrnDevTest | Works | What the hardware reports |
+| Apps | Firefox, Chromium, terminal | Works | Ordinary Linux apps, shown by ztMETRO as windows |
+| System | Updates | Works | A daily check, a notification, and an Updates app (tested in the emulator) |
+| System | Installer (`installer/ztos`) | Partial | The QEMU path builds, installs and boots; the phone path is written and untested |
+| SDK | ztOS SDK (apps in Python and Qt) | Works | Build, install, run, logs, uninstall from the app list; first start is slower than the native apps' |
+| Emulator | ztOS in QEMU | Partial | Boots and runs; slow, because the phone is fully emulated |
 
 ## The phone port: mainline Arch Linux ARM on a Galaxy S9
 
