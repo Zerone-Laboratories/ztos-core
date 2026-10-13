@@ -11,6 +11,22 @@ S9 (starlte) and in the QEMU emulator.
 
 **To install it:** `installer/ztos` (see [installer/README.md](installer/README.md)).
 
+**Jump to:** [Screenshots](#screenshots) · [Status: what works](#status) · [**Known quirks**](#known-quirks) (read before flashing) · [What is where](#what-is-where) · [The SDK](sdk/README.md)
+
+## Screenshots
+
+From a Galaxy S9 running ztOS (taken from the live display with `scripts/phone-grab.sh`).
+
+<table>
+<tr>
+<td align="center"><img src="docs/screenshots/start.png" width="230"><br><b>Start</b></td>
+<td align="center"><img src="docs/screenshots/app-list.png" width="230"><br><b>App list</b></td>
+<td align="center"><img src="docs/screenshots/networking.png" width="230"><br><b>Cellular + SIM</b></td>
+<td align="center"><img src="docs/screenshots/sensors.png" width="230"><br><b>Sensors</b> (ZrnDevTest)</td>
+<td align="center"><img src="docs/screenshots/about.png" width="230"><br><b>About</b></td>
+</tr>
+</table>
+
 ## What is where
 
 | | |
@@ -98,6 +114,75 @@ notes say what. **Broken**: tried, does not work. **Not started**: nothing yet.
 | System | Installer (`installer/ztos`) | Partial | The QEMU path builds, installs and boots; the phone path is written and untested |
 | SDK | ztOS SDK (apps in Python and Qt) | Works | Build, install, run, logs, uninstall from the app list; first start is slower than the native apps' |
 | Emulator | ztOS in QEMU | Partial | Boots and runs; slow, because the phone is fully emulated |
+
+## Known quirks
+
+Things that can go wrong on the phone, and what to do. Some are unfinished
+engineering, some are the price of running Samsung's own firmware.
+
+**1. The modem or the sensor hub does not come up, or goes offline.** The
+signs: no signal and no registration under Settings > cellular + SIM, and no
+data, SMS or calls (modem); the light sensor reads nothing, automatic
+brightness stops and ZrnDevTest's sensors page is empty (sensor hub). It
+tends to follow a forced reboot (Power + Volume Down) or a crash. What brings
+them back is **one pass through TWRP**: reboot into recovery, then back into
+ztOS.
+
+    systemctl reboot --reboot-argument=recovery     # or hold Volume Up + Bixby + Power
+    adb shell reboot                                # once TWRP is up
+
+Samsung's own kernel in TWRP powers the hub's supply and sets up its pins at
+boot, which ours does not yet do (the details and the register dump to compare
+are in [sensors/README.md](sensors/README.md)). Try a service restart first
+(`ztoscsf-sensorhub`, or `ztoscorenetworking-modem`; the networking daemon
+follows it). Restarting only the daemon leaves the modem deaf until the modem
+service is restarted too. (A phone installed before the component names were
+settled has them as `zrn-sensorhub`, `zrn-modem` and `zrn-modemd`;
+`scripts/dev/migrate-names.sh` moves it over.)
+
+**2. A driver that crashed while loading is not loaded again at the next
+boot.** This stops a crash from becoming a boot loop. The modem, the sensor hub
+and sound each leave a mark file while their driver loads
+(`/var/lib/ztoscorenetworking/modem-loading`, `/var/lib/ztoscsf-sensorhub/loading`,
+`/var/lib/ztoscirrusaudio/loading`); if it is still there at the next boot, the
+driver is skipped. Remove the mark and reboot to try again.
+
+**3. Do not `rmmod` a driver module to try a new build: reboot instead.** A
+failed unload has left the phone unable to shut down.
+
+**4. Powering down cores needs `zrn-hotplug.ko`.** Without it, a core taken
+offline on this kernel does not come back. zrnperfd only touches cores when
+the module is loaded, and never takes the last core of a cluster offline.
+
+**5. There is no suspend.** The big cores do not wake from it, so with the
+screen off the phone runs at its lowest clocks instead. Idle battery use is
+higher than Android's.
+
+**6. The clock resets at every boot** until the phone gets the time from the
+network. Offline, the lock screen can show an old date, and anything built on
+the phone needs `date -s` first.
+
+**7. ztOS needs the stock Android partitions to stay on the phone.** The
+modem's boot daemon (`cbd`) and the sensor hub's daemon (`lhd`) are Samsung's
+own Android programs, run from a read-only root assembled from the phone's
+SYSTEM and VENDOR partitions (`zrn-android-root`). The installer writes only BOOT
+and USERDATA; do not wipe the others. The EFS partitions (IMEI, calibration)
+are never touched.
+
+**8. Calls connect, but nobody is heard.** The call's audio is not routed yet.
+
+**9. Automatic brightness and the slider fight.** While automatic brightness is
+on, the Settings slider and the action centre tile move the screen only until
+the light in the room next changes.
+
+**10. An SDK app's first start is slower than a native app's.** It loads Qt for
+Python (about a second more); the warm runtime that removes most of that is
+started by the first SDK app after boot.
+
+**11. The emulator is slow, and its screen is black for the first minutes.** The
+whole phone is emulated on your computer's CPU. It draws with software OpenGL by
+default; `ztos emulator --gl` uses your GPU, but some drivers (NVIDIA, on laptops
+with two GPUs) make QEMU stop with `eglMakeCurrent failed: EGL_BAD_ACCESS`.
 
 ## The phone port: mainline Arch Linux ARM on a Galaxy S9
 

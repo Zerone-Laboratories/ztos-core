@@ -13,7 +13,7 @@ RAW=$(mktemp "$ROOT/build/grab.XXXXXX")
 trap 'rm -f "$RAW"' EXIT
 timeout 60 socat -u TCP-LISTEN:5576,bind=172.16.42.2,reuseaddr "OPEN:$RAW,creat,trunc" &
 sleep 1
-timeout 50 "$ROOT/scripts/ssh-pw.py" alarm alarm,root 172.16.42.1 \
+timeout 50 "$ROOT/scripts/ssh-pw.py" alarm "${ZT_PW:-alarm},root" 172.16.42.1 \
 	"su -c 'python3 /root/fbgrab.py 0 2>/dev/null'" >/dev/null
 wait || true
 [ "$(stat -c %s "$RAW")" = 17049600 ] || { echo "incomplete grab" >&2; exit 1; }
