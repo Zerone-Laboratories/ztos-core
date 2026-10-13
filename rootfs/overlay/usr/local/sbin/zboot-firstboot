@@ -1,0 +1,6 @@
+#!/bin/sh
+# Runs once: everything the image build could not do without running target code.
+dev=$(findmnt -no SOURCE /)
+resize2fs "$dev"
+pacman-key --init && pacman-key --populate archlinuxarm
+rm -f /etc/zboot-firstboot

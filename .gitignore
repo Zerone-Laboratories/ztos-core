@@ -1,0 +1,41 @@
+# Never in the repository
+# the phone's stock firmware and EFS backups (IMEI, calibration)
+stock/
+.claude/
+
+# Builds, inputs and outputs (made again by the scripts and the installer)
+build/
+out/
+dist/
+# bring-up recordings, screenshots and logs (see archive/MANIFEST.txt)
+archive/
+third_party/vendor-kernel/
+
+# Compiler output
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+*.cmd
+Module.symvers
+modules.order
+__pycache__/
+*.pyc
+
+# ztMETRO binaries (built by its Makefile)
+ztmetro/ztmetro
+ztmetro/xdg-shell-protocol.h
+ztmetro/apps/ztapps
+ztmetro/settings/ztsettings
+ztmetro/devtest/zrndevtest
+ztmetro/perfd/zrnperfd
+ztmetro/sensord/ztoscsf-sensord
+ztmetro/modemd/ztoscorenetworkingd
+ztmetro/csf/ztoscsf
+ztmetro/notifyd/ztnotifyd
+ztmetro/phone/ztphone
+ztmetro/messages/ztmessages
+ztmetro/contacts/ztcontacts
+ztmetro/core/*-protocol.c
+ztmetro/core/*-client-protocol.h

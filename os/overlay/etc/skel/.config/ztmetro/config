@@ -1,0 +1,6 @@
+# ztMETRO configuration, written by ztsettings
+accent = cobalt
+columns = 3
+haptics = on
+timeout = 120
+lock = on
