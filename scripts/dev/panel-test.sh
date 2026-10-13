@@ -8,6 +8,6 @@ printf 'brightness 100\n' > $C
 printf 'screen off\n' > $C; sleep 2
 python3 /tmp/zrn/dsim.py down; echo "down: $?"
 sleep 4
-python3 /tmp/zrn/dsim.py up; echo "up: $?"
+python3 /tmp/zrn/dsim.py ${1:-up}; echo "up ${1:-up}: $?"
 printf 'screen on\n' > $C
 echo done
