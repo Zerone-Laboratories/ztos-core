@@ -120,6 +120,7 @@ struct zmc_state {
 	int anim_frames;
 	bool anim_active;
 	bool anim_cache_ready;	/* destination page already rendered for GLES */
+	bool anim_prepared;	/* the destination was drawn ahead, while idle */
 	bool anim_target_pending;	/* prepare it in the black gap after the outgoing rows */
 	bool anim_back;		/* going back or closing: the old page turns away */
 	bool entrance;		/* the app's first page arriving: it also glides in */

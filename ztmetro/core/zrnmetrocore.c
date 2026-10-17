@@ -332,22 +332,34 @@ void zmc_add_hit(double x, double y, double w, double h, int action, int arg) {
  * entry 108 points down. A pivot's title is followed by the next one in grey,
  * running off the edge.
  */
+/* How wide a pivot title is, set in the title face. */
+static int pivot_title_width(cairo_t *cr, const char *text) {
+	PangoLayout *layout = steady_layout(cr);
+	PangoFontDescription *desc = pango_font_description_from_string(FONT_SEMILIGHT);
+	pango_font_description_set_absolute_size(desc, 48 * PANGO_SCALE);
+	pango_layout_set_font_description(layout, desc);
+	pango_layout_set_text(layout, text, -1);
+	int w, h;
+	pango_layout_get_pixel_size(layout, &w, &h);
+	pango_font_description_free(desc);
+	g_object_unref(layout);
+	return w;
+}
+
 double zmc_pivot_next(cairo_t *cr, const char *title, const char *next, int action, int arg) {
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text(cr, zmc.app->caps, FONT_SEMIBOLD, 11.5, MARGIN, 14, 0);
 	zmc_text(cr, title, FONT_SEMILIGHT, 48, MARGIN - 3, 24, 0);
 	if (next) {
-		PangoLayout *layout = steady_layout(cr);
-		PangoFontDescription *desc = pango_font_description_from_string(FONT_SEMILIGHT);
-		pango_font_description_set_absolute_size(desc, 48 * PANGO_SCALE);
-		pango_layout_set_font_description(layout, desc);
-		pango_layout_set_text(layout, title, -1);
-		int w, h;
-		pango_layout_get_pixel_size(layout, &w, &h);
-		pango_font_description_free(desc);
-		g_object_unref(layout);
+		int w = pivot_title_width(cr, title);
 		cairo_set_source_rgb(cr, 0.38, 0.38, 0.38);
 		zmc_text(cr, next, FONT_SEMILIGHT, 48, MARGIN - 3 + w + 16, 24, 0);
+		/* The tabs go round: after the next title comes this one again, as it
+		 * does while the tabs move. Drawn at rest too, or two short titles
+		 * show a third one that was not there a moment ago, popping in at the
+		 * edge as soon as a finger moves them. */
+		zmc_text(cr, title, FONT_SEMILIGHT, 48,
+			MARGIN - 3 + w + 16 + pivot_title_width(cr, next) + 16, 24, 0);
 		if (action) {
 			/* the next tab, to its right edge of the screen: before the
 			 * title's own hit, which would otherwise take the tap. It
@@ -754,6 +766,8 @@ static void cache_ensure(int scale) {
 	cache_gen++;
 }
 
+static void back_forget(void);
+
 /* Something on the page changed. */
 void zmc_scroll_end(void) {
 	scroll_to_end = true;
@@ -762,6 +776,7 @@ void zmc_scroll_end(void) {
 
 void zmc_redraw(void) {
 	zmc.cache_stale = true;
+	back_forget();
 	if (!zmc.slide_active && !zmc.swiping && !zmc.spring) {
 		pivot_forget();	/* drawn again when idle */
 	}
@@ -998,6 +1013,36 @@ static bool pivot_wants_prepare(void) {
 	return zmc.pivot_set && zmc.configured && !zmc.touching && !zmc.anim_active && !zmc.fling &&
 		!zmc.slide_active && !zmc.spring && !zmc.swiping &&
 		(!zmc.piv_ready || zmc.piv_scroll != zmc.scroll);
+}
+
+/* The page a forward turn left, drawn again while the new page is idle, and
+ * its texture uploaded, so that turning back starts at once instead of
+ * drawing the page in the middle of the turn. Drawn again whenever the page in
+ * front changes anything, since that may show on the page behind it too. */
+static cairo_surface_t *back_surface;
+static struct zmc_rowset back_rows;
+static int back_page = -1;
+
+static void back_forget(void) {
+	if (back_surface) {
+		cairo_surface_destroy(back_surface);
+		back_surface = NULL;
+	}
+}
+
+static bool back_wants_prepare(void) {
+	return back_page >= 0 && !back_surface && zmg_ready() && zmc.configured &&
+		zmc.page != back_page && !zmc.touching && !zmc.anim_active && !zmc.fling &&
+		!zmc.slide_active && !zmc.spring && !zmc.swiping;
+}
+
+static void back_prepare(void) {
+	double next_dx;
+	back_surface = pivot_snapshot(back_page, 0, ANIM_SCALE, &back_rows, &next_dx);
+	for (int i = 0; i < back_rows.n; i++) {
+		back_rows.rows[i].order = back_rows.n - 1 - back_rows.rows[i].order;	/* it will turn back */
+	}
+	zmg_prepare(back_surface, 0);
 }
 
 /* A band of `src` (heights y0..y1 on the screen, points), only between
@@ -1281,6 +1326,13 @@ static void present_gpu(uint32_t ms) {
 }
 
 static void gpu_prepare_destination(int target) {
+	if (zmc.anim_prepared) {
+		zmc.anim_prepared = false;
+		zmc.anim_target_pending = false;
+		back_page = -1;
+		back_forget();
+		return;
+	}
 	int previous = zmc.page;
 	/* An unscrolled outgoing page can keep its texture without a snapshot
 	 * copy. Give the destination a separate image before drawing into it. */
@@ -1519,9 +1571,14 @@ static void begin_animation(bool have_from, bool have_to, int target, double tap
 	zmc.anim_from_surface = zmc.anim_to_surface = NULL;
 	zmc.anim_cache_ready = false;
 	zmc.anim_target_pending = false;
+	zmc.anim_prepared = false;
 	bool back = zmc.anim_dir < 0;
 	zmc.anim_back = back || zmc.quit_after_anim;
 	zmc.fling = false;
+	if (have_from && have_to && !back && !zmc.quit_after_anim) {
+		back_forget();
+		back_page = zmc.page;	/* drawn again at idle, for the way back */
+	}
 	if (have_from) {
 		/* the page in front is drawn already: shrunk, not drawn again (its
 		 * hits, which the rows come from, are the drawing's own) */
@@ -1536,7 +1593,13 @@ static void begin_animation(bool have_from, bool have_to, int target, double tap
 	}
 	if (have_to) {
 		zmc.scroll = 0;
-		if (zmg_ready() && have_from) {
+		if (zmg_ready() && have_from && back_surface && back_page == target && zmc.anim_back) {
+			/* drawn ahead while the page in front was idle */
+			zmc.anim_to_surface = cairo_surface_reference(back_surface);
+			zmc.in_rows = back_rows;
+			zmc.anim_target_pending = true;
+			zmc.anim_prepared = true;
+		} else if (zmg_ready() && have_from) {
 			zmc.anim_target_pending = true;
 			zmc.in_rows.n = 0;
 		} else if (zmg_ready()) {
@@ -2583,7 +2646,7 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 			}
 		}
 		/* a finger resting on something: a hold, when it has rested long enough */
-		int wait = pivot_wants_prepare() ? 150 : -1;
+		int wait = pivot_wants_prepare() || back_wants_prepare() ? 150 : -1;
 		if (zmc.entrance && zmc.anim_active && !zmc.frame) {
 			int32_t left = (int32_t)(zmc.anim_start - now_ms());
 			if (left > 0 && (wait < 0 || left < wait)) {
@@ -2622,6 +2685,11 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 		if (ready == 0 && pivot_wants_prepare()) {
 			wl_display_cancel_read(zmc.display);
 			pivot_prepare();
+			continue;
+		}
+		if (ready == 0 && back_wants_prepare()) {
+			wl_display_cancel_read(zmc.display);
+			back_prepare();
 			continue;
 		}
 		if (ready < 0 && errno != EINTR) {
