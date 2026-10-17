@@ -450,7 +450,7 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
       <div class="body">
         <p>ztConflo takes a phone's codename and builds a flashable ztOS image for it: Arch Linux ARM with ztMETRO, on a kernel and boot setup that postmarketOS already boots. It looks in the ztOS device registry first and falls back to postmarketOS for phones nobody has ported ztOS to yet. It never ports new hardware.</p>
         <dl class="rules">
-          <div><dt>Eligible phones</dt><dd>64 today, with a mainline aarch64 kernel; Snapdragon phones lead.</dd></div>
+          <div><dt>Eligible phones</dt><dd>135 today, with a mainline aarch64 kernel; 71 of them archived by postmarketOS, and flagged.</dd></div>
           <div><dt>GPU check</dt><dd>Phones without a Mesa GPU driver still build, with a warning that ztMETRO won't start.</dd></div>
           <div><dt>Registry</dt><dd>One TOML file per phone; a phone moves from untested to boots to tested through a hardware checklist.</dd></div>
           <div><dt>Interface</dt><dd>A command line and a terminal UI in ztOS's own look, which installs its tools on first run.</dd></div>
