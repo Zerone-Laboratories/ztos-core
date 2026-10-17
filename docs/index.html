@@ -395,22 +395,23 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
           <b>This erases the phone</b>
           Android and the phone's user data are replaced. The phone's identity (IMEI and modem calibration, in the EFS partitions) is never touched. Read the <a href="#quirks">known quirks</a> below first.
         </div>
-        <p><code>installer/ztos</code> builds ztOS on a Linux computer and installs it. It offers three ways:</p>
+        <p><code>installer/ztos</code> builds ztOS on a Linux computer and installs it. Its menu offers:</p>
         <ol class="prose">
-          <li>Download the prebuilt image from GitHub Releases and install it. The fastest; the login is <code>zerone</code> / <code>toor</code>.</li>
           <li>Build the image on this computer and install it, with your own user name and password.</li>
-          <li>Build the image and keep it, without flashing.</li>
+          <li>Build the image and keep it, without installing.</li>
+          <li>Restart a phone that is stuck in ztOS Rescue.</li>
         </ol>
-<pre>installer/ztos install --target qemu      <span class="c"># try it in a phone-shaped window</span>
+        <p>A prebuilt image from GitHub Releases can be installed instead with <code>installer/ztos install --mode download</code>. Its login is <code>zerone</code> / <code>toor</code>.</p>
+        <pre>installer/ztos install --target qemu      <span class="c"># try it in a phone-shaped window</span>
 installer/ztos guide                     <span class="c"># read this first</span>
 installer/ztos install --target starlte   <span class="c"># the Galaxy S9, from TWRP</span></pre>
         <p><b>Step by step</b></p>
         <ol class="steps">
           <li><div><b>Unlock and put TWRP in RECOVERY</b><span>OEM unlocking in Android's developer options, then TWRP for starlte from download mode.</span></div></li>
-          <li><div><b>Back up what you want to keep</b><span>The install replaces everything on USERDATA.</span></div></li>
+          <li><div><b>Back up what you want to keep</b><span>The install replaces everything on USERDATA. Charge the phone above 50%, and have adb (android-tools) and a USB cable ready.</span></div></li>
           <li><div><b>Start TWRP and connect the phone</b><span>Volume Up, Bixby and Power; <code>adb devices</code> shows it as recovery.</span></div></li>
           <li><div><b>Run the installer</b><span>It asks before writing BOOT and reads it back, then asks you to type ERASE before writing the system in checked 256 MiB pieces. A pulled cable just means running it again.</span></div></li>
-          <li><div><b>First start</b><span>About a minute while the system grows to fill the storage, then the Welcome app shows how ztOS is used.</span></div></li>
+          <li><div><b>Restart and first start</b><span>Hold Power, Volume Up and Volume Down to restart the phone when the installer says so. The first start takes about a minute while the system grows to fill the storage, then the Welcome app shows how ztOS is used.</span></div></li>
         </ol>
         <p>A build needs about 15 GB free and an internet connection, and never needs <code>sudo</code>: it runs in a user namespace, with ARM programs through qemu-user. It takes 30 to 60 minutes.</p>
 
