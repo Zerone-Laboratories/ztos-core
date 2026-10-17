@@ -232,7 +232,6 @@
     <ul id="toc">
       <li><a href="#overview">Overview</a></li>
       <li><a href="#screens">Screenshots</a></li>
-      <li><a href="#install">Installing</a></li>
       <li><a href="#ztmetro">ztMETRO</a></li>
       <li><a href="#apps">Apps</a></li>
       <li><a href="#sdk">The SDK</a></li>
@@ -240,6 +239,7 @@
       <li>
         <a href="#s9">The Galaxy S9 port</a>
         <ul class="sub-nav">
+          <li><a href="#installing">Installing</a></li>
           <li><a href="#hardware">Hardware status</a></li>
           <li><a href="#quirks">Known quirks</a></li>
           <li><a href="#recovery">Getting back in</a></li>
@@ -269,7 +269,7 @@
         <p>ztOS is the ztMETRO shell, its own apps, an updater and an SDK for apps in Python and Qt, on an ordinary Arch Linux ARM system. It runs on the Samsung Galaxy S9 (SM-G960N, starlte) and in the QEMU emulator. Everything that moves is drawn by the GPU.</p>
         <p>It is alpha software. The S9 port runs a mainline 7.1 kernel with the phone's GPU, display, touch, Wi-Fi, 4G data, sound and sensors working. ztConflo, its image builder, is how it reaches other phones.</p>
         <div class="actions">
-          <a class="btn" href="#install">Install it</a>
+          <a class="btn" href="#installing">Install it</a>
           <a class="btn ghost" href="https://github.com/z3r0n3br4instorm/ztOS">View the source</a>
         </div>
       </div>
@@ -301,36 +301,6 @@
           <figure><img src="wiki/sensors.jpg" width="540" height="1110" alt="ZrnDevTest showing live sensor readings" loading="lazy"><figcaption>Sensors, in ZrnDevTest</figcaption></figure>
           <figure><img src="wiki/about.jpg" width="540" height="1110" alt="Settings, about: the device and ztOS version" loading="lazy"><figcaption>About</figcaption></figure>
         </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="section" id="install">
-    <div class="wrap">
-      <div><h2>Installing</h2><p class="sub">One installer, for the phone and the emulator.</p></div>
-      <div class="body">
-        <div class="alert" role="note">
-          <b>This erases the phone</b>
-          Android and the phone's user data are replaced. The phone's identity (IMEI and modem calibration, in the EFS partitions) is never touched. Read the <a href="#quirks">known quirks</a> first.
-        </div>
-        <p><code>installer/ztos</code> builds ztOS on a Linux computer and installs it. It offers three ways:</p>
-        <ol class="prose">
-          <li>Download the prebuilt image from GitHub Releases and install it. The fastest; the login is <code>zerone</code> / <code>toor</code>.</li>
-          <li>Build the image on this computer and install it, with your own user name and password.</li>
-          <li>Build the image and keep it, without flashing.</li>
-        </ol>
-<pre>installer/ztos install --target qemu      <span class="c"># try it in a phone-shaped window</span>
-installer/ztos guide                     <span class="c"># read this first</span>
-installer/ztos install --target starlte   <span class="c"># the Galaxy S9, from TWRP</span></pre>
-        <h3>On a Galaxy S9</h3>
-        <ol class="steps">
-          <li><div><b>Unlock and put TWRP in RECOVERY</b><span>OEM unlocking in Android's developer options, then TWRP for starlte from download mode.</span></div></li>
-          <li><div><b>Back up what you want to keep</b><span>The install replaces everything on USERDATA.</span></div></li>
-          <li><div><b>Start TWRP and connect the phone</b><span>Volume Up, Bixby and Power; <code>adb devices</code> shows it as recovery.</span></div></li>
-          <li><div><b>Run the installer</b><span>It asks before writing BOOT and reads it back, then asks you to type ERASE before writing the system in checked 256 MiB pieces. A pulled cable just means running it again.</span></div></li>
-          <li><div><b>First start</b><span>About a minute while the system grows to fill the storage, then the Welcome app shows how ztOS is used.</span></div></li>
-        </ol>
-        <p>A build needs about 15 GB free and an internet connection, and never needs <code>sudo</code>: it runs in a user namespace, with ARM programs through qemu-user. It takes 30 to 60 minutes.</p>
       </div>
     </div>
   </section>
@@ -419,6 +389,30 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
       <div><h2>The Galaxy S9 port</h2><p class="sub">Mainline Linux on an Exynos 9810.</p></div>
       <div class="body">
         <p>ztOS's first phone is the Galaxy S9, SM-G960N (starlte). It runs mainline Linux 7.1 with the Exynos 9810 drivers, booting from the phone's internal storage, with Arch on BOOT and TWRP left in RECOVERY. The phone's hardware support is built as loadable kernel modules, so drivers can be developed without reflashing. The modem and sensor hub still use Samsung's own Android daemons, run from the phone's stock partitions.</p>
+
+        <h3 id="installing">Installing</h3>
+        <div class="alert" role="note">
+          <b>This erases the phone</b>
+          Android and the phone's user data are replaced. The phone's identity (IMEI and modem calibration, in the EFS partitions) is never touched. Read the <a href="#quirks">known quirks</a> below first.
+        </div>
+        <p><code>installer/ztos</code> builds ztOS on a Linux computer and installs it. It offers three ways:</p>
+        <ol class="prose">
+          <li>Download the prebuilt image from GitHub Releases and install it. The fastest; the login is <code>zerone</code> / <code>toor</code>.</li>
+          <li>Build the image on this computer and install it, with your own user name and password.</li>
+          <li>Build the image and keep it, without flashing.</li>
+        </ol>
+<pre>installer/ztos install --target qemu      <span class="c"># try it in a phone-shaped window</span>
+installer/ztos guide                     <span class="c"># read this first</span>
+installer/ztos install --target starlte   <span class="c"># the Galaxy S9, from TWRP</span></pre>
+        <p><b>Step by step</b></p>
+        <ol class="steps">
+          <li><div><b>Unlock and put TWRP in RECOVERY</b><span>OEM unlocking in Android's developer options, then TWRP for starlte from download mode.</span></div></li>
+          <li><div><b>Back up what you want to keep</b><span>The install replaces everything on USERDATA.</span></div></li>
+          <li><div><b>Start TWRP and connect the phone</b><span>Volume Up, Bixby and Power; <code>adb devices</code> shows it as recovery.</span></div></li>
+          <li><div><b>Run the installer</b><span>It asks before writing BOOT and reads it back, then asks you to type ERASE before writing the system in checked 256 MiB pieces. A pulled cable just means running it again.</span></div></li>
+          <li><div><b>First start</b><span>About a minute while the system grows to fill the storage, then the Welcome app shows how ztOS is used.</span></div></li>
+        </ol>
+        <p>A build needs about 15 GB free and an internet connection, and never needs <code>sudo</code>: it runs in a user namespace, with ARM programs through qemu-user. It takes 30 to 60 minutes.</p>
 
         <h3 id="hardware">Hardware status</h3>
         <div class="table-scroll">
