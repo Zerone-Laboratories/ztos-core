@@ -7,7 +7,7 @@ CFLAGS ?= -O2 -g
 WARN = -std=c11 -Wall -Wno-unused-parameter
 
 all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
-	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts
+	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts splash/ztos-splash
 
 sounds/ztos-sounds: sounds/ztos-sounds.c
 	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags libpulse) -o $@ $< $(shell pkg-config --libs libpulse) -lm
@@ -84,7 +84,19 @@ core/viewporter-client-protocol.h:
 core/viewporter-protocol.c:
 	wayland-scanner private-code $(VIEWPORTER) $@
 
-install: all
+# A program built on another machine (a laptop's x86-64 build copied over with
+# the sources) looks up to date to make and would be installed as it is, and
+# then fails with "Exec format error". Refuse it: the built programs must be for
+# this machine.
+HOST_ELF := $(shell od -An -tx1 -j18 -N2 /bin/sh | tr -d ' \n')
+check-arch: all
+	@bad=0; for f in $$(find . -type f -perm -u+x ! -name '*.sh' ! -name '*.py' ! -path './.git/*'); do \
+		[ "$$(od -An -tc -j1 -N3 $$f 2>/dev/null | tr -d ' ')" = ELF ] || continue; \
+		m=$$(od -An -tx1 -j18 -N2 $$f | tr -d ' \n'); \
+		if [ "$$m" != "$(HOST_ELF)" ]; then echo "$$f: built for another machine; run make clean"; bad=1; fi; \
+	done; exit $$bad
+
+install: check-arch
 	install -Dm755 auth/ztos-polkit-agent /usr/local/bin/ztos-polkit-agent
 	install -Dm755 sounds/ztos-sounds /usr/local/bin/ztos-sounds
 	install -Dm755 ztmetro /usr/local/bin/ztmetro
@@ -111,11 +123,12 @@ install: all
 	install -Dm644 csf/ztoscoresensorframework.service /etc/systemd/system/ztoscoresensorframework.service
 
 clean:
-	rm -f auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf \
+	rm -f auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf notifyd/ztnotifyd splash/ztos-splash \
+		phone/ztphone messages/ztmessages contacts/ztcontacts core/viewporter-protocol.c core/viewporter-client-protocol.h \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c
 
 # Uses a private Wayland seat; does not touch the running compositor or display.
-.PHONY: check-keyboard
+.PHONY: check-arch check-keyboard
 check-keyboard: xdg-shell-protocol.h
 	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
 		-o /tmp/ztmetro-keyboard-test tests/keyboard-trackpad.c $(shell pkg-config --libs $(PKGS)) -lm
