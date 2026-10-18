@@ -1710,12 +1710,20 @@ static double page_y(double y) {
 	return y < HEADER_H ? y : y + zmc.scroll;
 }
 
+static int32_t app_touch_id = -1;	/* a finger the app took (zmc_app.touch) */
+
 static void touch_down(void *data, struct wl_touch *touch, uint32_t serial, uint32_t time,
 		struct wl_surface *surface, int32_t id, wl_fixed_t x, wl_fixed_t y) {
 	if (zmc.anim_active && zmc.entrance && (int32_t)(now_ms() - zmc.anim_start) > ENTER_HOLD_MS) {
 		/* a finger does not wait for the page to finish gliding in */
 		zmc.anim_start = now_ms() - zmc.anim_total;
 		present();
+	}
+	/* the app's own territory: it takes the finger whole */
+	if (zmc.app->touch && !zmc.anim_active && !zmc.touching && app_touch_id < 0 &&
+			zmc.app->touch(0, id, wl_fixed_to_double(x), wl_fixed_to_double(y), time)) {
+		app_touch_id = id;
+		return;
 	}
 	bool caught = false;
 	if (zmc.slide_active && !zmc.touching && !zmc.anim_active) {
@@ -1782,6 +1790,11 @@ static void touch_down(void *data, struct wl_touch *touch, uint32_t serial, uint
 
 static void touch_up(void *data, struct wl_touch *touch, uint32_t serial, uint32_t time,
 		int32_t id) {
+	if (id == app_touch_id) {
+		app_touch_id = -1;
+		zmc.app->touch(2, id, 0, 0, time);
+		return;
+	}
 	if (!zmc.touching || zmc.touch_id != id) return;
 	zmc.touching = false;
 	hold_at = 0;
@@ -1809,6 +1822,9 @@ static void touch_up(void *data, struct wl_touch *touch, uint32_t serial, uint32
 		double target = -k * w;
 		pivot_go(target, vx);
 		return;
+	}
+	if (zmc.moved && zmc.app->fixed) {
+		return;		/* a fixed page: a drag was nothing */
 	}
 	if (zmc.moved) {
 		/* let go: carry on at the speed it had, unless the finger had stopped */
@@ -1851,6 +1867,10 @@ static int drag_axis(double dx, double dy) {
 
 static void touch_motion(void *data, struct wl_touch *touch, uint32_t time, int32_t id,
 		wl_fixed_t x, wl_fixed_t y) {
+	if (id == app_touch_id) {
+		zmc.app->touch(1, id, wl_fixed_to_double(x), wl_fixed_to_double(y), time);
+		return;
+	}
 	if (!zmc.touching || zmc.touch_id != id) return;
 	if (zmc.sliding) {
 		zmc.last_y = wl_fixed_to_double(x);	/* a slider keeps the x here */
@@ -1903,13 +1923,18 @@ static void touch_motion(void *data, struct wl_touch *touch, uint32_t time, int3
 	if (zmc.swiping) {
 		zmc.swipe_dx = zmc.swipe_grab + dx;
 		present();
-	} else if (zmc.moved && zmc.axis == 2) {
+	} else if (zmc.moved && zmc.axis == 2 && !zmc.app->fixed) {
 		set_scroll(zmc.down_scroll - dy);
 	}
 }
 
 static void touch_frame(void *data, struct wl_touch *touch) {}
 static void touch_cancel(void *data, struct wl_touch *touch) {
+	if (app_touch_id >= 0) {
+		int32_t id = app_touch_id;
+		app_touch_id = -1;
+		zmc.app->touch(3, id, 0, 0, 0);
+	}
 	zmc.touching = false;
 	if (zmc.press_to > 0) {
 		press_set(0);

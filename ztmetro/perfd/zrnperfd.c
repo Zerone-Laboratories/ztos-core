@@ -143,10 +143,17 @@ static void detect_topology(void) {
 			sscanf(g.gl_pathv[i], CPUFREQ "/policy%d", &pol);
 			if (pol < 0) { continue; }
 			char path[160];
-			snprintf(path, sizeof(path), "%s/affected_cpus", g.gl_pathv[i]);
 			int cpus[16];
+			/* related_cpus: every core of the cluster, online or not.
+			 * affected_cpus lists only the online ones, so a perfd started
+			 * while idle0 had parked cores never knew them and never brought
+			 * them back (the phone ran on cpu0-1 and one big core). */
+			snprintf(path, sizeof(path), "%s/related_cpus", g.gl_pathv[i]);
 			if (read_cpu_list(path, cpus, 16) == 0) {
-				cpus[0] = pol; cpus[1] = -1;
+				snprintf(path, sizeof(path), "%s/affected_cpus", g.gl_pathv[i]);
+				if (read_cpu_list(path, cpus, 16) == 0) {
+					cpus[0] = pol; cpus[1] = -1;
+				}
 			}
 			/* keep them ordered by first cpu, so [0] is the efficiency cluster */
 			int at = n_clusters;

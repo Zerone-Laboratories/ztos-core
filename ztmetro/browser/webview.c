@@ -12,6 +12,7 @@
  * content area is blank and the chrome is live.
  */
 #define _GNU_SOURCE
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wayland-client.h>
@@ -191,10 +192,75 @@ bool webview_can_go_forward(struct webview *wv) { return webkit_web_view_can_go_
 void webview_back(struct webview *wv) { webkit_web_view_go_back(wv->web); }
 void webview_forward(struct webview *wv) { webkit_web_view_go_forward(wv->web); }
 
-/* input: WPEView events. Wired once the content area composites (next step). */
-void webview_touch_down(struct webview *wv, int id, double x, double y) { (void)wv; (void)id; (void)x; (void)y; }
-void webview_touch_motion(struct webview *wv, int id, double x, double y) { (void)wv; (void)id; (void)x; (void)y; }
-void webview_touch_up(struct webview *wv, int id) { (void)wv; (void)id; }
+/* Input. WebKit only pans from raw touch when the view has a gesture
+ * controller, so the gesture is decided here: once the finger has moved past
+ * a few points it is a drag and turns into precise scroll deltas (lifted with
+ * an is_stop, from which WebKit coasts on); a lift that never moved is a tap
+ * and becomes a click at that point. Coordinates are CSS pixels (points). */
+#define TAP_SLOP 8.0
+
+static struct {
+	double down_x, down_y, last_x, last_y;
+	bool moved, active;
+} finger;
+
+static void send(struct webview *wv, WPEEvent *ev) {
+	if (ev) {
+		wpe_view_event(wv->view, ev);
+		wpe_event_unref(ev);
+	}
+}
+
+void webview_touch_down(struct webview *wv, int id, double x, double y, unsigned time) {
+	(void)id;
+	if (!wv || !wv->view) return;
+	finger.down_x = finger.last_x = x;
+	finger.down_y = finger.last_y = y;
+	finger.moved = false;
+	finger.active = true;
+	/* the pointer to where the finger is, so :hover and the click land there */
+	send(wv, wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, wv->view,
+		WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0, x, y, 0, 0));
+}
+
+void webview_touch_motion(struct webview *wv, int id, double x, double y, unsigned time) {
+	(void)id;
+	if (!wv || !wv->view || !finger.active) return;
+	if (!finger.moved && hypot(x - finger.down_x, y - finger.down_y) > TAP_SLOP) {
+		finger.moved = true;
+		finger.last_x = x;	/* scroll from here: no jump at the start */
+		finger.last_y = y;
+		return;
+	}
+	if (finger.moved) {
+		double dx = x - finger.last_x, dy = y - finger.last_y;
+		send(wv, wpe_event_scroll_new(wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0,
+			dx, dy, TRUE, FALSE, x, y));
+		finger.last_x = x;
+		finger.last_y = y;
+	}
+}
+
+void webview_touch_up(struct webview *wv, int id, unsigned time) {
+	(void)id;
+	if (!wv || !wv->view || !finger.active) return;
+	finger.active = false;
+	double x = finger.last_x, y = finger.last_y;
+	if (finger.moved) {
+		send(wv, wpe_event_scroll_new(wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0,
+			0, 0, TRUE, TRUE, x, y));
+		return;
+	}
+	send(wv, wpe_event_pointer_button_new(WPE_EVENT_POINTER_DOWN, wv->view,
+		WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0, WPE_BUTTON_PRIMARY, x, y, 1));
+	send(wv, wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, wv->view,
+		WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0, WPE_BUTTON_PRIMARY, x, y, 1));
+}
+
+void webview_touch_cancel(struct webview *wv) {
+	(void)wv;
+	finger.active = false;
+}
 void webview_key(struct webview *wv, const char *utf8) { (void)wv; (void)utf8; }
 void webview_scroll(struct webview *wv, double dx, double dy) { (void)wv; (void)dx; (void)dy; }
 

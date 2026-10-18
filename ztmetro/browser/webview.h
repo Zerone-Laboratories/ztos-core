@@ -47,9 +47,11 @@ void webview_back(struct webview *wv);
 void webview_forward(struct webview *wv);
 
 /* input in the content area, in points relative to the view's top-left */
-void webview_touch_down(struct webview *wv, int id, double x, double y);
-void webview_touch_motion(struct webview *wv, int id, double x, double y);
-void webview_touch_up(struct webview *wv, int id);
+/* a finger on the page: a drag scrolls it, a tap clicks; time in ms */
+void webview_touch_down(struct webview *wv, int id, double x, double y, unsigned time);
+void webview_touch_motion(struct webview *wv, int id, double x, double y, unsigned time);
+void webview_touch_up(struct webview *wv, int id, unsigned time);
+void webview_touch_cancel(struct webview *wv);
 void webview_key(struct webview *wv, const char *utf8);	/* a char, "\b" or "\n" */
 void webview_scroll(struct webview *wv, double dx, double dy);
 

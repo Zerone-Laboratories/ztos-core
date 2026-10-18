@@ -78,6 +78,13 @@ struct zmc_app {
 	 * after the page itself: moving things that must not redraw the page
 	 * (zmc_gpu_quad, zmc_gpu_rect; zmc_present asks for the next frame) */
 	void (*overlay)(int page);
+	/* A finger, raw, for an app with territory of its own (a web page, a
+	 * map): phase 0 down, 1 move, 2 up, 3 cancel; x, y in window points (0 on
+	 * the lift). Return true on down to own that touch: zmc then sends its
+	 * moves and lift here and does nothing else with it. */
+	bool (*touch)(int phase, int id, double x, double y, uint32_t time);
+	/* the page never scrolls or rubber-bands under a drag */
+	bool fixed;
 };
 
 struct zmc_buffer {
