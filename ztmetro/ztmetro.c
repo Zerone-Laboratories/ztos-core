@@ -2110,8 +2110,23 @@ static void *bl_thread(void *data) {
 	return NULL;
 }
 
+/*
+ * The panel is driven at four levels only (20, 40, 70, 100 %); the rest of the
+ * way down to the brightness wanted is done by darkening the picture on the
+ * GPU. Each level is the ceiling of its band, so the darkening only ever makes
+ * the panel dimmer, never brighter (it cannot brighten). A brightness changed
+ * within a band is all software: no hardware write, so no panel-command race.
+ * Only crossing a band boundary writes the panel.
+ */
+static int bl_band(int percent) {
+	if (percent > 70) return 100;
+	if (percent > 40) return 70;
+	if (percent > 20) return 40;
+	return 20;
+}
+
 static void bl_request(int percent) {
-	int raw = (int)lround((double)percent * bl.max / 100.0);
+	int raw = (int)lround((double)bl_band(percent) * bl.max / 100.0);
 	pthread_mutex_lock(&bl.lock);
 	bl.want_raw = raw < 1 ? 1 : raw;
 	pthread_cond_signal(&bl.wake);
@@ -2136,7 +2151,7 @@ static int bl_written(int fd, uint32_t mask, void *data) {
 }
 
 static int bl_settled(void *data) {
-	if (bl.target != bl.hw) {
+	if (bl_band(bl.target) != bl.hw) {
 		bl_request(bl.target);
 	}
 	return 0;
@@ -2206,12 +2221,13 @@ static void backlight_set(int percent) {
 	if (percent < 1) percent = 1;
 	if (percent > 100) percent = 100;
 	bl.target = percent;
-	if (percent > bl.hw) {
-		bl_request(percent);	/* brighter: only the panel can */
+	if (bl_band(percent) > bl.hw) {
+		bl_request(percent);	/* a higher band: only the panel can brighten */
 		wl_event_source_timer_update(bl.settle, 0);
-	} else {
+	} else if (bl_band(percent) < bl.hw) {
 		wl_event_source_timer_update(bl.settle, BL_SETTLE_MS);
 	}
+	/* same band: the darkening alone, no hardware write at all */
 	damage(bl.server);
 }
 
