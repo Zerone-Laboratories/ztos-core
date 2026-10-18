@@ -509,7 +509,7 @@ struct zt_server {
 		float y0, y1;		/* where it was last drawn in the panel */
 	} notes[MAX_NOTES];
 	int n_notes;
-	float toast_y;			/* 0 shown, -TOAST_H out of sight */
+	float toast_y;			/* 1 fully in, 0 out of sight (swivel progress) */
 	struct zt_layer toast_layer;
 	struct wl_event_source *toast_timer;
 	float page_rest;		/* the page last come to rest on */
@@ -1189,6 +1189,19 @@ static void layer_draw(struct zt_server *server, struct zt_layer *layer, float x
 	mat_translate(m, x, y);
 	mat_scale(m, layer->w, layer->h);
 	quad(server, GL_TEXTURE_2D, layer->tex, m, alpha, true, false,
+		(float)layer->pw / layer->tw, (float)layer->ph / layer->th);
+}
+
+/* A layer swung in about its top edge: the Windows Phone toast swivel
+ * (MessageToastShow, -45 deg about X to 0; the firmware's value). `t` is 0
+ * hidden, 1 fully in. */
+static void layer_draw_swivel(struct zt_server *server, struct zt_layer *layer, float t) {
+	float m[16], angle = -45.0f * (1.0f - (t < 0 ? 0 : t > 1 ? 1 : t));
+	mat_identity(m);
+	mat_translate(m, 0, 0);		/* the top edge, where it pivots */
+	mat_rotate_x(m, angle);
+	mat_scale(m, layer->w, layer->h);
+	quad(server, GL_TEXTURE_2D, layer->tex, m, t, true, false,
 		(float)layer->pw / layer->tw, (float)layer->ph / layer->th);
 }
 
@@ -7200,7 +7213,7 @@ static void draw_toast(struct zt_server *server) {
 
 static int toast_hide(void *data) {
 	struct zt_server *server = data;
-	animate(server, &server->toast_y, (float)-TOAST_H, 180, 0, false);
+	animate(server, &server->toast_y, 0.0f, 199, 0, false);  /* swivel out */
 	return 0;
 }
 
@@ -7220,7 +7233,7 @@ static void note_add(struct zt_server *server, const char *app, const char *titl
 		return;	/* no screen yet: it is in the list when there is one */
 	}
 	draw_toast(server);
-	animate(server, &server->toast_y, 0.0f, 160, 0, false);
+	animate(server, &server->toast_y, 1.0f, 300, 0, false);  /* swivel in */
 	wl_event_source_timer_update(server->toast_timer, TOAST_MS);
 	if (server->shade_open || server->shade_h > 0.1f) {
 		draw_shade(server);
@@ -7705,7 +7718,7 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		p->role = ROLE_NONE;
 		return;
 	}
-	if (server->toast_y > -TOAST_H / 2.0f && y < TOAST_H) {
+	if (server->toast_y > 0.5f && y < TOAST_H) {
 		/* a finger on a notification's banner puts it away */
 		wl_event_source_timer_update(server->toast_timer, 0);
 		toast_hide(server);
@@ -9428,8 +9441,8 @@ static void render_frame(struct zt_server *server) {
 	if (server->volume_y > 1.0f - (float)banner_h(server) && server->volume_layer.tex) {
 		layer_draw(server, &server->volume_layer, 0, server->volume_y, 1.0f);
 	}
-	if (server->toast_y > 1.0f - TOAST_H && server->toast_layer.tex) {
-		layer_draw(server, &server->toast_layer, 0, server->toast_y, 1.0f);
+	if (server->toast_y > 0.02f && server->toast_layer.tex) {
+		layer_draw_swivel(server, &server->toast_layer, server->toast_y);
 	}
 	if (server->dialog_y > 1.0f - (float)server->dialog_h && server->dialog_layer.tex) {
 		float t = (server->dialog_y + (float)server->dialog_h) / (float)server->dialog_h;
@@ -9918,7 +9931,7 @@ int main(int argc, char *argv[]) {
 	server.key_sound_fd = -1;
 	server.volume = 24;
 	server.volume_y = -(VOLUME_H + MEDIA_H + OUTPUT_H);
-	server.toast_y = -TOAST_H;
+	server.toast_y = 0.0f;
 	server.dialog_h = 240;
 	server.dialog_y = -240.0f;
 	server.drop_card = -1;
