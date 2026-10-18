@@ -7,6 +7,7 @@
  */
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <math.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -21,8 +22,8 @@
 #include "zrnmetrocore.h"
 
 enum page { PAGE_HUB, PAGE_SYSTEM, PAGE_SENSORS, PAGE_JOURNAL, PAGE_KERNEL, PAGE_SHELL, PAGE_HARDWARE,
-	PAGE_LOGS /* the hub's second tab */ };
-enum action { ACT_OPEN = 1 };
+	PAGE_LOGS /* the hub's second tab */, PAGE_ANIM, PAGE_PREVIEW };
+enum action { ACT_OPEN = 1, ACT_PLAY };
 
 #define MAX_LINES	70	/* of a log, newest first */
 #define LINE_LEN	240
@@ -129,6 +130,7 @@ static double draw_hub(cairo_t *cr) {
 	y = zmc_entry(cr, y, "system", "kernel, memory, storage, load", ACT_OPEN, PAGE_SYSTEM);
 	y = zmc_entry(cr, y, "sensors", "battery, charger, heat, clocks: live", ACT_OPEN, PAGE_SENSORS);
 	y = zmc_entry(cr, y, "hardware", "what this kernel drives, and what it does not", ACT_OPEN, PAGE_HARDWARE);
+	y = zmc_entry(cr, y, "animations", "Windows Phone 8.1's transitions, from the Lumia 530's firmware", ACT_OPEN, PAGE_ANIM);
 	return y + 20;
 }
 
@@ -329,6 +331,196 @@ static double draw_hardware(cairo_t *cr) {
 	return y + 10;
 }
 
+
+/* ------------------------------------------------------------ animations
+ *
+ * Windows Phone 8.1's standard transitions, with the values read out of a
+ * Lumia 530's firmware (UIXMobile!Animations.uix and the shell's own, in
+ * compiled Iris markup; see the notes in OpensourceResources/lumia530).
+ * Angles, durations, the feather and the scale are the firmware's; the
+ * curves are Iris's Exp/Log/SCurve rebuilt from their names and weights,
+ * which the firmware gives but whose exact formula lives in UIXrender.
+ *
+ * Played on a stage of four rows; each is drawn in Cairo into its own
+ * surface and projected in slices, as ZrnMetroCore turns its rows.
+ */
+
+enum curve { C_LINEAR, C_EXP, C_LOG, C_SCURVE };
+enum axis { AX_Y, AX_X, AX_Z };
+
+struct anim {
+	const char *name, *detail;
+	enum axis axis;
+	double from_deg, to_deg;	/* rotation */
+	double pivot;			/* along the turning edge: 0 left/top .. 1 right/bottom */
+	double from_scale, to_scale;
+	double from_dy, to_dy;		/* points, downward */
+	double from_alpha, to_alpha;
+	double ms, feather_ms;		/* each row, and between rows */
+	enum curve curve; double weight;
+	bool reverse_order;		/* the last row first */
+};
+
+static const struct anim anims[] = {
+	{ "turnstile forward in", "-80 to 0 about Y, rows 33 ms apart (TurnstileFeatherForwardIn)",
+	  AX_Y, -80, 0, 0, 1, 1, 0, 0, 1, 1, 350, 33, C_LOG, 60, false },
+	{ "turnstile forward out", "0 to 50 about Y, 128 ms, rows 33 ms apart (TurnstileFeatherForwardOut)",
+	  AX_Y, 0, 50, 0, 1, 1, 0, 0, 1, 0, 128, 33, C_EXP, 60, false },
+	{ "turnstile backward in", "50 to 0 about Y, the way back",
+	  AX_Y, 50, 0, 0, 1, 1, 0, 0, 1, 1, 350, 33, C_LOG, 60, true },
+	{ "turnstile backward out", "0 to -80 about Y, the way back",
+	  AX_Y, 0, -80, 0, 1, 1, 0, 0, 1, 0, 128, 33, C_EXP, 60, true },
+	{ "swivel in", "60 to 0 about X, Log 200: dialogs, menus, the status bar's list",
+	  AX_X, -60, 0, 0.5, 1, 1, 0, 0, 0, 1, 300, 0, C_LOG, 200, false },
+	{ "swivel out", "0 to 60 about X, 0.199 s: a dialog or a toast going",
+	  AX_X, 0, 60, 0.5, 1, 1, 0, 0, 1, 0, 199, 0, C_EXP, 60, false },
+	{ "continuum forward hide", "the tapped row tips back 80 and drops, Exp 60, 0.12 s",
+	  AX_X, 0, 80, 0, 1, 1, 0, 120, 1, 0, 120, 0, C_EXP, 60, false },
+	{ "continuum forward show", "-50 to 0 about X, scale 1.5 to 1, Log 60 (the next page's title)",
+	  AX_X, -50, 0, 0, 1.5, 1, -60, 0, 0, 1, 350, 0, C_LOG, 60, false },
+	{ "readerboard in", "-45 to 0 about X, 0.166 s per row, rows feathered",
+	  AX_X, -45, 0, 0, 1, 1, 0, 0, 0, 1, 166, 33, C_LOG, 60, false },
+	{ "readerboard out", "0 to 90 about X, 0.166 s per row, rows feathered",
+	  AX_X, 0, 90, 0, 1, 1, 0, 0, 1, 0, 166, 33, C_EXP, 60, false },
+	{ "slide up, fade in", "24 points up, Exp 150, 0.24 s (SlideUpFadeIn)",
+	  AX_Y, 0, 0, 0, 1, 1, 24, 0, 0, 1, 240, 0, C_LOG, 150, false },
+	{ "rotate 90", "90 about Z, 0.167 s (a page turned with the phone)",
+	  AX_Z, 90, 0, 0.5, 1, 1, 0, 0, 1, 1, 167, 0, C_SCURVE, 7.5, false },
+	{ "fade in", "alpha 0 to 1, Exp 150, 0.35 s",
+	  AX_Y, 0, 0, 0, 1, 1, 0, 0, 0, 1, 350, 0, C_LOG, 150, false },
+	{ "fade out", "alpha 1 to 0, Log 150, 0.15 s",
+	  AX_Y, 0, 0, 0, 1, 1, 0, 0, 1, 0, 150, 0, C_EXP, 150, false },
+};
+#define N_ANIMS (int)(sizeof(anims) / sizeof(anims[0]))
+#define STAGE_ROWS 4
+#define STAGE_ROW_H 46
+#define STAGE_GAP 8
+
+static int shown_anim = -1;	/* the one on the preview page */
+static uint32_t loop_start;
+#define HOLD_MS 700	/* at rest between two plays */
+
+/* Iris names: Exp gathers speed (things leaving), Log settles (arriving),
+ * SCurve both; the weight sets how hard. */
+static double shape(enum curve c, double w, double t) {
+	double k = w / 30.0;
+	switch (c) {
+	case C_EXP: return (exp(k * t) - 1) / (exp(k) - 1);
+	case C_LOG: return 1 - (exp(k * (1 - t)) - 1) / (exp(k) - 1);
+	case C_SCURVE: {
+		double f0 = 1 / (1 + exp(w / 2)), f1 = 1 / (1 + exp(-w / 2));
+		return (1 / (1 + exp(-w * (t - 0.5))) - f0) / (f1 - f0);
+	}
+	default: return t;
+	}
+}
+
+static double lerp(double a, double b, double t) { return a + (b - a) * t; }
+
+/* The four rows, drawn once at the screen's scale and kept as textures. */
+static cairo_surface_t *cards[STAGE_ROWS];
+static double card_w;
+
+static void cards_make(void) {
+	static const char *labels[STAGE_ROWS] = { "wi-fi", "bluetooth", "theme", "display" };
+	if (cards[0]) {
+		return;
+	}
+	int sc = zmc.scale > 0 ? zmc.scale : 1;
+	card_w = zmc.width - 2 * ZMC_MARGIN;
+	for (int r = 0; r < STAGE_ROWS; r++) {
+		cards[r] = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)ceil(card_w * sc), STAGE_ROW_H * sc);
+		cairo_t *c = cairo_create(cards[r]);
+		cairo_scale(c, sc, sc);
+		zmc_accent(c);
+		cairo_rectangle(c, 0, 0, STAGE_ROW_H, STAGE_ROW_H);
+		cairo_fill(c);
+		cairo_set_source_rgb(c, 1, 1, 1);
+		zmc_text(c, labels[r], FONT_SEMILIGHT, 24, STAGE_ROW_H + 12, 6, 0);
+		cairo_destroy(c);
+		cairo_surface_flush(cards[r]);
+	}
+}
+
+/* One card at (x, y), turned `deg` about its axis through the pivot (a share
+ * of its width for Y, of its height for X; the middle for Z), scaled about
+ * its middle: four corners in points, z toward the viewer. */
+static void card_quad(cairo_surface_t *card, double x, double y, double w, double h,
+		enum axis axis, double deg, double pivot, double scale, double alpha, unsigned rev) {
+	double a = deg * M_PI / 180, c[4][3];
+	double lx[4] = { 0, w, 0, w }, ly[4] = { 0, 0, h, h };
+	for (int i = 0; i < 4; i++) {
+		double px = lx[i] - w / 2, py = ly[i] - h / 2, pz = 0;	/* about the middle */
+		if (axis == AX_Y) {
+			double u = lx[i] - w * pivot;
+			px = w * pivot - w / 2 + u * cos(a); pz = u * sin(a);
+		} else if (axis == AX_X) {
+			double u = ly[i] - h * pivot;
+			py = h * pivot - h / 2 + u * cos(a); pz = u * sin(a);
+		} else {
+			double rx = px * cos(a) - py * sin(a), ry = px * sin(a) + py * cos(a);
+			px = rx; py = ry;
+		}
+		c[i][0] = x + w / 2 + px * scale;
+		c[i][1] = y + h / 2 + py * scale;
+		c[i][2] = pz * scale;
+	}
+	zmc_gpu_quad(card, rev, c, alpha);
+}
+
+static double stage_top(void) {
+	return ZMC_HEADER_H + 120;
+}
+
+/* The preview page's moving part, every frame on the GPU. */
+static void overlay(int page) {
+	if (page != PAGE_PREVIEW || shown_anim < 0) {
+		return;
+	}
+	cards_make();
+	const struct anim *A = &anims[shown_anim];
+	double run = A->ms + (STAGE_ROWS - 1) * A->feather_ms;
+	double ms = fmod((double)(zmc_now_ms() - loop_start), run + HOLD_MS);
+	double y0 = stage_top();
+	for (int r = 0; r < STAGE_ROWS; r++) {
+		double ry = y0 + r * (STAGE_ROW_H + STAGE_GAP);
+		int order = A->reverse_order ? STAGE_ROWS - 1 - r : r;
+		bool alone = A->feather_ms == 0 && r != 0;	/* single-element ones: the first row */
+		if (alone) {
+			card_quad(cards[r], ZMC_MARGIN, ry, card_w, STAGE_ROW_H, AX_Y, 0, 0, 1, 0.25, r + 1);
+			continue;
+		}
+		double t = fmin(1, fmax(0, (ms - order * A->feather_ms) / A->ms));
+		double e = shape(A->curve, A->weight, t);
+		card_quad(cards[r], ZMC_MARGIN, ry + lerp(A->from_dy, A->to_dy, e), card_w, STAGE_ROW_H,
+			A->axis, lerp(A->from_deg, A->to_deg, e), A->pivot,
+			lerp(A->from_scale, A->to_scale, e), lerp(A->from_alpha, A->to_alpha, e), r + 1);
+	}
+}
+
+static void preview_tick(void) {
+	zmc_present();	/* a frame: the page stays as it is, the overlay moves */
+}
+
+static double draw_preview(cairo_t *cr) {
+	if (shown_anim < 0) {
+		return zmc_header(cr, "preview");
+	}
+	const struct anim *A = &anims[shown_anim];
+	double y = zmc_header(cr, A->name);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text(cr, A->detail, FONT_REGULAR, 13.5, ZMC_MARGIN, y, zmc.width - 2 * ZMC_MARGIN);
+	return stage_top() + STAGE_ROWS * (STAGE_ROW_H + STAGE_GAP) + 40;
+}
+
+static double draw_anims(cairo_t *cr) {
+	double y = zmc_header(cr, "animations");
+	for (int i = 0; i < N_ANIMS; i++) {
+		y = zmc_entry(cr, y, anims[i].name, anims[i].detail, ACT_PLAY, i);
+	}
+	return y + 20;
+}
+
 static double render(cairo_t *cr, int page) {
 	switch (page) {
 	case PAGE_HUB: return draw_hub(cr);
@@ -339,11 +531,18 @@ static double render(cairo_t *cr, int page) {
 	case PAGE_KERNEL: return draw_stream(cr, "kernel log");
 	case PAGE_SHELL: return draw_stream(cr, "shell log");
 	case PAGE_HARDWARE: return draw_hardware(cr);
+	case PAGE_ANIM: return draw_anims(cr);
+	case PAGE_PREVIEW: return draw_preview(cr);
 	}
 	return 0;
 }
 
 static void activate(int action, int arg) {
+	if (action == ACT_PLAY && arg >= 0 && arg < N_ANIMS) {
+		shown_anim = arg;
+		zmc_go(PAGE_PREVIEW, 1);
+		return;
+	}
 	if (action == ACT_OPEN) {
 		if (arg == PAGE_HUB || arg == PAGE_LOGS) {
 			hub_tab = arg;
@@ -373,6 +572,10 @@ static void arrived(int page) {
 	case PAGE_SHELL:
 		stream_start("LC_ALL=C.UTF-8 exec tail -n 40 -F \"$HOME/.local/state/ztmetro.log\" 2>&1");
 		break;
+	case PAGE_PREVIEW:
+		loop_start = zmc_now_ms();
+		zmc_every(16, preview_tick);	/* frames only while it is open */
+		break;
 	default:
 		break;
 	}
@@ -384,21 +587,29 @@ static bool back(void) {
 	}
 	zmc_every(0, NULL);
 	stream_stop();
+	if (zmc.page == PAGE_PREVIEW) {
+		zmc_go(PAGE_ANIM, -1);	/* back to the list of them */
+		return true;
+	}
 	zmc_go(hub_tab, -1);
 	return true;
 }
 
 static const struct zmc_app devtest = {
 	.app_id = "zrndevtest", .title = "ZrnDevTest", .caps = "ZRNDEVTEST",
-	.render = render, .activate = activate, .back = back, .arrived = arrived,
+	.render = render, .activate = activate, .back = back, .arrived = arrived, .overlay = overlay,
 };
 
 int main(int argc, char **argv) {
-	static const char *names[] = { "hub", "system", "sensors", "journal", "kernel", "shell", "hardware" };
+	static const char *names[] = { "hub", "system", "sensors", "journal", "kernel", "shell", "hardware", "logs", "animations", "preview" };
 	if (argc == 4 && strcmp(argv[1], "--render") == 0) {
-		for (int i = 0; i < 7; i++) {
+		/* ZT_ANIM=N ZT_ANIM_MS=T: the animations page with N played T ms in */
+		if (getenv("ZT_ANIM")) {
+			shown_anim = atoi(getenv("ZT_ANIM"));
+		}
+		for (int i = 0; i < 10; i++) {
 			if (strcmp(names[i], argv[2]) == 0) {
-				return zmc_render_png(&devtest, i, 664, argv[3]);
+				return zmc_render_png(&devtest, i, i == PAGE_ANIM ? 1400 : 664, argv[3]);
 			}
 		}
 		return 2;

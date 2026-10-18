@@ -43,7 +43,7 @@
  * Going back, both pages turn from the bottom up. The first page arrives
  * like that when the app starts and leaves like that when it is closed.
  */
-#define ROW_OUT_MS	110	/* one row turning away */
+#define ROW_OUT_MS	128	/* one row turning away (UIXMobile TurnstileForwardOut: 0.128 s) */
 #define ROW_IN_MS	180	/* one row arriving (the Lumia's Settings: ~150) */
 #define ROW_STAGGER_MS	33	/* between one row starting and the next (its Settings: 33) */
 /* An app's first page arrives row by row as on the Lumia's Settings screen.
@@ -59,7 +59,7 @@
  * the old page's rows swing out toward the viewer, going back (or closing)
  * away from it; the new page's rows always arrive from behind the screen and
  * swing forward into place. */
-#define TURN_OUT_DEG	80.0
+#define TURN_OUT_DEG	50.0	/* TurnstileForwardOut ends at 50 degrees about Y */
 #define TURN_IN_DEG	80.0
 #define DEPTH_FOV_DEG	34.0	/* the shell's field of view, for the same depth */
 #define ANIM_SCALE	(zmg_ready() ? zmc.scale : 2)	/* GLES keeps native resolution */
@@ -1315,6 +1315,9 @@ static void present_gpu(uint32_t ms) {
 		if (slider_live >= 0 && zmc.sliding) {
 			draw_slider_live(s);
 		}
+		if (zmc.app->overlay && !zmc.slide_active && !zmc.swiping && !zmc.spring) {
+			zmc.app->overlay(zmc.page);
+		}
 	}
 	if (zmc.busy && !zmc.anim_active) {
 		uint32_t t = (now_ms() - zmc.busy_since) % 2600;
@@ -2504,6 +2507,23 @@ static void round_glyph(cairo_t *cr, const char *g) {
 			cairo_fill(cr);
 		}
 	}
+}
+
+void zmc_gpu_quad(cairo_surface_t *source, unsigned revision, const double c[4][3], double alpha) {
+	struct zmg_vertex q[4];
+	for (int i = 0; i < 4; i++) {
+		q[i] = (struct zmg_vertex){ (float)c[i][0], (float)c[i][1], (float)c[i][2] };
+	}
+	zmg_surface(source, revision, 0, 0, cairo_image_surface_get_width(source),
+		cairo_image_surface_get_height(source), q, (float)alpha);
+}
+
+void zmc_gpu_rect(double x, double y, double w, double h, double r, double g, double b) {
+	zmg_rect(x, y, w, h, (float)r, (float)g, (float)b);
+}
+
+void zmc_present(void) {
+	present();
 }
 
 double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg) {

@@ -60,6 +60,7 @@ enum page {
 	PAGE_WIFI_NET,	/* one network: its state, its address, forgetting it */
 	PAGE_DATE,
 	PAGE_BLUETOOTH,
+	PAGE_ACCENTS,	/* the accent picker, full screen */
 };
 
 enum action {
@@ -1007,29 +1008,54 @@ static double draw_walls(cairo_t *cr, double y) {
 	return y;
 }
 
+/* The accent picker, as the phone's: four swatches a row, each row a strip
+ * that the page change turns in on its own, 33 ms after the one above
+ * (TurnstileFeatherList in UIXMobile; the core's ROW_STAGGER_MS). */
+static double draw_accents(cairo_t *cr) {
+	double y = zmc_header(cr, "accents");
+	double gap = 10, side = (zmc.width - 2 * MARGIN - 3 * gap) / 4;
+	int rows = (N_ACCENTS + 3) / 4;
+	for (int row = 0; row < rows; row++) {
+		double sy = y + row * (side + gap);
+		for (int i = row * 4; i < N_ACCENTS && i < row * 4 + 4; i++) {
+			double x = MARGIN + (i % 4) * (side + gap);
+			zmc_set_rgb(cr, ACCENTS[i].color);
+			cairo_rectangle(cr, x, sy, side, side);
+			cairo_fill(cr);
+			if (i == app.accent) {
+				cairo_set_source_rgb(cr, 1, 1, 1);
+				cairo_set_line_width(cr, 3);
+				cairo_rectangle(cr, x + 1.5, sy + 1.5, side - 3, side - 3);
+				cairo_stroke(cr);
+			}
+			zmc_add_hit(x, sy, side, side, ACT_ACCENT, i);
+		}
+		/* the row itself, after its swatches (the first hit under a finger
+		 * wins): it is what makes the row one strip of the turnstile */
+		zmc_add_hit(0, sy, zmc.width, side, 0, 0);
+	}
+	return y + rows * (side + gap) + 20;
+}
+
 static double draw_theme(cairo_t *cr) {
 	double y = zmc_header(cr, "theme");
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Accent colour", FONT_REGULAR, 13.5, MARGIN, y, 0);
+	/* Windows Phone's list picker, collapsed: the box shows the choice and
+	 * opens the full-screen picker (UIXMobile!ListPicker in full mode) */
+	y += 20;
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	cairo_set_line_width(cr, 2);
+	cairo_rectangle(cr, MARGIN + 1, y + 1, zmc.width - 2 * MARGIN - 2, 40);
+	cairo_stroke(cr);
 	zmc_set_rgb(cr, ACCENTS[app.accent].color);
-	zmc_text(cr, ACCENTS[app.accent].name, FONT_SEMILIGHT, 25, MARGIN, y + 18, 0);
+	cairo_rectangle(cr, MARGIN + 10, y + 10, 22, 22);
+	cairo_fill(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text(cr, ACCENTS[app.accent].name, FONT_REGULAR, 16, MARGIN + 42, y + 10, 0);
+	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_OPEN_PAGE, PAGE_ACCENTS);
 	y += 62;
-
-	double gap = 8, side = (zmc.width - 2 * MARGIN - 3 * gap) / 4;
-	for (int i = 0; i < N_ACCENTS; i++) {
-		double x = MARGIN + (i % 4) * (side + gap), sy = y + (i / 4) * (side + gap);
-		zmc_set_rgb(cr, ACCENTS[i].color);
-		cairo_rectangle(cr, x, sy, side, side);
-		cairo_fill(cr);
-		if (i == app.accent) {
-			cairo_set_source_rgb(cr, 1, 1, 1);
-			cairo_set_line_width(cr, 3);
-			cairo_rectangle(cr, x + 1.5, sy + 1.5, side - 3, side - 3);
-			cairo_stroke(cr);
-		}
-		zmc_add_hit(x, sy, side, side, ACT_ACCENT, i);
-	}
-	y += ((N_ACCENTS + 3) / 4) * (side + gap) + 16;
+	double gap = 8;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Start screen columns", FONT_REGULAR, 13.5, MARGIN, y, 0);
@@ -2053,6 +2079,7 @@ static double render_page_content(cairo_t *cr, int p) {
 	case PAGE_MAIN: return draw_main(cr);
 	case PAGE_APPS: return draw_apps(cr);
 	case PAGE_THEME: return draw_theme(cr);
+	case PAGE_ACCENTS: return draw_accents(cr);
 	case PAGE_DISPLAY: return draw_display(cr);
 	case PAGE_WIFI: return draw_wifi(cr);
 	case PAGE_BLUETOOTH: return draw_bluetooth(cr);
@@ -2158,6 +2185,9 @@ static void activate(int action, int arg) {
 	case ACT_ACCENT:
 		app.accent = arg;
 		config_save();
+		if (zmc.page == PAGE_ACCENTS) {
+			zmc_go(PAGE_THEME, -1);	/* chosen: the picker turns away */
+		}
 		break;
 	case ACT_WALL_TARGET:
 		app.wall_target = arg;
@@ -2695,6 +2725,10 @@ static bool back(void) {
 		zmc_go(PAGE_WIFI, -1);
 		return true;
 	}
+	if (zmc.page == PAGE_ACCENTS) {
+		zmc_go(PAGE_THEME, -1);	/* the picker is under the theme page */
+		return true;
+	}
 	if (zmc.page == PAGE_DATE) { date_focus = -1; zmc_keyboard(false); }
 	if (zmc.page == PAGE_APN) {
 		apn_focus = -1;
@@ -2762,7 +2796,7 @@ static const struct zmc_app settings = {
  * That is how the look is checked without opening the app on the phone. */
 /* Pages by name: --render PAGE, and `ztsettings PAGE` (Hyperscan opens one). */
 static const struct { const char *name; enum page page; } pages[] = {
-	{ "date", PAGE_DATE }, { "main", PAGE_MAIN }, { "apps", PAGE_APPS }, { "theme", PAGE_THEME }, { "display", PAGE_DISPLAY },
+	{ "date", PAGE_DATE }, { "main", PAGE_MAIN }, { "apps", PAGE_APPS }, { "theme", PAGE_THEME }, { "accents", PAGE_ACCENTS }, { "display", PAGE_DISPLAY },
 	{ "wifi", PAGE_WIFI }, { "bluetooth", PAGE_BLUETOOTH }, { "mobile", PAGE_MOBILE }, { "audio", PAGE_AUDIO },
 	{ "battery", PAGE_BATTERY }, { "cpu", PAGE_CPU }, { "vm", PAGE_VM },
 	{ "gpu", PAGE_GPU }, { "keyboard", PAGE_KEYBOARD }, { "about", PAGE_ABOUT },

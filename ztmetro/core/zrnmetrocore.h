@@ -74,6 +74,10 @@ struct zmc_app {
 	/* something was typed on the keyboard: one character (UTF-8), "\b" for
 	 * backspace or "\n" for enter; the page is redrawn afterwards */
 	void (*text)(const char *typed);
+	/* drawn on the GPU over `page` every frame it is in front and at rest,
+	 * after the page itself: moving things that must not redraw the page
+	 * (zmc_gpu_quad, zmc_gpu_rect; zmc_present asks for the next frame) */
+	void (*overlay)(int page);
 };
 
 struct zmc_buffer {
@@ -224,6 +228,12 @@ void zmc_text_centred(cairo_t *cr, const char *s, const char *font, double size,
  * "people", "keypad". Gives (action, arg) when tapped. */
 /* Windows Phone's button: a white outline round the label, filled white with
  * the label in black while a finger is on it. Returns where the next thing goes. */
+/* For an overlay: a Cairo surface (in pixels) as a quad whose corners, top
+ * left, top right, bottom left, bottom right, are points with z toward the
+ * viewer (the shell's own perspective); a solid rectangle; another frame. */
+void zmc_gpu_quad(cairo_surface_t *source, unsigned revision, const double corners[4][3], double alpha);
+void zmc_gpu_rect(double x, double y, double w, double h, double r, double g, double b);
+void zmc_present(void);
 double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg);
 void zmc_round_button(cairo_t *cr, double cx, double y, const char *glyph, const char *label,
 	int action, int arg);
