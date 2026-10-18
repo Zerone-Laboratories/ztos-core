@@ -124,6 +124,9 @@ static double press_amount(void);
 static void fling_step(void);
 static double page_y(double y);
 static void slider_set(double x, bool done);
+static void zmc_trace(const char *what);
+static int slider_live = -1;		/* percent while dragging, -1 otherwise */
+static void draw_slider_live(double s);
 static void zmc_activate(struct zmc_hit *hit);
 static void pivot_forget(void);
 static void collect_rows(struct zmc_rowset *set, double scroll, double tapped, bool reverse);
@@ -1286,6 +1289,11 @@ static int present_list(int scale) {
 /* A GPU frame samples cached page textures. Cairo only runs when the app
  * changes a page, never to copy, rotate or scale it on each motion frame. */
 static void present_gpu(uint32_t ms) {
+	static int frames;
+	if (frames < 3) {
+		frames++;
+		zmc_trace(frames == 1 ? "first frame" : "frame");
+	}
 	zmc.dirty = false;
 	zmg_begin(zmc.width, zmc.height, zmc.scale);
 	if (zmc.anim_active) {
@@ -1304,6 +1312,9 @@ static void present_gpu(uint32_t ms) {
 		gpu_surface_rect(zmc.cache, 0, 0, zmc.width*s, HEADER_H*s,
 			0, 0, zmc.width, HEADER_H, 1);
 		draw_press(NULL, zmc.scale);
+		if (slider_live >= 0 && zmc.sliding) {
+			draw_slider_live(s);
+		}
 	}
 	if (zmc.busy && !zmc.anim_active) {
 		uint32_t t = (now_ms() - zmc.busy_since) % 2600;
@@ -1747,6 +1758,13 @@ static void touch_down(void *data, struct wl_touch *touch, uint32_t serial, uint
 		}
 	}
 	if (!zmc.sliding && !zmc.moved && hit_at(zmc.down_x, zmc.down_y, &zmc.pressed) &&
+			zmc.pressed.button) {
+		zmc.button_down = true;	/* drawn filled: the page is drawn again */
+		zmc_redraw();
+		if (zmc.app->hold) {
+			hold_at = now_ms() + HOLD_MS;
+		}
+	} else if (!zmc.sliding && !zmc.moved && hit_at(zmc.down_x, zmc.down_y, &zmc.pressed) &&
 			zmc.pressed.y >= HEADER_H &&	/* a page's title does not give */
 			zmc.pressed.h < zmc.height) {	/* nor does "anywhere else" */
 		struct zmc_hit *h = &zmc.pressed;
@@ -1766,6 +1784,10 @@ static void touch_up(void *data, struct wl_touch *touch, uint32_t serial, uint32
 	hold_at = 0;
 	if (zmc.press_to > 0) {
 		press_set(0);
+	}
+	if (zmc.button_down) {
+		zmc.button_down = false;
+		zmc_redraw();
 	}
 	if (held) {
 		held = false;	/* the hold did something: this lift is not a tap */
@@ -1838,6 +1860,10 @@ static void touch_motion(void *data, struct wl_touch *touch, uint32_t time, int3
 	if (fabs(dx) > SLOP || fabs(dy) > SLOP) {
 		zmc.moved = true;
 		hold_at = 0;
+		if (zmc.button_down) {	/* a scroll that began on a button */
+			zmc.button_down = false;
+			zmc_redraw();
+		}
 		if (zmc.press_to > 0) {
 			/* it is a scroll, not a press: let go at once (eased out, it
 			 * would be drawn the plain way while the list already moves) */
@@ -1884,6 +1910,14 @@ static void touch_cancel(void *data, struct wl_touch *touch) {
 	zmc.touching = false;
 	if (zmc.press_to > 0) {
 		press_set(0);
+	}
+	if (zmc.button_down) {
+		zmc.button_down = false;
+		zmc_redraw();
+	}
+	if (zmc.sliding && slider_live >= 0) {
+		slider_live = -1;	/* the page shows where it was left */
+		zmc_redraw();
 	}
 	zmc.sliding = false;
 	zmc.fling = true;	/* back inside the ends, if it was past one */
@@ -2016,6 +2050,7 @@ static bool settle_when_configured;
 static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial) {
 	xdg_surface_ack_configure(xdg_surface, serial);
 	if (!zmc.configured) {
+		zmc_trace("configured");
 		/* Snapshot the first page before the shell uncovers the window. The
 		 * shell and client use the same monotonic reveal time. */
 		zmc.configured = true;
@@ -2130,6 +2165,69 @@ static const struct wl_registry_listener registry_listener = {
 
 
 /* The slider under the finger follows it; `done` when the finger lifts. */
+/*
+ * A slider under the finger is drawn on the GPU over the cached page: the
+ * track, the thumb and the percentage, from rectangles and a strip of
+ * pre-drawn digits. Drawing the whole page again in Cairo for every move
+ * kept a core busy (enough to wake the performance daemon's boost) and the
+ * thumb trailed the finger. The page is drawn again once, when it lets go.
+ */
+static cairo_surface_t *digits;		/* "0123456789%" at DIGIT_CELL points apart */
+static double digit_w[11];
+#define DIGIT_CELL	14
+#define DIGIT_SIZE	14
+#define DIGIT_H		22
+
+static void digits_ensure(int scale) {
+	static int made_at;
+	if (digits && made_at == scale) {
+		return;
+	}
+	if (digits) {
+		cairo_surface_destroy(digits);
+	}
+	made_at = scale;
+	digits = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 11 * DIGIT_CELL * scale, DIGIT_H * scale);
+	cairo_t *cr = cairo_create(digits);
+	cairo_scale(cr, scale, scale);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	for (int i = 0; i < 11; i++) {
+		char glyph[2] = { i < 10 ? (char)('0' + i) : '%', 0 };
+		digit_w[i] = zmc_text_width(glyph, FONT_SEMIBOLD, DIGIT_SIZE);
+		zmc_text(cr, glyph, FONT_SEMIBOLD, DIGIT_SIZE, i * DIGIT_CELL, 0, 0);
+	}
+	cairo_destroy(cr);
+	cairo_surface_flush(digits);
+}
+
+static void draw_slider_live(double s) {
+	struct zmc_hit *h = &zmc.slider;
+	double y = h->y - zmc.scroll;	/* page to screen */
+	if (y < HEADER_H || y > zmc.height) {
+		return;
+	}
+	float r = ((zmc.accent >> 16) & 255) / 255.0f;
+	float g = ((zmc.accent >> 8) & 255) / 255.0f, b = (zmc.accent & 255) / 255.0f;
+	double track = y + 24, fill = h->w * slider_live / 100.0;
+	zmg_rect(h->x - 6, track - 8, h->w + 12, 20, 0, 0, 0);	/* the old thumb and fill */
+	zmg_rect(h->x, track, h->w, 4, 0.22f, 0.22f, 0.22f);
+	zmg_rect(h->x, track, fill, 4, r, g, b);
+	zmg_rect(h->x + fill - 5, track - 7, 10, 18, 1, 1, 1);
+	/* the percentage, where zmc_slider writes it */
+	digits_ensure((int)s);
+	double x = h->x + h->w - 42;
+	zmg_rect(x - 2, y - 1, 46, DIGIT_H, 0, 0, 0);
+	char text[8];
+	snprintf(text, sizeof(text), "%d%%", slider_live);
+	for (const char *c = text; *c; c++) {
+		int i = *c == '%' ? 10 : *c - '0';
+		struct zmg_vertex q[4] = { {x, y, 0}, {x + DIGIT_CELL, y, 0},
+			{x, y + DIGIT_H, 0}, {x + DIGIT_CELL, y + DIGIT_H, 0} };
+		zmg_surface(digits, 1, i * DIGIT_CELL * s, 0, (i + 1) * DIGIT_CELL * s, DIGIT_H * s, q, 1);
+		x += digit_w[i];
+	}
+}
+
 static void slider_set(double x, bool done) {
 	int value = (int)lround((x - zmc.slider.x) / zmc.slider.w * 100);
 	value = value < 0 ? 0 : value > 100 ? 100 : value;
@@ -2146,6 +2244,12 @@ static void slider_set(double x, bool done) {
 	if (zmc.app->slide) {
 		zmc.app->slide(zmc.slider.action, value, done);
 	}
+	if (!done && zmg_ready()) {
+		slider_live = value;	/* drawn over the page, not into it */
+		present();
+		return;
+	}
+	slider_live = -1;
 	zmc_redraw();
 }
 
@@ -2402,6 +2506,30 @@ static void round_glyph(cairo_t *cr, const char *g) {
 	}
 }
 
+double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg) {
+	const double h = 40, line = 2;
+	bool down = zmc.button_down && zmc.pressed.action == action && zmc.pressed.arg == arg &&
+		zmc.pressed.button;
+	cairo_save(cr);
+	cairo_new_path(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	if (down) {
+		cairo_rectangle(cr, x, y, w, h);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 0, 0, 0);
+	} else {
+		cairo_set_line_width(cr, line);
+		cairo_rectangle(cr, x + line / 2, y + line / 2, w - line, h - line);
+		cairo_stroke(cr);
+	}
+	zmc_text_centred(cr, label, FONT_SEMIBOLD, 14.5, x + w / 2, y + 10);
+	cairo_restore(cr);
+	if (zmc.n_hits < MAX_HITS) {
+		zmc.hits[zmc.n_hits++] = (struct zmc_hit){ x, y, w, h, action, arg, false, true };
+	}
+	return y + h + 12;
+}
+
 void zmc_round_button(cairo_t *cr, double cx, double y, const char *glyph, const char *label,
 		int action, int arg) {
 	const double d = 44;
@@ -2580,7 +2708,23 @@ int zmc_render_png(const struct zmc_app *app, int page, int height, const char *
 	return status == CAIRO_STATUS_SUCCESS ? 0 : 1;
 }
 
+/* ZMC_TRACE=1: how long start-up takes, step by step, on stderr */
+static void zmc_trace(const char *what) {
+	static struct timespec t0;
+	static int on = -1;
+	if (on < 0) {
+		on = getenv("ZMC_TRACE") != NULL;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+	}
+	if (on) {
+		struct timespec t;
+		clock_gettime(CLOCK_MONOTONIC, &t);
+		fprintf(stderr, "trace %6.1f ms %s\n", (t.tv_sec - t0.tv_sec) * 1e3 + (t.tv_nsec - t0.tv_nsec) / 1e6, what);
+	}
+}
+
 int zmc_run(const struct zmc_app *app, int first_page) {
+	zmc_trace("start");
 	/* system() and pclose() have to be able to wait for their children,
 	 * whatever the process that started us did with this signal */
 	signal(SIGCHLD, SIG_DFL);
@@ -2595,6 +2739,7 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 	struct wl_registry *registry = wl_display_get_registry(zmc.display);
 	wl_registry_add_listener(registry, &registry_listener, NULL);
 	wl_display_roundtrip(zmc.display);
+	zmc_trace("globals");
 	if (!zmc.compositor || !zmc.shm || !zmc.wm_base) {
 		fprintf(stderr, "%s: compositor missing required interfaces\n", app->app_id);
 		return 1;
@@ -2606,7 +2751,9 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 	xdg_toplevel_add_listener(zmc.toplevel, &xdg_toplevel_listener, NULL);
 	xdg_toplevel_set_title(zmc.toplevel, app->title);
 	xdg_toplevel_set_app_id(zmc.toplevel, app->app_id);
+	zmc_trace("toplevel");
 	zmg_init(zmc.display, zmc.surface, zmc.width, zmc.height, zmc.scale);
+	zmc_trace("gpu ready");
 	if (!zmg_ready() && subcompositor && viewporter) {
 		/* the list's own surface, over the window, taking no touches itself
 		 * (they all go to the window, in its coordinates) */

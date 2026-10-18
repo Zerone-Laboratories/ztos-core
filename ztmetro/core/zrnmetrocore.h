@@ -51,6 +51,7 @@ struct zmc_hit {
 	double x, y, w, h;	/* on the page, points */
 	int action, arg;
 	bool slider;
+	bool button;	/* a zmc_button: pressing it fills it, it does not tilt */
 };
 
 struct zmc_app {
@@ -140,6 +141,7 @@ struct zmc_state {
 	double vel;
 	/* the tilt of whatever the finger is on (Windows Phone's tilt effect) */
 	struct zmc_hit pressed;
+	bool button_down;	/* pressed is a zmc_button, held down: drawn filled */
 	double press_fx, press_fy;	/* where on it, 0..1 */
 	double press_from, press_to;	/* 0 at rest, 1 pressed in */
 	uint32_t press_start;
@@ -220,6 +222,9 @@ void zmc_text_centred(cairo_t *cr, const char *s, const char *font, double size,
  * it and a small label under it, its middle at cx. Glyphs: "call", "message",
  * "add", "save", "edit", "delete", "send", "cancel", "back", "refresh",
  * "people", "keypad". Gives (action, arg) when tapped. */
+/* Windows Phone's button: a white outline round the label, filled white with
+ * the label in black while a finger is on it. Returns where the next thing goes. */
+double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg);
 void zmc_round_button(cairo_t *cr, double cx, double y, const char *glyph, const char *label,
 	int action, int arg);
 /* Wi-Fi's fan with `bars` (0..4) of its four arcs lit, in a box `size` points
