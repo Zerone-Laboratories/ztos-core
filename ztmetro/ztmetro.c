@@ -1359,7 +1359,42 @@ static void shift_arrow_path(cairo_t *cr, double u) {
  * Line glyphs, drawn here rather than taken from an icon font. Each is drawn
  * in a box of `s` points centred on (cx, cy), in the current colour.
  */
+/* The Windows Phone app glyphs, by their Segoe UI Symbol codepoints (the font
+ * the firmware draws its tiles with). Mapped names render the real glyph; every
+ * other name falls through to the hand-drawn vectors below. */
+static bool draw_icon_symbol(cairo_t *cr, const char *name, double cx, double cy, double s) {
+	static const struct { const char *name, *glyph; } sym[] = {
+		{ "phone",    u8"" }, { "people",   u8"" },
+		{ "message",  u8"" }, { "mail",     u8"" },
+		{ "music",    u8"" }, { "camera",   u8"" },
+		{ "calendar", u8"" }, { "store",    u8"" },
+		{ "map",      u8"" },
+	};
+	const char *g = NULL;
+	for (size_t i = 0; i < sizeof(sym) / sizeof(sym[0]); i++) {
+		if (strcmp(name, sym[i].name) == 0) { g = sym[i].glyph; break; }
+	}
+	if (!g) {
+		return false;
+	}
+	PangoLayout *layout = pango_cairo_create_layout(cr);
+	PangoFontDescription *desc = pango_font_description_from_string("Segoe UI Symbol, Segoe MDL2 Assets, Noto Sans Symbols, sans-serif");
+	pango_font_description_set_absolute_size(desc, s * 1.1 * PANGO_SCALE);
+	pango_layout_set_font_description(layout, desc);
+	pango_layout_set_text(layout, g, -1);
+	PangoRectangle ink;
+	pango_layout_get_pixel_extents(layout, &ink, NULL);
+	cairo_move_to(cr, cx - ink.x - ink.width / 2.0, cy - ink.y - ink.height / 2.0);
+	pango_cairo_show_layout(cr, layout);
+	pango_font_description_free(desc);
+	g_object_unref(layout);
+	return true;
+}
+
 static void draw_icon_vector(cairo_t *cr, const char *name, double cx, double cy, double s) {
+	if (draw_icon_symbol(cr, name, cx, cy, s)) {
+		return;
+	}
 	double u = s / 2;
 	cairo_save(cr);
 	cairo_translate(cr, cx, cy);
@@ -9461,6 +9496,7 @@ static void render_frame(struct zt_server *server) {
 	if (server->splash && !animating(server, &server->lock_y) && server->lock_y >= 0.0f) {
 		server->splash = false;
 		wlr_log(WLR_INFO, "boot: transition complete, splash removed");
+		ui_sound(server, UIS_NOTIFY);	/* a chime as the phone finishes starting */
 	}
 	if (server->volume_y > 1.0f - (float)banner_h(server) && server->volume_layer.tex) {
 		layer_draw(server, &server->volume_layer, 0, server->volume_y, 1.0f);
