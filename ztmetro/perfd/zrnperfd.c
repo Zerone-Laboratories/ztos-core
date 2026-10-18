@@ -40,7 +40,7 @@
  *	idle0	the resting state: only the first two efficiency cores online
  *		(the rest of that cluster offline), held near 1.3 GHz, the big
  *		cluster parked. Screen on or off. No light.
- *	nominal	the app in front (eco apps too) has used more than 75 % of a
+ *	nominal	the app in front (eco apps too) has used more than 25 % of a
  *		core: all the efficiency cores, at their full little speed. No
  *		light.
  *	big	more than 95 % (not an eco app): the big cores open to it, at no
@@ -392,7 +392,7 @@ static bool led_lit;
 static long led_next;		/* when the light next changes; 0: not blinking */
 #define LED_WHITE	40	/* of 255, each of the three colours */
 #define BOOST_SAMPLE_MS	250
-#define IDLE_UP		0.75	/* idle0 -> idle1 (nominal): the front app, eco apps too */
+#define IDLE_UP		0.25	/* idle0 -> idle1 (nominal): the front app, eco apps too */
 #define BOOST_UP	0.95	/* nominal -> big -> rapid: of one core, not eco apps */
 #define BOOST_DOWN	0.55
 #define BIG_SHARE	0.65
