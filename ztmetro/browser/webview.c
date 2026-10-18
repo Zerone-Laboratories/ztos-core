@@ -66,7 +66,7 @@ static void on_buffer(WPEView *view, WPEBuffer *buffer, gpointer u) {
 		wv->frame_rev++;
 		zmc_present();		/* a new frame to put up */
 	}
-	g_bytes_unref(px);
+	/* no g_bytes_unref: import_to_pixels is transfer-none, the buffer owns them */
 }
 
 /* ---- WebKit signals -> the chrome ----------------------------------------- */
@@ -120,7 +120,10 @@ static void tune(WebKitSettings *s) {
 	webkit_settings_set_enable_offline_web_application_cache(s, TRUE);
 	webkit_settings_set_enable_html5_local_storage(s, TRUE);
 	webkit_settings_set_enable_html5_database(s, TRUE);
-	webkit_settings_set_user_agent_with_application_details(s, "ztBrowser", "1.0");
+	/* a phone user agent, so sites send their mobile pages */
+	webkit_settings_set_user_agent(s,
+		"Mozilla/5.0 (Linux; Android 14; ztOS) AppleWebKit/605.1.15 "
+		"(KHTML, like Gecko) Version/18.0 Mobile Safari/605.1.15 ztBrowser/1.0");
 }
 
 /* ---- the interface -------------------------------------------------------- */
@@ -165,7 +168,15 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 void webview_place(struct webview *wv, int x, int y, int w, int h, int scale) {
 	wv->x = x; wv->y = y; wv->w = w; wv->h = h; wv->scale = scale;
 	if (wv->view) {
-		wpe_view_resized(wv->view, w * scale, h * scale);
+		/* logical size in CSS pixels plus the device scale: the page lays out
+		 * at phone width (~360 px) and renders sharp at the panel's density,
+		 * instead of a 1440 px desktop layout with tiny text */
+		WPEScreen *screen = wpe_view_get_screen(wv->view);
+		if (screen) {
+			wpe_screen_set_scale(screen, scale);
+			wpe_screen_set_size(screen, w, h);
+		}
+		wpe_view_resized(wv->view, w, h);
 	}
 }
 
