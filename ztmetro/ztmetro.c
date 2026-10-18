@@ -2155,6 +2155,14 @@ static float backlight_darkening(int percent) {
 	return 0.0f;
 }
 
+static void pipe_tell(const char *path, const char *command);
+
+/* A hand on a brightness control takes over from the light sensor: tell
+ * sensord to stop auto brightness, as the settings slider does. */
+static void backlight_manual(void) {
+	pipe_tell("/run/ztoscsf-sensord.ctl", "auto off\n");
+}
+
 static void load_config(struct zt_server *server) {
 	char path[512];
 	const char *home = getenv("HOME");
@@ -5631,6 +5639,7 @@ static void shade_activate(struct zt_server *server, int index) {
 			server->shade_brightness = 25;
 		}
 		config_keep("brightness", server->shade_brightness);	/* remembered */
+		backlight_manual();	/* a hand on it: the light sensor steps back */
 		backlight_set(server->shade_brightness);
 		draw_shade(server);
 		damage(server);
