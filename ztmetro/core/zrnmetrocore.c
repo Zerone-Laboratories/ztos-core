@@ -2369,6 +2369,16 @@ void zmc_keyboard(bool show) {
 	osk_tell(show ? "osk show\n" : "osk hide\n");
 }
 
+void zmc_osk_box(int bottom) {
+	if (!osk_wanted || bottom == osk_told) {
+		return;
+	}
+	char line[48];
+	osk_told = bottom;
+	snprintf(line, sizeof(line), "osk show %d\n", bottom);
+	osk_tell(line);
+}
+
 double zmc_text_width(const char *s, const char *font, double size) {
 	cairo_surface_t *scratch = cairo_image_surface_create(CAIRO_FORMAT_A8, 1, 1);
 	cairo_t *cr = cairo_create(scratch);

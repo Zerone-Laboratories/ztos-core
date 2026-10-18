@@ -53,6 +53,14 @@ void webview_touch_up(struct webview *wv, int id);
 void webview_key(struct webview *wv, const char *utf8);	/* a char, "\b" or "\n" */
 void webview_scroll(struct webview *wv, double dx, double dy);
 
+/* Draw the latest page frame as a GPU quad over (x,y,w,h) in points. Call from
+ * the app's .overlay hook. No-op until a frame has arrived. */
+void webview_composite(struct webview *wv, int x, int y, int w, int h);
+
+/* Run WebKit's (GLib) work: call often from a zmc_every tick, since zmc's loop
+ * is Wayland-only and would otherwise never service the engine. */
+void webview_pump(void);
+
 void webview_destroy(struct webview *wv);
 
 #endif

@@ -217,6 +217,11 @@ double zmc_picker(cairo_t *cr, double y, const char *caption, const char *const 
 double zmc_textbox(cairo_t *cr, double y, const char *caption, const char *value, bool focused,
 	int action, int arg);
 void zmc_keyboard(bool show);		/* ask the shell for its keyboard, or to put it away */
+/* Where the box being typed into ends, in window points, so the shell lifts the
+ * app over the keyboard. zmc_textbox sends this itself; a custom control (an
+ * app that draws its own field, e.g. the browser's bottom address bar) sends it
+ * by hand while its field is focused. */
+void zmc_osk_box(int bottom);
 void zmc_toggle(cairo_t *cr, double x, double y, bool on);
 /* How wide `s` comes out in `font` at `size` points. */
 double zmc_text_width(const char *s, const char *font, double size);

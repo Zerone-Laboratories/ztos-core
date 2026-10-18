@@ -22,6 +22,7 @@
 
 /* after the platform headers, so this sees the same wl_* declarations they do */
 #include "webview.h"
+#include "zrnmetrocore.h"	/* zmc_gpu_quad, zmc_present, cairo */
 
 struct webview {
 	struct wl_display *display;
@@ -31,8 +32,42 @@ struct webview {
 	WebKitNetworkSession *session;
 	WebKitWebView *web;
 	WPEView *view;		/* webkit_web_view_get_wpe_view */
+	cairo_surface_t *frame;	/* the latest page frame, as pixels */
+	unsigned frame_rev;	/* bumped each frame so the GPU re-uploads */
 	struct wv_delegate d;
 };
+
+/* WebKit rendered a frame: copy it into our cairo surface and ask for a draw.
+ * Runs on the main thread (the GLib pump below), same as everything else. */
+static void on_buffer(WPEView *view, WPEBuffer *buffer, gpointer u) {
+	(void)view;
+	struct webview *wv = u;
+	GError *err = NULL;
+	GBytes *px = wpe_buffer_import_to_pixels(buffer, &err);
+	if (!px) {
+		if (err) g_error_free(err);
+		return;
+	}
+	int w = wpe_buffer_get_width(buffer), h = wpe_buffer_get_height(buffer);
+	gsize n = 0;
+	const unsigned char *src = g_bytes_get_data(px, &n);
+	if (w > 0 && h > 0 && n >= (gsize)w * h * 4) {
+		if (!wv->frame || cairo_image_surface_get_width(wv->frame) != w ||
+		    cairo_image_surface_get_height(wv->frame) != h) {
+			if (wv->frame) cairo_surface_destroy(wv->frame);
+			wv->frame = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+		}
+		int dst_stride = cairo_image_surface_get_stride(wv->frame);
+		unsigned char *dst = cairo_image_surface_get_data(wv->frame);
+		for (int y = 0; y < h; y++) {
+			memcpy(dst + y * dst_stride, src + (size_t)y * w * 4, (size_t)w * 4);
+		}
+		cairo_surface_mark_dirty(wv->frame);
+		wv->frame_rev++;
+		zmc_present();		/* a new frame to put up */
+	}
+	g_bytes_unref(px);
+}
 
 /* ---- WebKit signals -> the chrome ----------------------------------------- */
 
@@ -114,6 +149,11 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 		NULL));
 	g_object_unref(settings);
 	wv->view = webkit_web_view_get_wpe_view(wv->web);
+	if (wv->view) {
+		g_signal_connect(wv->view, "buffer-rendered", G_CALLBACK(on_buffer), wv);
+		wpe_view_map(wv->view);
+		wpe_view_set_visible(wv->view, TRUE);
+	}
 
 	g_signal_connect(wv->web, "notify::title", G_CALLBACK(notify_title), wv);
 	g_signal_connect(wv->web, "notify::uri", G_CALLBACK(notify_uri), wv);
@@ -147,10 +187,26 @@ void webview_touch_up(struct webview *wv, int id) { (void)wv; (void)id; }
 void webview_key(struct webview *wv, const char *utf8) { (void)wv; (void)utf8; }
 void webview_scroll(struct webview *wv, double dx, double dy) { (void)wv; (void)dx; (void)dy; }
 
+void webview_composite(struct webview *wv, int x, int y, int w, int h) {
+	if (!wv || !wv->frame) {
+		return;
+	}
+	double corners[4][3] = {
+		{ x, y, 0 }, { x + w, y, 0 }, { x, y + h, 0 }, { x + w, y + h, 0 },
+	};
+	zmc_gpu_quad(wv->frame, wv->frame_rev, corners, 1.0);
+}
+
+void webview_pump(void) {
+	while (g_main_context_iteration(NULL, FALSE)) {
+	}
+}
+
 void webview_destroy(struct webview *wv) {
 	if (!wv) return;
 	if (wv->web) g_object_unref(wv->web);
 	if (wv->session) g_object_unref(wv->session);
 	if (wv->wpe) g_object_unref(wv->wpe);
+	if (wv->frame) cairo_surface_destroy(wv->frame);
 	free(wv);
 }
