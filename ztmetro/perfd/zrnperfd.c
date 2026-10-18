@@ -9,6 +9,12 @@
  *
  *	profile powersave | balanced | performance
  *	deepsleep on | off	whether "screen off" lowers anything
+ *	idle 0 | 1		the screen-off deep-sleep mode: 0 holds only two
+ *				cores online near 1.3 GHz (race to idle), 1 keeps
+ *				all the efficiency cores at their lowest clock
+ *				(the default). The daemon finds the processor's
+ *				layout at startup, so it fits a four-core phone
+ *				as well as this eight-core one.
  *	screen off | on		from the shell, as the display goes off and on
  *	focus PID APP_ID	from the shell: the app now in front (PID 0: Start)
  *	shell PID		from the shell as it starts: the compositor's pid
@@ -94,9 +100,92 @@
 
 enum profile { POWERSAVE, BALANCED, PERFORMANCE };
 static const char *names[] = { "powersave", "balanced", "performance" };
-static const int clusters[] = { 0, 4 };
+/* The processor's layout, found at startup, so the daemon fits whatever phone
+ * it runs on: one entry per cpufreq policy (a cluster), the lowest-numbered
+ * cpu first. clusters[0] is the efficiency cluster, clusters[n_clusters-1] the
+ * fastest. cpu_count is every present cpu. */
+static int clusters[8];		/* first cpu of each cluster */
+static int cluster_cpus[8][16];	/* the cpus of each cluster, -1 terminated */
+static int n_clusters;
+static int cpu_count = 1;
+#define IDLE_KHZ_TARGET	1300000	/* idle 0: the two live cores held near 1.3 GHz */
+static int idle_mode = 1;	/* 0: two cores, ~1.3 GHz. 1: all efficiency cores, lowest. */
 
 static enum profile profile = BALANCED;
+/* read a cpu list like "0-3" or "4,5,6,7" into out[] (-1 terminated) */
+static int read_cpu_list(const char *path, int *out, int max) {
+	FILE *f = fopen(path, "r");
+	int n = 0;
+	char buf[128];
+	if (f && fgets(buf, sizeof(buf), f)) {
+		char *p = buf;
+		while (*p && n < max - 1) {
+			int a = strtol(p, &p, 10), b = a;
+			if (*p == '-') { b = strtol(p + 1, &p, 10); }
+			for (int c = a; c <= b && n < max - 1; c++) { out[n++] = c; }
+			while (*p == ',' || *p == ' ') { p++; }
+		}
+	}
+	if (f) { fclose(f); }
+	out[n] = -1;
+	return n;
+}
+
+static void detect_topology(void) {
+	glob_t g;
+	n_clusters = 0;
+	if (glob(CPUFREQ "/policy*", 0, NULL, &g) == 0) {
+		for (size_t i = 0; i < g.gl_pathc && n_clusters < 8; i++) {
+			int pol = -1;
+			sscanf(g.gl_pathv[i], CPUFREQ "/policy%d", &pol);
+			if (pol < 0) { continue; }
+			char path[160];
+			snprintf(path, sizeof(path), "%s/affected_cpus", g.gl_pathv[i]);
+			int cpus[16];
+			if (read_cpu_list(path, cpus, 16) == 0) {
+				cpus[0] = pol; cpus[1] = -1;
+			}
+			/* keep them ordered by first cpu, so [0] is the efficiency cluster */
+			int at = n_clusters;
+			while (at > 0 && clusters[at - 1] > cpus[0]) {
+				clusters[at] = clusters[at - 1];
+				memcpy(cluster_cpus[at], cluster_cpus[at - 1], sizeof(cluster_cpus[0]));
+				at--;
+			}
+			clusters[at] = cpus[0];
+			memcpy(cluster_cpus[at], cpus, sizeof(cluster_cpus[0]));
+			n_clusters++;
+		}
+	}
+	globfree(&g);
+	if (n_clusters == 0) { clusters[0] = 0; cluster_cpus[0][0] = 0; cluster_cpus[0][1] = -1; n_clusters = 1; }
+	/* every present cpu */
+	cpu_count = 0;
+	for (int c = 0; c < 64; c++) {
+		char path[80];
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d", c);
+		if (access(path, F_OK) == 0) { cpu_count = c + 1; } else if (c > 0) { break; }
+	}
+	if (cpu_count < 1) { cpu_count = 1; }
+	fprintf(stderr, "zrnperfd: %d cpus, %d clusters (first cpus", cpu_count, n_clusters);
+	for (int c = 0; c < n_clusters; c++) { fprintf(stderr, " %d", clusters[c]); }
+	fprintf(stderr, ")\n");
+}
+
+/* One cpu online or off. cpu0 is never touched (it cannot go offline), and
+ * only with zrn-hotplug loaded, which is what lets a core come back. */
+static void core_online(int cpu, bool on) {
+	char path[80], now[8] = "";
+	if (cpu <= 0 || access("/sys/module/zrn_hotplug", F_OK) != 0) { return; }
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/online", cpu);
+	FILE *f = fopen(path, "r");
+	if (f) { if (!fgets(now, sizeof(now), f)) { now[0] = 0; } fclose(f); }
+	if (now[0] && (now[0] == '1') != on) {
+		f = fopen(path, "w");
+		if (f) { fputc(on ? '1' : '0', f); fclose(f); }
+	}
+}
+
 static bool deepsleep = true, screen_on = true;
 /* The Wi-Fi radio itself goes off five minutes after the screen, on battery:
  * the chip's own power save (listening only for beacons) is on all the time,
@@ -325,27 +414,39 @@ static void cores_allowed(const char *cpus) {
 
 /* The big cores but the first, on or off. Only with zrn-hotplug loaded: it is
  * what lets a core come back. */
-static const int spare_big[] = { 5, 6, 7 };
-
+/* The fast (performance) cluster's cores but its first, on or off: parking
+ * the big cores when nothing needs them. The first core of each cluster is
+ * never offlined (its cluster cannot come back from empty; see the module). */
 static void big_cores(bool on) {
-	char path[80], now[8];
-	if (access("/sys/module/zrn_hotplug", F_OK) != 0) {
-		return;
+	if (n_clusters < 2) {
+		return;		/* a single-cluster phone has no big cores to park */
 	}
-	for (size_t i = 0; i < sizeof(spare_big) / sizeof(spare_big[0]); i++) {
-		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/online", spare_big[i]);
-		FILE *f = fopen(path, "r");
-		now[0] = 0;
-		if (f) {
-			if (!fgets(now, sizeof(now), f)) {
-				now[0] = 0;
-			}
-			fclose(f);
-		}
-		if (now[0] && (now[0] == '1') != on) {
-			put(path, on ? "1" : "0");
-		}
+	const int *big = cluster_cpus[n_clusters - 1];
+	for (int i = 1; big[i] >= 0; i++) {
+		core_online(big[i], on);
 	}
+}
+
+/* idle 0: hold only the first two efficiency cores online (the cluster's cpu0
+ * and cpu1), its other cores off. The big cluster is left to big_cores, which
+ * keeps its first core online (a whole cluster offline can hang the bus; see
+ * the module). Scales with the phone: a four-core single cluster keeps cpu0
+ * and cpu1 and parks the rest. */
+static void idle_two_cores(bool two_only) {
+	const int *eff = cluster_cpus[0];
+	for (int i = 2; eff[i] >= 0; i++) {
+		core_online(eff[i], !two_only);
+	}
+}
+
+/* the entry of `table` nearest `target` kHz, for idle 0's ~1.3 GHz */
+static long nearest(const long *table, int n, long target) {
+	long best = table[0], bestd = labs(table[0] - target);
+	for (int i = 1; i < n; i++) {
+		long d = labs(table[i] - target);
+		if (d < bestd) { bestd = d; best = table[i]; }
+	}
+	return best;
 }
 
 /* The processor time `pid` has had, in clock ticks, all its threads together. */
@@ -469,7 +570,9 @@ static void apply(void) {
 	bool low = !screen_on && deepsleep;
 	char path[160];
 	long table[32];
-	for (int c = 0; c < 2; c++) {
+	bool idle0 = low && idle_mode == 0;
+	for (int c = 0; c < n_clusters; c++) {
+		bool big = c == n_clusters - 1 && n_clusters > 1;
 		snprintf(path, sizeof(path), CPUFREQ "/policy%d/scaling_available_frequencies", clusters[c]);
 		int n = points(path, table, 32);
 		if (n == 0) {
@@ -477,9 +580,12 @@ static void apply(void) {
 		}
 		long max = low ? table[0] : profile == POWERSAVE ? capped(table, n, 0.65) : table[n - 1];
 		bool flat_out = (profile == PERFORMANCE || boost == RAPID) && !low;
-		if (!low && c == 1 && boost == NOMINAL) {
+		if (idle0 && !big) {
+			/* idle 0: the two surviving cores run near 1.3 GHz (race to idle) */
+			max = nearest(table, n, IDLE_KHZ_TARGET);
+		} else if (!low && big && boost == NOMINAL) {
 			max = table[0];		/* the big cluster: nothing runs there, and slowly */
-		} else if (!low && c == 1 && boost == BIG) {
+		} else if (!low && big && boost == BIG) {
 			max = capped(table, n, BIG_SHARE);
 		}
 		snprintf(path, sizeof(path), CPUFREQ "/policy%d/scaling_governor", clusters[c]);
@@ -504,14 +610,25 @@ static void apply(void) {
 	}
 	/* Programs on the efficiency cores only, and the spare big cores off,
 	 * until something needs more; coming up, the cores first and then the
-	 * leave to use them. */
+	 * leave to use them. idle 0 goes further: only cpu0 and cpu1 stay online. */
 	bool few = boost == NOMINAL || low;
+	char eff_set[24], all_set[24];
+	int eff_last = cluster_cpus[0][0];
+	for (int i = 0; cluster_cpus[0][i] >= 0; i++) { eff_last = cluster_cpus[0][i]; }
+	snprintf(eff_set, sizeof(eff_set), "%d-%d", cluster_cpus[0][0], eff_last);
+	snprintf(all_set, sizeof(all_set), "0-%d", cpu_count - 1);
 	if (!few) {
 		big_cores(true);
+		idle_two_cores(false);
 	}
-	cores_allowed(few ? "0-3" : "0-7");
+	if (idle0) {
+		cores_allowed("0-1");
+	} else {
+		cores_allowed(few ? eff_set : all_set);
+	}
 	if (few) {
 		big_cores(false);
+		idle_two_cores(idle0);	/* only idle 0 parks cpu2+ of the efficiency cluster */
 	}
 	/* the light: blinking while rapid boost is on (the loop does the blinking) */
 	bool blink = boost == RAPID && !low && profile != PERFORMANCE;
@@ -538,6 +655,7 @@ static void status(void) {
 	if (f) {
 		fprintf(f, "profile=%s\ndeepsleep=%s\nscreen=%s\n", names[profile],
 			deepsleep ? "on" : "off", screen_on ? "on" : "off");
+		fprintf(f, "idle=%d\ncpus=%d\nclusters=%d\n", idle_mode, cpu_count, n_clusters);
 		fprintf(f, "condition=%s\nboost=%s\n", conditions[condition()], boost_names[boost]);
 		fprintf(f, "wifi=%s\n", wifi_asleep ? "sleeping" : "on");
 		for (int c = 0; c < 3; c++) {
@@ -555,6 +673,7 @@ static void save(void) {
 	FILE *f = fopen(STATE, "w");
 	if (f) {
 		fprintf(f, "profile %s\ndeepsleep %s\n", names[profile], deepsleep ? "on" : "off");
+		fprintf(f, "idle %d\n", idle_mode);
 		for (int c = 0; c < 3; c++) {
 			fprintf(f, "tickle %s %s\n", conditions[c], tickle_names[tickle_when[c]]);
 		}
@@ -619,6 +738,10 @@ static int command(char *line, bool persist) {
 		}
 	} else if (strcmp(what, "deepsleep") == 0) {
 		deepsleep = strcmp(value, "on") == 0;
+	} else if (strcmp(what, "idle") == 0) {
+		/* 0: two cores near 1.3 GHz (race to idle). 1: all efficiency cores,
+		 * lowest clock (the default). Only the screen-off deep-sleep state. */
+		idle_mode = atoi(value) == 0 ? 0 : 1;
 	} else if (strcmp(what, "screen") == 0) {
 		screen_on = strcmp(value, "off") != 0;
 		persist = false;
@@ -676,6 +799,7 @@ int main(void) {
 	signal(SIGTERM, stop);
 	signal(SIGINT, stop);
 	signal(SIGPIPE, SIG_IGN);
+	detect_topology();
 	FILE *f = fopen(STATE, "r");
 	while (f && fgets(line, sizeof(line), f)) {
 		command(line, false);
