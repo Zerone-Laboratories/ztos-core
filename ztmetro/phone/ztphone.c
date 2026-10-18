@@ -56,6 +56,7 @@ enum action {
 	ACT_SPEED_MENU,	/* arg: 0 remove, 1 move up, 2 move down */
 	ACT_ENTRY_SPEED,	/* add the number on the entry page to speed dial */
 	ACT_PIVOT_PLUS,	/* the plus on speed dial: pick a number from the history */
+	ACT_CANCEL,	/* the keypad's cancel: back to the history */
 };
 
 #define MAX_SPEED	30	/* what the phone allows in speed dial */
@@ -321,29 +322,45 @@ static double draw_keypad(cairo_t *cr) {
 	}
 	y += 64;
 	/* three across, four down, as the phone's */
-	const double gap = 4, kw = (zmc.width - 2 * MARGIN - 2 * gap) / 3, kh = 58;
+	/* the keys, as the phone's: a 3 by 4 grid of dark tiles that run to the
+	 * buttons at the foot, the digit with its letters beside it */
+	const double gap = 2, kw = (zmc.width - 2 * gap) / 3, kh = 84;
+	const double btn_h = 46, btn_y = zmc.height - btn_h - 14;
+	double keys_top = btn_y - 12 - 4 * kh - 3 * gap;
+	if (keys_top < y) {
+		keys_top = y;
+	}
 	for (int i = 0; i < 12; i++) {
-		double x = MARGIN + (i % 3) * (kw + gap), ky = y + (i / 3) * (kh + gap);
+		double x = (i % 3) * (kw + gap), ky = keys_top + (i / 3) * (kh + gap);
 		char label[2] = { KEYS[i].key, 0 };
+		bool letters = KEYS[i].letters[0] != 0;
+		cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
+		cairo_rectangle(cr, x, ky, kw, kh);
+		cairo_fill(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
-		zmc_text_centred(cr, label, FONT_LIGHT, 36, x + kw / 2, ky + (KEYS[i].letters[0] ? 2 : 10));
-		if (KEYS[i].letters[0]) {
-			cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-			zmc_text_centred(cr, KEYS[i].letters, FONT_SEMIBOLD, 10, x + kw / 2, ky + 40);
+		double dx = letters ? x + kw * 0.34 : x + kw / 2;
+		zmc_text_centred(cr, label, FONT_LIGHT, 40, dx, ky + kh / 2 - 26);
+		if (letters) {
+			cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
+			zmc_text(cr, KEYS[i].letters, FONT_SEMIBOLD, 12, x + kw * 0.56, ky + kh / 2 - 8, 0);
 		}
 		zmc_add_hit(x, ky, kw, kh, ACT_KEY, KEYS[i].key);
 	}
-	y += 4 * (kh + gap) + 8;
-	/* call across the middle, in the accent colour; text and save beside it */
-	double cw = zmc.width - 2 * MARGIN - 2 * 62;
-	zmc_accent(cr);
-	cairo_rectangle(cr, MARGIN + 62, y, cw, 46);
-	cairo_fill(cr);
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text_centred(cr, "call", FONT_SEMILIGHT, 22, zmc.width / 2.0, y + 8);
-	zmc_add_hit(MARGIN + 62, y, cw, 46, ACT_DIAL, 0);
-	zmc_round_button(cr, MARGIN + 22, y + 1, "message", "", ACT_TEXT, 0);
-	zmc_round_button(cr, zmc.width - MARGIN - 22, y + 1, "save", "", ACT_SAVE, 0);
+	/* call and save, outlined, along the foot */
+	double bw = (zmc.width - 2 * MARGIN - 10) / 2.0;
+	static const char *const words[2] = { "call", "save" };
+	int actions[2] = { ACT_DIAL, ACT_SAVE };
+	for (int i = 0; i < 2; i++) {
+		double x = MARGIN + i * (bw + 10);
+		cairo_set_source_rgb(cr, 0.4, 0.4, 0.4);
+		cairo_set_line_width(cr, 1.5);
+		cairo_rectangle(cr, x + 0.75, btn_y + 0.75, bw - 1.5, btn_h - 1.5);
+		cairo_stroke(cr);
+		cairo_set_source_rgb(cr, 0.92, 0.92, 0.92);
+		zmc_text_centred(cr, words[i], FONT_REGULAR, 16, x + bw / 2, btn_y + 12);
+		zmc_add_hit(x, btn_y, bw, btn_h, actions[i], 0);
+	}
+	y = btn_y + btn_h;
 	return y + 60;
 }
 
@@ -582,6 +599,9 @@ static void activate(int action, int arg) {
 		break;
 	}
 	case ACT_PIVOT_PLUS:
+		zmc_go(P_HISTORY, -1);
+		break;
+	case ACT_CANCEL:
 		zmc_go(P_HISTORY, -1);
 		break;
 	case ACT_ENTRY_SPEED:
