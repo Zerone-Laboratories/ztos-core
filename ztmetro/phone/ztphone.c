@@ -742,12 +742,6 @@ int main(int argc, char **argv) {
 		snprintf(entry, sizeof(entry), "0771234567");
 		int page = !strcmp(argv[2], "keypad") ? P_KEYPAD : !strcmp(argv[2], "call") ? P_CALL :
 			!strcmp(argv[2], "entry") ? P_ENTRY : !strcmp(argv[2], "speed") ? P_SPEED : P_HISTORY;
-		if (page == P_SPEED) {
-			n_speed = 0;
-			speed_add("0771234567");
-			speed_add("0112345678");
-			speed_add("0712223334");
-		}
 		if (page == P_CALL) {
 			snprintf(state, sizeof(state), "active");
 			snprintf(number, sizeof(number), "0771234567");
