@@ -2257,6 +2257,26 @@ static void backlight_set(int percent) {
 	if (percent < 1) percent = 1;
 	if (percent > 100) percent = 100;
 	bl.target = percent;
+	/* Publish the effective brightness: on the S9 the panel sits at a band
+	 * level, so a reader of /sys sees 20/40/70/100, not what is wanted. The
+	 * settings slider follows this file instead, so it does not snap to a band. */
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	if (runtime) {
+		char p[256], tmp[260], text[8];
+		snprintf(p, sizeof(p), "%s/ztmetro.brightness", runtime);
+		snprintf(tmp, sizeof(tmp), "%s.new", p);
+		int n = snprintf(text, sizeof(text), "%d\n", percent);
+		int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+		if (fd >= 0) {
+			if (write(fd, text, n) == n) {
+				close(fd);
+				if (rename(tmp, p) != 0) { unlink(tmp); }
+			} else {
+				close(fd);
+				unlink(tmp);
+			}
+		}
+	}
 	if (bl.mode == BL_S9) {
 		if (bl_band(percent) > bl.hw) {
 			bl_request(percent);	/* a higher band: only the panel can brighten */

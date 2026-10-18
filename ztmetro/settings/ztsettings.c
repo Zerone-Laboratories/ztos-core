@@ -1081,9 +1081,23 @@ static double draw_theme(cairo_t *cr) {
 	return draw_walls(cr, y + 60) + 24;
 }
 
-/* The panel's brightness as it is now, in percent (the shell or sensord may
- * have changed it); -1 when there is no backlight and the shell dims in software. */
+/* The brightness as it is now, in percent (the shell or sensord may have
+ * changed it); -1 when it cannot be told. The shell publishes its effective
+ * brightness to $XDG_RUNTIME_DIR/ztmetro.brightness: on the S9 the panel sits
+ * at a band level (20/40/70/100 %) with the rest done in software, so reading
+ * /sys would make the slider snap to the band. The file is the real value;
+ * /sys is only the fallback when the shell has not written it. */
 static int brightness_now(void) {
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	if (runtime) {
+		char path[256], v[16] = "";
+		snprintf(path, sizeof(path), "%s/ztmetro.brightness", runtime);
+		read_sys_file(path, v, sizeof(v));
+		if (v[0]) {
+			int p = atoi(v);
+			if (p > 0) return p;
+		}
+	}
 	char a[16], b[16];
 	read_sys_file("/sys/class/backlight/s9p-panel/brightness", a, sizeof(a));
 	read_sys_file("/sys/class/backlight/s9p-panel/max_brightness", b, sizeof(b));
