@@ -34,7 +34,7 @@
 
 #define MARGIN ZMC_MARGIN
 
-enum page { P_HISTORY, P_KEYPAD, P_CALL, P_ENTRY };
+enum page { P_HISTORY, P_SPEED, P_KEYPAD, P_CALL, P_ENTRY };
 
 enum action {
 	ACT_KEY = 1,	/* arg: the character */
@@ -51,7 +51,20 @@ enum action {
 	ACT_ANSWER,
 	ACT_MENU,
 	ACT_MENU_CLOSE,
+	ACT_KEYPAD,	/* the keypad, from the history */
+	ACT_SPEED_TILE,	/* arg: which speed dial entry (n_speed: the plus) */
+	ACT_SPEED_MENU,	/* arg: 0 remove, 1 move up, 2 move down */
+	ACT_ENTRY_SPEED,	/* add the number on the entry page to speed dial */
+	ACT_PIVOT_PLUS,	/* the plus on speed dial: pick a number from the history */
 };
+
+#define MAX_SPEED	30	/* what the phone allows in speed dial */
+struct speed_item {
+	char number[40], name[64];
+};
+static struct speed_item speed[MAX_SPEED];
+static int n_speed;
+static int speed_menu_for = -1;
 
 static char digits[40];
 static struct call_item calls[MAX_CALLS];
@@ -63,46 +76,144 @@ static char entry[40];			/* the number the entry page is of */
 static int menu_for = -1;
 static bool sample;
 
+/* speed dial: one entry a line, "number<TAB>name", kept in the user's data */
+static void speed_load(void) {
+	char path[300], line[120];
+	data_path(path, sizeof(path), "speeddial");
+	n_speed = 0;
+	FILE *f = fopen(path, "r");
+	while (f && n_speed < MAX_SPEED && fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\n")] = 0;
+		char *tab = strchr(line, '\t');
+		if (!tab || !line[0]) {
+			continue;
+		}
+		*tab = 0;
+		snprintf(speed[n_speed].number, sizeof(speed[n_speed].number), "%s", line);
+		snprintf(speed[n_speed].name, sizeof(speed[n_speed].name), "%s", tab + 1);
+		n_speed++;
+	}
+	if (f) {
+		fclose(f);
+	}
+}
+
+static void speed_save(void) {
+	char path[300], tmp[310];
+	data_path(path, sizeof(path), "speeddial");
+	snprintf(tmp, sizeof(tmp), "%s.new", path);
+	FILE *f = fopen(tmp, "w");
+	if (!f) {
+		return;
+	}
+	for (int i = 0; i < n_speed; i++) {
+		fprintf(f, "%s\t%s\n", speed[i].number, speed[i].name);
+	}
+	fclose(f);
+	rename(tmp, path);
+}
+
+static int speed_index(const char *number) {
+	for (int i = 0; i < n_speed; i++) {
+		if (!strcmp(speed[i].number, number)) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static void speed_add(const char *number) {
+	if (!number[0] || speed_index(number) >= 0) {
+		return;
+	}
+	if (n_speed >= MAX_SPEED) {
+		return;		/* "Too many in speed dial": the list is full */
+	}
+	snprintf(speed[n_speed].number, sizeof(speed[n_speed].number), "%s", number);
+	snprintf(speed[n_speed].name, sizeof(speed[n_speed].name), "%s", name_of(number));
+	n_speed++;
+	speed_save();
+	zmc_haptic("click");
+}
+
+static void speed_remove(int i) {
+	if (i < 0 || i >= n_speed) {
+		return;
+	}
+	memmove(speed + i, speed + i + 1, sizeof(speed[0]) * (size_t)(n_speed - i - 1));
+	n_speed--;
+	speed_save();
+}
+
+static void speed_move(int i, int by) {
+	int j = i + by;
+	if (i < 0 || i >= n_speed || j < 0 || j >= n_speed) {
+		return;
+	}
+	struct speed_item tmp = speed[i];
+	speed[i] = speed[j];
+	speed[j] = tmp;
+	speed_save();
+}
+
 static bool on_call(void) {
 	return state[0] && strcmp(state, "idle") != 0;
 }
 
 /* ---- history -------------------------------------------------------------- */
 
+/* The second line of a history item, in the phone's own words. */
 static void describe(const struct call_item *c, char *out, size_t size) {
-	char when[24];
-	when_text(c->at, when, sizeof(when));
 	if (!strcmp(c->type, "missed")) {
-		snprintf(out, size, "Missed, %s", when);
+		snprintf(out, size, "Missed call");
 	} else if (c->duration > 0) {
-		snprintf(out, size, "%s, %s, %ld:%02ld", !strcmp(c->type, "in") ? "Incoming" : "Outgoing", when,
+		snprintf(out, size, "%s, Duration: %ld:%02ld", !strcmp(c->type, "in") ? "Incoming" : "Outgoing",
 			c->duration / 60, c->duration % 60);
 	} else {
-		snprintf(out, size, "%s, %s", !strcmp(c->type, "in") ? "Incoming" : "Outgoing, no answer", when);
+		snprintf(out, size, "%s", !strcmp(c->type, "in") ? "Incoming" : "Outgoing");
 	}
 }
 
 static double draw_history(cairo_t *cr) {
-	double y = zmc_pivot_next(cr, "history", "keypad", ZMC_ACT_PIVOT, P_KEYPAD);
+	double y = zmc_pivot_next(cr, "history", "speed dial", ZMC_ACT_PIVOT, P_SPEED);
 	if (!sample) {
 		n_calls = calls_load(calls, MAX_CALLS);
 	}
+	/* the keypad: a row at the top, as the phone's keypad button */
+	cairo_set_source_rgb(cr, 0.13, 0.13, 0.13);
+	cairo_rectangle(cr, MARGIN, y, zmc.width - 2 * MARGIN, 44);
+	cairo_fill(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	for (int r = 0; r < 3; r++) {
+		for (int c = 0; c < 3; c++) {
+			cairo_arc(cr, MARGIN + 22 + (c - 1) * 6, y + 22 + (r - 1) * 6, 1.6, 0, 2 * M_PI);
+			cairo_fill(cr);
+		}
+	}
+	zmc_text(cr, "keypad", FONT_REGULAR, 15, MARGIN + 46, y + 12, 0);
+	zmc_add_hit(MARGIN, y, zmc.width - 2 * MARGIN, 44, ACT_KEYPAD, 0);
+	y += 60;
 	if (n_calls == 0) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		y += zmc_text(cr, "No calls.", FONT_REGULAR, 14, MARGIN, y,
-			zmc.width - 2 * MARGIN) + 20;
+		y += zmc_text(cr, "Calls you make or receive will appear here. Tap the keypad icon to call someone.",
+			FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 20;
 		return y;
 	}
 	double menu_at = -1;
 	for (int i = 0; i < n_calls; i++) {
 		struct call_item *c = &calls[i];
 		bool missed = !strcmp(c->type, "missed");
-		char detail[80];
+		char detail[80], when[24];
 		describe(c, detail, sizeof(detail));
+		when_text(c->at, when, sizeof(when));
 		/* the round button rings back; the rest opens the call */
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		zmc_round_button(cr, MARGIN + 22, y + 2, "call", "", ACT_REDIAL, i);
-		zmc_text_line(cr, name_of(c->number), FONT_SEMILIGHT, 24, MARGIN + 58, y, zmc.width - MARGIN - 58 - 10);
+		double tw = zmc_text_width(when, FONT_REGULAR, 13);
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, when, FONT_REGULAR, 13, zmc.width - MARGIN - tw, y + 6, 0);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text_line(cr, name_of(c->number), FONT_SEMILIGHT, 24, MARGIN + 58, y, zmc.width - MARGIN - 58 - tw - 14);
 		if (missed) {
 			zmc_accent(cr);
 		} else {
@@ -117,9 +228,59 @@ static double draw_history(cairo_t *cr) {
 	}
 	y += 20;
 	if (menu_for >= 0 && menu_at >= 0) {
-		static const char *const items[] = { "call", "text", "add to people" };
+		static const char *const items[] = { "call", "text", "add to speed dial" };
 		bool known = strcmp(name_of(calls[menu_for].number), calls[menu_for].number) != 0;
 		zmc_menu(cr, menu_at, items, known ? 2 : 3, ACT_MENU, ACT_MENU_CLOSE);
+	}
+	return y;
+}
+
+/* ---- speed dial ----------------------------------------------------------- */
+
+/* The speed dial: two across, a tile to each entry, in the accent colour, and
+ * a plus at the end. Tap a tile to call it; hold for the menu. */
+static double draw_speed(cairo_t *cr) {
+	double y = zmc_pivot_next(cr, "speed dial", "history", ZMC_ACT_PIVOT, P_HISTORY);
+	if (n_speed == 0) {
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		y += zmc_text(cr, "Looking for quicker calling? Tap the plus sign to add someone to speed dial.",
+			FONT_REGULAR, 14, MARGIN, y + 8, zmc.width - 2 * MARGIN) + 12;
+	}
+	const double gap = 8, side = (zmc.width - 2 * MARGIN - gap) / 2, h = 112;
+	int total = n_speed + 1;	/* the plus takes the last place */
+	double menu_y = -1;
+	for (int i = 0; i < total; i++) {
+		double x = MARGIN + (i % 2) * (side + gap), ty = y + (i / 2) * (h + gap);
+		if (i < n_speed) {
+			zmc_accent(cr);
+			cairo_rectangle(cr, x, ty, side, h);
+			cairo_fill(cr);
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_text_line(cr, speed[i].name[0] ? speed[i].name : speed[i].number, FONT_SEMILIGHT, 20,
+				x + 12, ty + h - 50, side - 24);
+			cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
+			zmc_text(cr, "mobile", FONT_REGULAR, 12.5, x + 12, ty + h - 26, 0);
+			zmc_add_hit(x, ty, side, h, ACT_SPEED_TILE, i);
+			if (i == speed_menu_for) {
+				menu_y = ty + h;
+			}
+		} else {
+			cairo_set_source_rgb(cr, 0.13, 0.13, 0.13);
+			cairo_rectangle(cr, x, ty, side, h);
+			cairo_fill(cr);
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			cairo_set_line_width(cr, 2);
+			double cx = x + side / 2, cy = ty + h / 2;
+			cairo_move_to(cr, cx - 16, cy); cairo_line_to(cr, cx + 16, cy);
+			cairo_move_to(cr, cx, cy - 16); cairo_line_to(cr, cx, cy + 16);
+			cairo_stroke(cr);
+			zmc_add_hit(x, ty, side, h, ACT_PIVOT_PLUS, 0);
+		}
+	}
+	y += ((total + 1) / 2) * (h + gap) + 16;
+	if (speed_menu_for >= 0 && menu_y >= 0) {
+		static const char *const items[] = { "remove", "move up", "move down" };
+		zmc_menu(cr, menu_y, items, 3, ACT_SPEED_MENU, ACT_MENU_CLOSE);
 	}
 	return y;
 }
@@ -131,8 +292,7 @@ static double draw_keypad(cairo_t *cr) {
 		{ '1', "" }, { '2', "ABC" }, { '3', "DEF" }, { '4', "GHI" }, { '5', "JKL" }, { '6', "MNO" },
 		{ '7', "PQRS" }, { '8', "TUV" }, { '9', "WXYZ" }, { '*', "" }, { '0', "+" }, { '#', "" },
 	};
-	double y = zmc_pivot_next(cr, "keypad", "history", ZMC_ACT_PIVOT, P_HISTORY);
-	y -= 14;
+	double y = zmc_header(cr, "keypad") - 14;
 	/* the number so far, and under it whose it is */
 	double size = strlen(digits) > 13 ? 26 : 34;
 	cairo_set_source_rgb(cr, 1, 1, 1);
@@ -165,14 +325,11 @@ static double draw_keypad(cairo_t *cr) {
 	for (int i = 0; i < 12; i++) {
 		double x = MARGIN + (i % 3) * (kw + gap), ky = y + (i / 3) * (kh + gap);
 		char label[2] = { KEYS[i].key, 0 };
-		cairo_set_source_rgb(cr, 0.13, 0.13, 0.13);
-		cairo_rectangle(cr, x, ky, kw, kh);
-		cairo_fill(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
-		zmc_text_centred(cr, label, FONT_LIGHT, 28, x + kw / 2, ky + (KEYS[i].letters[0] ? 5 : 11));
+		zmc_text_centred(cr, label, FONT_LIGHT, 36, x + kw / 2, ky + (KEYS[i].letters[0] ? 2 : 10));
 		if (KEYS[i].letters[0]) {
 			cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-			zmc_text_centred(cr, KEYS[i].letters, FONT_REGULAR, 10.5, x + kw / 2, ky + 39);
+			zmc_text_centred(cr, KEYS[i].letters, FONT_SEMIBOLD, 10, x + kw / 2, ky + 40);
 		}
 		zmc_add_hit(x, ky, kw, kh, ACT_KEY, KEYS[i].key);
 	}
@@ -258,6 +415,9 @@ static double draw_entry(cairo_t *cr) {
 	if (!known) {
 		y = zmc_entry(cr, y, "add to people", "", ACT_ENTRY_SAVE, 0);
 	}
+	bool on_speed = speed_index(entry) >= 0;
+	y = zmc_entry(cr, y, on_speed ? "remove from speed dial" : "add to speed dial", "",
+		ACT_ENTRY_SPEED, 0);
 	/* the calls there have been with this number */
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Calls", FONT_REGULAR, 13, MARGIN, y + 6, 0);
@@ -282,6 +442,7 @@ static double draw_entry(cairo_t *cr) {
 static double render(cairo_t *cr, int page) {
 	switch (page) {
 	case P_HISTORY: return draw_history(cr);
+	case P_SPEED: return draw_speed(cr);
 	case P_KEYPAD: return draw_keypad(cr);
 	case P_CALL: return draw_call(cr);
 	case P_ENTRY: return draw_entry(cr);
@@ -393,6 +554,43 @@ static void activate(int action, int arg) {
 	}
 	case ACT_MENU_CLOSE:
 		menu_for = -1;
+		speed_menu_for = -1;
+		break;
+	case ACT_KEYPAD:
+		came_from = P_HISTORY;
+		zmc_go(P_KEYPAD, 1);
+		break;
+	case ACT_SPEED_TILE:
+		if (arg >= 0 && arg < n_speed) {
+			dial(speed[arg].number);
+		}
+		break;
+	case ACT_SPEED_MENU: {
+		int which = speed_menu_for;
+		speed_menu_for = -1;
+		if (which < 0 || which >= n_speed) {
+			break;
+		}
+		if (arg == 0) {
+			speed_remove(which);
+		} else if (arg == 1) {
+			speed_move(which, -1);
+		} else {
+			speed_move(which, 1);
+		}
+		zmc_redraw();
+		break;
+	}
+	case ACT_PIVOT_PLUS:
+		zmc_go(P_HISTORY, -1);
+		break;
+	case ACT_ENTRY_SPEED:
+		if (speed_index(entry) >= 0) {
+			speed_remove(speed_index(entry));
+		} else {
+			speed_add(entry);
+		}
+		zmc_redraw();
 		break;
 	}
 }
@@ -400,6 +598,10 @@ static void activate(int action, int arg) {
 static bool hold(int action, int arg) {
 	if (zmc.page == P_HISTORY && (action == ACT_OPEN || action == ACT_REDIAL) && menu_for < 0) {
 		menu_for = arg;
+		return true;
+	}
+	if (zmc.page == P_SPEED && action == ACT_SPEED_TILE && speed_menu_for < 0 && arg < n_speed) {
+		speed_menu_for = arg;
 		return true;
 	}
 	if (zmc.page == P_KEYPAD && action == ACT_KEY && arg == '0') {
@@ -437,7 +639,12 @@ static bool back(void) {
 		zmc_redraw();
 		return true;
 	}
-	if (zmc.page == P_ENTRY) {
+	if (speed_menu_for >= 0) {
+		speed_menu_for = -1;
+		zmc_redraw();
+		return true;
+	}
+	if (zmc.page == P_ENTRY || zmc.page == P_KEYPAD) {
 		zmc_go(P_HISTORY, -1);
 		return true;
 	}
@@ -493,6 +700,7 @@ static const struct zmc_app phone = {
 
 int main(int argc, char **argv) {
 	contacts_load();
+	speed_load();
 	if (argc == 4 && !strcmp(argv[1], "--render")) {
 		/* made-up calls: only for looking at the pages */
 		static const struct { const char *type; int ago; const char *number; long lasted; } made[] = {
@@ -513,7 +721,13 @@ int main(int argc, char **argv) {
 		snprintf(digits, sizeof(digits), "0771234567");
 		snprintf(entry, sizeof(entry), "0771234567");
 		int page = !strcmp(argv[2], "keypad") ? P_KEYPAD : !strcmp(argv[2], "call") ? P_CALL :
-			!strcmp(argv[2], "entry") ? P_ENTRY : P_HISTORY;
+			!strcmp(argv[2], "entry") ? P_ENTRY : !strcmp(argv[2], "speed") ? P_SPEED : P_HISTORY;
+		if (page == P_SPEED) {
+			n_speed = 0;
+			speed_add("0771234567");
+			speed_add("0112345678");
+			speed_add("0712223334");
+		}
 		if (page == P_CALL) {
 			snprintf(state, sizeof(state), "active");
 			snprintf(number, sizeof(number), "0771234567");
