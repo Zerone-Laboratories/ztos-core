@@ -324,6 +324,7 @@ struct zt_anim {
 	float from, to;
 	uint32_t start, duration;	/* ms */
 	bool linear;			/* otherwise exponential ease-out */
+	float overshoot;		/* >0: a back-ease-out, past the target then back */
 };
 
 struct zt_text_input {
@@ -798,6 +799,19 @@ static void animate(struct zt_server *server, float *value, float to, uint32_t d
 	damage(server);
 }
 
+/* Like animate(), but the value overshoots the target by `overshoot` of the
+ * travel and settles: the live-tile notify flip's rock-back. */
+static void animate_spring(struct zt_server *server, float *value, float to,
+		uint32_t duration, float overshoot) {
+	animate(server, value, to, duration, 0, false);
+	for (int i = 0; i < MAX_ANIMS; i++) {
+		if (server->anims[i].active && server->anims[i].value == value) {
+			server->anims[i].overshoot = overshoot;
+			break;
+		}
+	}
+}
+
 /* Use a timestamp shared with a client. animate() scales relative delays by
  * the menu speed, so passing an already scaled wall-clock delay through it
  * would postpone the reveal a second time. */
@@ -850,7 +864,15 @@ static bool anims_step(struct zt_server *server, uint32_t now) {
 			a->active = false;
 			continue;
 		}
-		float e = a->linear ? t : (1.0f - powf(2.0f, -10.0f * t)) / (1.0f - 1.0f / 1024.0f);
+		float e;
+		if (a->overshoot > 0.0f) {
+			/* a back-ease-out: overshoots the target by `overshoot` of the
+			 * travel, then settles (the live-tile notify flip's rock-back) */
+			float c1 = 1.70158f * a->overshoot / 0.1f, c3 = c1 + 1.0f, u = t - 1.0f;
+			e = 1.0f + c3 * u * u * u + c1 * u * u;
+		} else {
+			e = a->linear ? t : (1.0f - powf(2.0f, -10.0f * t)) / (1.0f - 1.0f / 1024.0f);
+		}
 		*a->value = a->from + (a->to - a->from) * e;
 		running = true;
 	}
@@ -2853,7 +2875,9 @@ static void live_tick(struct zt_server *server) {
 			continue;
 		}
 		bool to_back = t->flip < 90.0f;
-		animate(server, &t->flip, to_back ? 180.0f : 0.0f, 520, 0, false);
+		/* the Windows Phone live-tile notify flip: the face turns in and rocks
+		 * back a little (NotificationCycleShow overshoots -180 -> 35 -> -6 -> 0) */
+		animate_spring(server, &t->flip, to_back ? 180.0f : 0.0f, 520, 0.08f);
 		/* the back stays up a while to be read; the front a random while */
 		t->next_flip_ms = now + (to_back ? 5000 + (uint32_t)(rand() % 3000) :
 			4000 + (uint32_t)(rand() % 6000));
