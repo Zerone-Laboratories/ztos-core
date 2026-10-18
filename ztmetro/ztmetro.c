@@ -2632,8 +2632,35 @@ static void glyphs_forget(struct zt_server *server) {
 /* A tile's or a row's picture in a box of `s` points centred on (cx, cy), in
  * the current colour: a line glyph of ours by name, or "@" and the glyph made
  * from the application's icon, or, with neither, the name's first letter. */
+/* A known Windows Phone app, by its name: its tile shows the real Segoe UI
+ * Symbol glyph (the firmware's) rather than whatever icon the app ships. */
+static const char *app_symbol_name(const char *label) {
+	static const struct { const char *label, *name; } apps[] = {
+		{ "music", "music" }, { "phone", "phone" }, { "people", "people" },
+		{ "contacts", "people" }, { "messaging", "message" }, { "messages", "message" },
+		{ "mail", "mail" }, { "email", "mail" }, { "calendar", "calendar" },
+		{ "store", "store" }, { "camera", "camera" }, { "maps", "map" }, { "map", "map" },
+	};
+	char low[32];
+	size_t i = 0;
+	for (; label[i] && i < sizeof(low) - 1; i++) {
+		low[i] = label[i] >= 'A' && label[i] <= 'Z' ? label[i] + 32 : label[i];
+	}
+	low[i] = 0;
+	for (size_t k = 0; k < sizeof(apps) / sizeof(apps[0]); k++) {
+		if (strcmp(low, apps[k].label) == 0) {
+			return apps[k].name;
+		}
+	}
+	return NULL;
+}
+
 static void draw_glyph(struct zt_server *server, cairo_t *cr, const char *icon,
 		const char *label, double cx, double cy, double s) {
+	const char *sym = label ? app_symbol_name(label) : NULL;
+	if (sym && draw_icon_symbol(cr, sym, cx, cy, s)) {
+		return;	/* a known Windows Phone app: its real tile glyph */
+	}
 	if (icon[0] != '@') {
 		draw_icon(cr, icon, cx, cy, s);
 		return;
