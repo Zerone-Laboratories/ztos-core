@@ -138,6 +138,24 @@ static double note(cairo_t *cr, double y, const char *text) {
 	return y + zmc_text(cr, text, FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 18;
 }
 
+/* Soft placeholders the size of the real thing, drawn while a list is still
+ * loading, so the page keeps its shape and nothing pops in or jumps about as
+ * the cached lists and then the network lists arrive. */
+static void skel_box(cairo_t *cr, double x, double y, double w, double h) {
+	cairo_set_source_rgba(cr, 1, 1, 1, 0.07);
+	cairo_rectangle(cr, x, y, w, h);
+	cairo_fill(cr);
+}
+
+static double skel_row(cairo_t *cr, double y) {
+	double x = MARGIN + 68, w = zmc.width - x - MARGIN;
+	skel_box(cr, MARGIN, y, 56, 56);		/* the tile */
+	skel_box(cr, x, y, w * 0.55, 16);		/* the name */
+	skel_box(cr, x, y + 25, w * 0.85, 12);		/* the line about it */
+	skel_box(cr, x, y + 45, 54, 13);		/* the source badge */
+	return y + 76;
+}
+
 /* the phone's plain button: a white outline with its label in the middle */
 static double button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg) {
 	white(cr);
@@ -612,11 +630,29 @@ static double draw_top(cairo_t *cr) {
 		y = note(cr, y, load_note);
 	}
 	if (!sections.n) {
-		return note(cr, y, loading ? "Reading your repos…" : "No lists to show.");
+		if (!loading) {
+			return note(cr, y, "No lists to show.");
+		}
+		/* nothing read yet: a skeleton the shape of the page to come */
+		skel_box(cr, MARGIN, y, zmc.width - 2 * MARGIN, 150);
+		y += 150 + 26;
+		for (int s = 0; s < 2; s++) {
+			skel_box(cr, MARGIN, y, 180, 20);
+			y += 34;
+			for (int k = 0; k < ROWS_SHOWN; k++) {
+				y = skel_row(cr, y);
+			}
+			y += 14;
+		}
+		return y + 20;
 	}
 	/* the first list's first package, large */
 	int from = -1;
 	struct pkg *spot = spotlight(&from);
+	if (!spot && loading) {
+		skel_box(cr, MARGIN, y, zmc.width - 2 * MARGIN, 150);
+		y += 150 + 26;
+	}
 	if (spot) {
 		struct section *s = sections.v[from];
 		double w = zmc.width - 2 * MARGIN, h = 150;
@@ -650,7 +686,14 @@ static double draw_top(cairo_t *cr) {
 		}
 		y = heading(cr, y, s->title, s->caption);
 		if (!s->items.n) {
-			y = note(cr, y, s->note ? s->note : (loading ? "Getting this list…" : "Nothing here yet."));
+			if (loading && !s->note) {
+				for (int k = 0; k < ROWS_SHOWN; k++) {
+					y = skel_row(cr, y);
+				}
+				y += 14;
+			} else {
+				y = note(cr, y, s->note ? s->note : "Nothing here yet.");
+			}
 			continue;
 		}
 		for (int k = first; k < s->items.n && k < first + ROWS_SHOWN; k++) {
