@@ -40,6 +40,7 @@ struct webview {
 	cairo_surface_t *frame;	/* fallback only: the latest frame as pixels */
 	unsigned frame_rev;	/* bumped each frame so the GPU re-uploads */
 	void *image;		/* the latest frame as an imported GPU image (no copy) */
+	void *im;		/* ZtIm: the page's text fields */
 	bool logged;
 	struct wv_delegate d;
 };
@@ -62,12 +63,27 @@ static void imported_free(gpointer p) {
 }
 
 /* the frame is ready on the GPU: wait for its render fence, if it has one */
+static struct { int frames; double fence_ms, worst_ms; gint64 since; } stats;
+
 static void wait_rendered(WPEBuffer *buffer) {
 	int fd = wpe_buffer_take_rendering_fence(buffer);
+	gint64 t0 = g_get_monotonic_time();
 	if (fd >= 0) {
 		struct pollfd p = { .fd = fd, .events = POLLIN };
 		poll(&p, 1, 50);
 		close(fd);
+	}
+	if (getenv("ZTB_DEBUG")) {
+		double ms = (g_get_monotonic_time() - t0) / 1000.0;
+		stats.frames++;
+		stats.fence_ms += ms;
+		if (ms > stats.worst_ms) stats.worst_ms = ms;
+		if (!stats.since) stats.since = t0;
+		if (t0 - stats.since > 1000000) {
+			fprintf(stderr, "ztbrowser: %d frames/s, fence wait %.2f ms avg (worst %.2f), fence=%s\n",
+				stats.frames, stats.fence_ms / stats.frames, stats.worst_ms, fd >= 0 ? "yes" : "none");
+			stats.frames = 0; stats.fence_ms = stats.worst_ms = 0; stats.since = t0;
+		}
 	}
 }
 
@@ -199,6 +215,67 @@ static void tune(WebKitSettings *s) {
 
 /* ---- the interface -------------------------------------------------------- */
 
+/* ---- the page's text fields: WebKit's input method context ----------------
+ * WebKit tells this context when a text field takes focus, where its caret
+ * is, and when it lets go; the shell's keyboard then comes up over it, and
+ * what is typed goes back in through the "committed" signal. */
+typedef struct {
+	WebKitInputMethodContext parent;
+	struct webview *wv;
+	int caret_bottom;
+	bool focused;
+} ZtIm;
+typedef struct {
+	WebKitInputMethodContextClass parent;
+} ZtImClass;
+G_DEFINE_TYPE(ZtIm, zt_im, WEBKIT_TYPE_INPUT_METHOD_CONTEXT)
+
+static void im_tell(ZtIm *im) {
+	struct webview *wv = im->wv;
+	if (wv && wv->d.ime) {
+		wv->d.ime(wv->d.user, im->focused, im->caret_bottom);
+	}
+}
+static void im_focus_in(WebKitInputMethodContext *c) {
+	ZtIm *im = (ZtIm *)c;
+	im->focused = true;
+	im_tell(im);
+}
+static void im_focus_out(WebKitInputMethodContext *c) {
+	ZtIm *im = (ZtIm *)c;
+	im->focused = false;
+	im_tell(im);
+}
+static void im_cursor_area(WebKitInputMethodContext *c, int x, int y, int w, int h) {
+	(void)x; (void)w;
+	ZtIm *im = (ZtIm *)c;
+	im->caret_bottom = y + h;
+	if (im->focused) {
+		im_tell(im);	/* the field moved, or the caret went to another line */
+	}
+}
+static void im_get_preedit(WebKitInputMethodContext *c, gchar **text, GList **underlines, guint *cursor) {
+	(void)c;
+	if (text) *text = g_strdup("");
+	if (underlines) *underlines = NULL;
+	if (cursor) *cursor = 0;
+}
+static gboolean im_filter_key(WebKitInputMethodContext *c, gpointer ev) { (void)c; (void)ev; return FALSE; }
+static void im_reset(WebKitInputMethodContext *c) { (void)c; }
+static void im_set_preedit(WebKitInputMethodContext *c, gboolean on) { (void)c; (void)on; }
+
+static void zt_im_class_init(ZtImClass *k) {
+	WebKitInputMethodContextClass *c = WEBKIT_INPUT_METHOD_CONTEXT_CLASS(k);
+	c->notify_focus_in = im_focus_in;
+	c->notify_focus_out = im_focus_out;
+	c->notify_cursor_area = im_cursor_area;
+	c->get_preedit = im_get_preedit;
+	c->filter_key_event = im_filter_key;
+	c->reset = im_reset;
+	c->set_enable_preedit = im_set_preedit;
+}
+static void zt_im_init(ZtIm *im) { im->caret_bottom = -1; }
+
 struct webview *webview_create(struct wl_display *display, struct wl_compositor *compositor,
 			       struct wl_surface *parent, const char *data_dir,
 			       const struct wv_delegate *delegate) {
@@ -229,6 +306,12 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 		wpe_view_set_visible(wv->view, TRUE);
 		wpe_view_focus_in(wv->view);	/* input (clicks, keys) only reaches a focused view */
 	}
+
+	ZtIm *im = g_object_new(zt_im_get_type(), NULL);
+	im->wv = wv;
+	wv->im = im;
+	webkit_web_view_set_input_method_context(wv->web, WEBKIT_INPUT_METHOD_CONTEXT(im));
+	g_object_unref(im);	/* the view holds it */
 
 	g_signal_connect(wv->web, "notify::title", G_CALLBACK(notify_title), wv);
 	g_signal_connect(wv->web, "notify::uri", G_CALLBACK(notify_uri), wv);
@@ -359,7 +442,27 @@ void webview_touch_cancel(struct webview *wv) {
 	(void)wv;
 	finger.active = false;
 }
-void webview_key(struct webview *wv, const char *utf8) { (void)wv; (void)utf8; }
+/* one key press and release; keycodes are evdev + 8, as XKB counts them */
+static void key_tap(struct webview *wv, guint keycode, guint keyval) {
+	guint32 t = (guint32)(g_get_monotonic_time() / 1000);
+	send(wv, wpe_event_keyboard_new(WPE_EVENT_KEYBOARD_KEY_DOWN, wv->view, WPE_INPUT_SOURCE_KEYBOARD,
+		t, 0, keycode, keyval));
+	send(wv, wpe_event_keyboard_new(WPE_EVENT_KEYBOARD_KEY_UP, wv->view, WPE_INPUT_SOURCE_KEYBOARD,
+		t, 0, keycode, keyval));
+}
+
+void webview_key(struct webview *wv, const char *utf8) {
+	if (!wv || !wv->view || !wv->im) {
+		return;
+	}
+	if (strcmp(utf8, "\b") == 0) {
+		key_tap(wv, 14 + 8, WPE_KEY_BackSpace);	/* KEY_BACKSPACE */
+	} else if (strcmp(utf8, "\n") == 0) {
+		key_tap(wv, 28 + 8, WPE_KEY_Return);	/* KEY_ENTER: submits a search */
+	} else {
+		g_signal_emit_by_name(wv->im, "committed", utf8);
+	}
+}
 void webview_scroll(struct webview *wv, double dx, double dy) { (void)wv; (void)dx; (void)dy; }
 
 void webview_composite(struct webview *wv, int x, int y, int w, int h) {
@@ -376,9 +479,48 @@ void webview_composite(struct webview *wv, int x, int y, int w, int h) {
 	}
 }
 
+/* WebKit's GLib work, event-driven: after each run, the file descriptors GLib
+ * waits on (the web process's IPC, the network, timers' eventfds) go into
+ * zmc's own poll and GLib's next timeout becomes zmc's timer, so WebKit is
+ * served the moment something happens instead of on a fixed 16 ms tick that
+ * added up to a frame of latency to every event, and woke the CPU for nothing
+ * when idle. */
+#define GLIB_FDS 32
+static int watched[GLIB_FDS], n_watched;
+
+static void glib_ready(int fd, void *data) { (void)fd; (void)data; webview_pump(); }
+static void glib_tick(void) { webview_pump(); }
+
 void webview_pump(void) {
-	while (g_main_context_iteration(NULL, FALSE)) {
+	GMainContext *c = g_main_context_default();
+	while (g_main_context_iteration(c, FALSE)) {
 	}
+	if (!g_main_context_acquire(c)) {
+		return;
+	}
+	gint prio = 0, timeout = -1;
+	GPollFD fds[GLIB_FDS];
+	g_main_context_prepare(c, &prio);
+	int n = g_main_context_query(c, prio, &timeout, fds, GLIB_FDS);
+	g_main_context_release(c);
+	if (n > GLIB_FDS) n = GLIB_FDS;
+	/* stop watching what GLib no longer waits on, start on what is new */
+	for (int i = 0; i < n_watched; i++) {
+		bool keep = false;
+		for (int j = 0; j < n && !keep; j++) keep = fds[j].fd == watched[i];
+		if (!keep) zmc_watch_fd(watched[i], NULL, NULL);
+	}
+	for (int j = 0; j < n; j++) {
+		bool known = false;
+		for (int i = 0; i < n_watched && !known; i++) known = watched[i] == fds[j].fd;
+		if (!known && fds[j].fd >= 0) zmc_watch_fd(fds[j].fd, glib_ready, NULL);
+	}
+	n_watched = 0;
+	for (int j = 0; j < n; j++) {
+		if (fds[j].fd >= 0) watched[n_watched++] = fds[j].fd;
+	}
+	/* GLib's next timer, or a slow heartbeat when it has none */
+	zmc_every(timeout < 0 ? 1000 : timeout < 1 ? 1 : timeout, glib_tick);
 }
 
 void webview_destroy(struct webview *wv) {

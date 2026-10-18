@@ -23,6 +23,9 @@ struct wv_delegate {
 	void (*progress)(void *user, double fraction);	/* 0..1 */
 	void (*load)(void *user, enum wv_load state);
 	void (*secure)(void *user, bool https_ok);
+	/* a text field in the page took or lost focus; caret_bottom: where its
+	 * caret ends, in points from the top of the view (-1: not known) */
+	void (*ime)(void *user, bool active, int caret_bottom);
 	void *user;
 };
 
@@ -52,7 +55,8 @@ void webview_touch_down(struct webview *wv, int id, double x, double y, unsigned
 void webview_touch_motion(struct webview *wv, int id, double x, double y, unsigned time);
 void webview_touch_up(struct webview *wv, int id, unsigned time);
 void webview_touch_cancel(struct webview *wv);
-void webview_key(struct webview *wv, const char *utf8);	/* a char, "\b" or "\n" */
+/* typing into the page's focused text field: a char, "\b" or "\n" */
+void webview_key(struct webview *wv, const char *utf8);
 void webview_scroll(struct webview *wv, double dx, double dy);
 
 /* Draw the latest page frame as a GPU quad over (x,y,w,h) in points. Call from

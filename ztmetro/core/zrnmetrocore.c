@@ -63,7 +63,7 @@
 #define TURN_IN_DEG	80.0
 #define DEPTH_FOV_DEG	34.0	/* the shell's field of view, for the same depth */
 #define ANIM_SCALE	(zmg_ready() ? zmc.scale : 2)	/* GLES keeps native resolution */
-#define MAX_SOURCES	6
+#define MAX_SOURCES	40	/* an app with an engine of its own (WebKit) hands its GLib fds in here */
 
 struct zmc_state zmc = { .scale = 4, .width = 360, .height = 640, .running = true,
 	.accent = 0x0050ef, .entrance_rate = 1.0 };

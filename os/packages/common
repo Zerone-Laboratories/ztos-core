@@ -38,6 +38,12 @@ libpulse
 ttf-dejavu
 wl-clipboard
 wpewebkit
+# the browser's audio and video (WebKit plays media through GStreamer)
+gst-plugins-base
+gst-plugins-good
+gst-plugins-bad
+gst-libav
+gst-plugin-pipewire
 
 # to build ztMETRO and its apps inside the image (and for developers after)
 base-devel

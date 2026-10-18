@@ -532,6 +532,85 @@ static long long cpu_ticks(pid_t pid) {
 	return ticks;
 }
 
+/* The app in front is often more than one process: a browser's pages run in
+ * WebKit's web, network and sandbox (bwrap) processes, its children. Its load
+ * is the whole tree's, and the whole tree gets the front app's priority.
+ * The tree is found again every 2 s (a /proc walk); each look only reads the
+ * members' stat. */
+#define TREE_MAX	64
+static pid_t tree[TREE_MAX];
+static int n_tree;
+static pid_t tree_root;
+static long tree_found_at;
+
+static long boost_ms(void);
+static void prioritise(pid_t pid, int nice, int uclamp);
+
+static void tree_find(void) {
+	static pid_t pids[4096], ppids[4096];
+	int n = 0;
+	DIR *d = opendir("/proc");
+	struct dirent *e;
+	while (d && (e = readdir(d)) && n < 4096) {
+		pid_t pid = atoi(e->d_name);
+		if (pid <= 0) continue;
+		char path[64], line[512];
+		snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+		FILE *f = fopen(path, "r");
+		if (!f) continue;
+		if (fgets(line, sizeof(line), f)) {
+			char *p = strrchr(line, ')');
+			int ppid;
+			if (p && sscanf(p + 2, "%*c %d", &ppid) == 1) {
+				pids[n] = pid;
+				ppids[n] = ppid;
+				n++;
+			}
+		}
+		fclose(f);
+	}
+	if (d) closedir(d);
+	pid_t old[TREE_MAX];
+	int n_old = n_tree;
+	memcpy(old, tree, sizeof(pid_t) * n_tree);
+	n_tree = 0;
+	if (front_pid > 0) {
+		tree[n_tree++] = front_pid;
+		for (int head = 0; head < n_tree && n_tree < TREE_MAX; head++) {
+			for (int i = 0; i < n && n_tree < TREE_MAX; i++) {
+				if (ppids[i] == tree[head]) tree[n_tree++] = pids[i];
+			}
+		}
+	}
+	/* newcomers (a web process started) get the front app's priority */
+	for (int i = 1; i < n_tree; i++) {
+		bool known = false;
+		for (int j = 0; j < n_old && !known; j++) known = old[j] == tree[i];
+		if (!known || tree_root != front_pid) prioritise(tree[i], FRONT_NICE, FRONT_UCLAMP);
+	}
+	tree_root = front_pid;
+	tree_found_at = boost_ms();
+}
+
+/* the front app's whole tree: processor ticks, all together */
+static long long front_ticks(void) {
+	if (front_pid <= 0) return -1;
+	if (tree_root != front_pid || boost_ms() - tree_found_at > 2000) tree_find();
+	long long sum = 0;
+	for (int i = 0; i < n_tree; i++) {
+		long long t = cpu_ticks(tree[i]);
+		if (t > 0) sum += t;
+	}
+	return sum;
+}
+
+/* the app left the front: its helper processes back among the rest */
+static void tree_release(void) {
+	for (int i = 1; i < n_tree; i++) prioritise(tree[i], 0, 0);
+	n_tree = 0;
+	tree_root = 0;
+}
+
 /* The front light, all three colours together: white, or dark. */
 static void led_white(bool on) {
 	static const char *const colours[] = { "red", "green", "blue" };
@@ -628,7 +707,7 @@ static bool boost_sample(void) {
 		boost = want;
 		return true;
 	}
-	long long front = front_pid > 0 ? cpu_ticks(front_pid) : -1;
+	long long front = front_ticks();	/* the app and its helper processes */
 	long long shell = shell_pid > 0 ? cpu_ticks(shell_pid) : -1;
 	double used = 0;		/* for big/rapid: the front app (unless eco) or the shell */
 	double used_any = 0;		/* for idle0 -> nominal: the front app, eco included */
@@ -846,6 +925,7 @@ static int command(char *line, bool persist) {
 		pid_t pid = atoi(value);
 		if (front_pid > 0 && front_pid != pid && front_pid != shell_pid) {
 			prioritise(front_pid, 0, 0);	/* back among the rest */
+			tree_release();
 		}
 		front_pid = pid;
 		if (pid > 0 && pid != shell_pid) {
@@ -1054,6 +1134,15 @@ int main(void) {
 			}
 			if (down) {
 				touch_boost();
+				/* input boost: a finger on an app means frames are about to be
+				 * wanted; open the second big core now rather than after a
+				 * second of load (the first frames of a scroll were janky).
+				 * The usual 3 s of calm brings it back down. */
+				if (boost_live() && front_pid > 0 && boost < INTERACTIVE &&
+						profile != POWERSAVE) {
+					boost = INTERACTIVE;
+					changed = 2;
+				}
 			}
 		}
 		if (touch_until && boost_ms() >= touch_until) {
