@@ -8812,8 +8812,8 @@ static void ctl_command(struct zt_server *server, char *line) {
 		server->record_until = now_ms() + (uint32_t)id;
 		wlr_log(WLR_INFO, "recording frames for %d ms into /tmp/ztrec", id);
 	} else if (sscanf(line, "brightness %d", &id) == 1) {
-		/* from an ambient light program or settings: 10..100 */
-		server->shade_brightness = id < 10 ? 10 : id > 100 ? 100 : id;
+		/* from an ambient light program or settings: 1..100 */
+		server->shade_brightness = id < 1 ? 1 : id > 100 ? 100 : id;
 		backlight_set(server->shade_brightness);
 		damage(server);
 	} else if (sscanf(line, "tone %d", &id) == 1) {

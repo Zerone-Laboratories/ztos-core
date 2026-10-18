@@ -1110,7 +1110,7 @@ static int brightness_now(void) {
 static void display_tick(void) {
 	int now = brightness_now();
 	if (zmc.page == PAGE_DISPLAY && !zmc.sliding && now > 0 && now != app.brightness) {
-		app.brightness = now < 10 ? 10 : now;
+		app.brightness = now < 1 ? 1 : now;
 		zmc_redraw();
 	}
 }
@@ -2573,7 +2573,7 @@ static void slide(int action, int value, bool done) {
 	}
 	switch (action) {
 	case ACT_BRIGHTNESS_STEP:
-		app.brightness = value < 10 ? 10 : value;
+		app.brightness = value < 1 ? 1 : value;
 		if (app.autobrightness) {
 			/* a hand on the slider takes over from the light sensor */
 			app.autobrightness = false;
