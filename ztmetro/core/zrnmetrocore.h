@@ -245,6 +245,13 @@ void zmc_text_centred(cairo_t *cr, const char *s, const char *font, double size,
  * viewer (the shell's own perspective); a solid rectangle; another frame. */
 void zmc_gpu_quad(cairo_surface_t *source, unsigned revision, const double corners[4][3], double alpha);
 void zmc_gpu_rect(double x, double y, double w, double h, double r, double g, double b);
+/* A GPU buffer from elsewhere (a DMA-BUF: a video frame, a web page) drawn with
+ * no copy: import it once, draw it every frame from an .overlay, free it when
+ * its owner lets it go. Import returns NULL if the driver cannot take it. */
+void *zmc_gpu_dmabuf_import(int w, int h, uint32_t fourcc, uint64_t modifier, int planes,
+		const int *fds, const uint32_t *offsets, const uint32_t *strides);
+void zmc_gpu_dmabuf_free(void *image);
+void zmc_gpu_dmabuf(void *image, const double corners[4][3], double alpha);
 void zmc_present(void);
 
 /* Named Windows Phone transitions, from the Lumia 530 firmware. Draw one frame

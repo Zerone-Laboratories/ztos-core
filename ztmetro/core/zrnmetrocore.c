@@ -2553,6 +2553,23 @@ void zmc_gpu_quad(cairo_surface_t *source, unsigned revision, const double c[4][
 		cairo_image_surface_get_height(source), q, (float)alpha);
 }
 
+void *zmc_gpu_dmabuf_import(int w, int h, uint32_t fourcc, uint64_t modifier, int planes,
+		const int *fds, const uint32_t *offsets, const uint32_t *strides) {
+	return zmg_dmabuf_import(w, h, fourcc, modifier, planes, fds, offsets, strides);
+}
+
+void zmc_gpu_dmabuf_free(void *image) {
+	zmg_dmabuf_free(image);
+}
+
+void zmc_gpu_dmabuf(void *image, const double c[4][3], double alpha) {
+	struct zmg_vertex q[4];
+	for (int i = 0; i < 4; i++) {
+		q[i] = (struct zmg_vertex){ (float)c[i][0], (float)c[i][1], (float)c[i][2] };
+	}
+	zmg_dmabuf_draw(image, q, (float)alpha);
+}
+
 void zmc_gpu_rect(double x, double y, double w, double h, double r, double g, double b) {
 	zmg_rect(x, y, w, h, (float)r, (float)g, (float)b);
 }

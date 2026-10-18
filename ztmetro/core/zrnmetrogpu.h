@@ -3,6 +3,7 @@
 #define ZRNMETROGPU_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <cairo.h>
 #include <wayland-client.h>
 
@@ -22,6 +23,14 @@ void zmg_prepare(cairo_surface_t *source, unsigned revision);
 void zmg_surface(cairo_surface_t *source, unsigned revision,
 		double x0, double y0, double x1, double y1,
 		const struct zmg_vertex corners[4], float alpha);
+/* An external GPU buffer (a DMA-BUF, e.g. a WebKit frame) as a texture, with
+ * no copy: imported once as an EGLImage and drawn from where it lies. Returns
+ * an opaque handle, NULL if the driver cannot import it. */
+void *zmg_dmabuf_import(int w, int h, uint32_t fourcc, uint64_t modifier, int planes,
+		const int *fds, const uint32_t *offsets, const uint32_t *strides);
+void zmg_dmabuf_free(void *image);
+/* the whole image over the four corners (points), as zmg_surface */
+void zmg_dmabuf_draw(void *image, const struct zmg_vertex corners[4], float alpha);
 void zmg_report(const char *app_id);
 void zmg_fini(void);
 

@@ -5,7 +5,9 @@
 #include "zrnmetrogpu.h"
 #include "zrnmetrorender.h"
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <wayland-egl.h>
 #include <math.h>
 #include <stdint.h>
@@ -29,7 +31,7 @@ static struct {
 	struct wl_egl_window *window;
 	struct wl_surface *wl_surface;
 	GLuint program, white;
-	GLint size, eye, alpha, opaque, solid, color;
+	GLint size, eye, alpha, opaque, solid, color, native;
 	int w, h, scale, tile_h, max_size;
 	bool ready;
 	unsigned clock;
@@ -103,8 +105,9 @@ bool zmg_init(struct wl_display *display, struct wl_surface *surface, int w, int
 	static const char fragment[] =
 		"precision mediump float; varying vec2 uv; uniform sampler2D image;"
 		"uniform float alpha; uniform bool opaque; uniform bool solid; uniform vec4 color;"
+		"uniform bool native;"	/* an EGLImage samples in order; Cairo's BGRA is swapped */
 		"void main(){ if(solid){gl_FragColor=color;return;} vec4 c=texture2D(image,uv);"
-		"gl_FragColor=vec4(c.bgr,opaque?1.0:c.a)*alpha; }";
+		"gl_FragColor=vec4(native?c.rgb:c.bgr,opaque?1.0:c.a)*alpha; }";
 	GLuint vs = zmr_shader(GL_VERTEX_SHADER, vertex), fs = zmr_shader(GL_FRAGMENT_SHADER, fragment);
 	if (!vs || !fs) {
 		if (vs) glDeleteShader(vs);
@@ -128,6 +131,7 @@ bool zmg_init(struct wl_display *display, struct wl_surface *surface, int w, int
 	gpu.opaque = glGetUniformLocation(gpu.program, "opaque");
 	gpu.solid = glGetUniformLocation(gpu.program, "solid");
 	gpu.color = glGetUniformLocation(gpu.program, "color");
+	gpu.native = glGetUniformLocation(gpu.program, "native");
 	static const unsigned char white[] = {255,255,255,255};
 	glGenTextures(1, &gpu.white);
 	glBindTexture(GL_TEXTURE_2D, gpu.white);
@@ -283,6 +287,7 @@ void zmg_surface(cairo_surface_t *source, unsigned revision, double x0, double y
 	double top = fmax(0, y0), bottom = fmin(p->h, y1);
 	if (left >= right || top >= bottom) return;
 	glUniform1i(gpu.solid, 0);
+	glUniform1i(gpu.native, 0);
 	glUniform1i(gpu.opaque, cairo_image_surface_get_format(source) == CAIRO_FORMAT_RGB24);
 	glUniform1f(gpu.alpha, alpha);
 	int first = (int)top / gpu.tile_h, last = (int)ceil(bottom / gpu.tile_h);
@@ -300,4 +305,99 @@ void zmg_surface(cairo_surface_t *source, unsigned revision, double x0, double y
 		glBindTexture(GL_TEXTURE_2D, p->tiles[i]);
 		vertices(v);
 	}
+}
+
+/* ---- external buffers (DMA-BUF), no copy ---------------------------------- */
+
+struct external {
+	EGLImageKHR image;
+	GLuint tex;
+};
+
+static PFNEGLCREATEIMAGEKHRPROC create_image;
+static PFNEGLDESTROYIMAGEKHRPROC destroy_image;
+static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target;
+
+void *zmg_dmabuf_import(int w, int h, uint32_t fourcc, uint64_t modifier, int planes,
+		const int *fds, const uint32_t *offsets, const uint32_t *strides) {
+	if (!gpu.ready || planes < 1 || planes > 4) return NULL;
+	if (!create_image) {
+		create_image = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+		destroy_image = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+		image_target = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+		if (!create_image || !destroy_image || !image_target) {
+			fprintf(stderr, "ZrnMetroCore: no EGLImage import on this driver\n");
+			return NULL;
+		}
+	}
+	static const EGLint fd_attr[] = { EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE1_FD_EXT,
+		EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE3_FD_EXT };
+	static const EGLint off_attr[] = { EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+		EGL_DMA_BUF_PLANE2_OFFSET_EXT, EGL_DMA_BUF_PLANE3_OFFSET_EXT };
+	static const EGLint pitch_attr[] = { EGL_DMA_BUF_PLANE0_PITCH_EXT, EGL_DMA_BUF_PLANE1_PITCH_EXT,
+		EGL_DMA_BUF_PLANE2_PITCH_EXT, EGL_DMA_BUF_PLANE3_PITCH_EXT };
+	static const EGLint lo_attr[] = { EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+		EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT };
+	static const EGLint hi_attr[] = { EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
+		EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT };
+	EGLint a[64];
+	int k = 0;
+	a[k++] = EGL_WIDTH; a[k++] = w;
+	a[k++] = EGL_HEIGHT; a[k++] = h;
+	a[k++] = EGL_LINUX_DRM_FOURCC_EXT; a[k++] = (EGLint)fourcc;
+	bool with_modifier = modifier != 0x00ffffffffffffffULL;	/* DRM_FORMAT_MOD_INVALID */
+	for (int i = 0; i < planes; i++) {
+		a[k++] = fd_attr[i]; a[k++] = fds[i];
+		a[k++] = off_attr[i]; a[k++] = (EGLint)offsets[i];
+		a[k++] = pitch_attr[i]; a[k++] = (EGLint)strides[i];
+		if (with_modifier) {
+			a[k++] = lo_attr[i]; a[k++] = (EGLint)(modifier & 0xffffffff);
+			a[k++] = hi_attr[i]; a[k++] = (EGLint)(modifier >> 32);
+		}
+	}
+	a[k++] = EGL_NONE;
+	EGLImageKHR image = create_image(gpu.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, a);
+	if (image == EGL_NO_IMAGE_KHR) {
+		fprintf(stderr, "ZrnMetroCore: DMA-BUF import failed (0x%x, fourcc %.4s, modifier 0x%llx)\n",
+			eglGetError(), (const char *)&fourcc, (unsigned long long)modifier);
+		return NULL;
+	}
+	struct external *e = calloc(1, sizeof(*e));
+	if (!e) { destroy_image(gpu.display, image); return NULL; }
+	e->image = image;
+	glGenTextures(1, &e->tex);
+	glBindTexture(GL_TEXTURE_2D, e->tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	image_target(GL_TEXTURE_2D, (GLeglImageOES)image);
+	return e;
+}
+
+void zmg_dmabuf_free(void *image) {
+	struct external *e = image;
+	if (!e) return;
+	if (gpu.ready) {
+		glDeleteTextures(1, &e->tex);
+		destroy_image(gpu.display, e->image);
+	}
+	free(e);
+}
+
+void zmg_dmabuf_draw(void *image, const struct zmg_vertex c[4], float alpha) {
+	struct external *e = image;
+	if (!e || !gpu.ready || alpha <= 0.001) return;
+	float v[20];
+	for (int j = 0; j < 4; j++) {
+		v[j*5] = c[j].x; v[j*5+1] = c[j].y; v[j*5+2] = c[j].z;
+		v[j*5+3] = (j & 1) ? 1 : 0; v[j*5+4] = (j & 2) ? 1 : 0;
+	}
+	glUniform1i(gpu.solid, 0);
+	glUniform1i(gpu.native, 1);
+	glUniform1i(gpu.opaque, 1);
+	glUniform1f(gpu.alpha, alpha);
+	glBindTexture(GL_TEXTURE_2D, e->tex);
+	vertices(v);
+	glUniform1i(gpu.native, 0);
 }

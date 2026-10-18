@@ -13,6 +13,10 @@
  */
 #define _GNU_SOURCE
 #include <math.h>
+#include <poll.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wayland-client.h>
@@ -33,16 +37,82 @@ struct webview {
 	WebKitNetworkSession *session;
 	WebKitWebView *web;
 	WPEView *view;		/* webkit_web_view_get_wpe_view */
-	cairo_surface_t *frame;	/* the latest page frame, as pixels */
+	cairo_surface_t *frame;	/* fallback only: the latest frame as pixels */
 	unsigned frame_rev;	/* bumped each frame so the GPU re-uploads */
+	void *image;		/* the latest frame as an imported GPU image (no copy) */
+	bool logged;
 	struct wv_delegate d;
 };
 
-/* WebKit rendered a frame: copy it into our cairo surface and ask for a draw.
+/* An imported image lives as long as WebKit's buffer: WebKit keeps a few
+ * buffers and renders into them in turn, so each is imported once and then
+ * only drawn. Freed when WebKit lets the buffer go. */
+struct imported {
+	void *image;
+	struct webview *wv;
+};
+
+static void imported_free(gpointer p) {
+	struct imported *im = p;
+	if (im->wv && im->wv->image == im->image) {
+		im->wv->image = NULL;
+	}
+	zmc_gpu_dmabuf_free(im->image);
+	free(im);
+}
+
+/* the frame is ready on the GPU: wait for its render fence, if it has one */
+static void wait_rendered(WPEBuffer *buffer) {
+	int fd = wpe_buffer_take_rendering_fence(buffer);
+	if (fd >= 0) {
+		struct pollfd p = { .fd = fd, .events = POLLIN };
+		poll(&p, 1, 50);
+		close(fd);
+	}
+}
+
+/* WebKit rendered a frame. Zero copy: a DMA-BUF frame is handed to the GPU as
+ * a texture where it already lies; only if that fails is it copied out.
  * Runs on the main thread (the GLib pump below), same as everything else. */
 static void on_buffer(WPEView *view, WPEBuffer *buffer, gpointer u) {
 	(void)view;
 	struct webview *wv = u;
+	if (!wv->logged) {
+		wv->logged = true;
+		fprintf(stderr, "ztbrowser: frames %dx%d, %s (view %dx%d points at scale %d)\n",
+			wpe_buffer_get_width(buffer), wpe_buffer_get_height(buffer),
+			WPE_IS_BUFFER_DMA_BUF(buffer) ? "DMA-BUF, imported" : "not DMA-BUF, copied",
+			wv->w, wv->h, wv->scale);
+	}
+	if (WPE_IS_BUFFER_DMA_BUF(buffer)) {
+		struct imported *im = wpe_buffer_get_user_data(buffer);
+		if (!im) {
+			WPEBufferDMABuf *d = WPE_BUFFER_DMA_BUF(buffer);
+			int n = (int)wpe_buffer_dma_buf_get_n_planes(d);
+			int fds[4];
+			uint32_t offsets[4], strides[4];
+			for (int i = 0; i < n && i < 4; i++) {
+				fds[i] = wpe_buffer_dma_buf_get_fd(d, i);
+				offsets[i] = wpe_buffer_dma_buf_get_offset(d, i);
+				strides[i] = wpe_buffer_dma_buf_get_stride(d, i);
+			}
+			void *image = zmc_gpu_dmabuf_import(wpe_buffer_get_width(buffer),
+				wpe_buffer_get_height(buffer), wpe_buffer_dma_buf_get_format(d),
+				wpe_buffer_dma_buf_get_modifier(d), n, fds, offsets, strides);
+			if (image) {
+				im = calloc(1, sizeof(*im));
+				im->image = image;
+				im->wv = wv;
+				wpe_buffer_set_user_data(buffer, im, imported_free);
+			}
+		}
+		if (im) {
+			wait_rendered(buffer);
+			wv->image = im->image;
+			zmc_present();		/* a new frame to put up */
+			return;
+		}
+	}
 	GError *err = NULL;
 	GBytes *px = wpe_buffer_import_to_pixels(buffer, &err);
 	if (!px) {
@@ -177,7 +247,16 @@ void webview_place(struct webview *wv, int x, int y, int w, int h, int scale) {
 			wpe_screen_set_scale(screen, scale);
 			wpe_screen_set_size(screen, w, h);
 		}
+		/* the view's device scale is its toplevel's: set there, or WebKit
+		 * renders 360 px frames that the GPU stretches 4x (the blur) */
+		WPEToplevel *top = wpe_view_get_toplevel(wv->view);
+		if (top) {
+			wpe_toplevel_resized(top, w, h);
+			wpe_toplevel_scale_changed(top, scale);
+		}
 		wpe_view_resized(wv->view, w, h);
+		fprintf(stderr, "ztbrowser: view %dx%d at scale %.1f (toplevel %s)\n", w, h,
+			wpe_view_get_scale(wv->view), top ? "yes" : "none");
 	}
 }
 
@@ -265,13 +344,17 @@ void webview_key(struct webview *wv, const char *utf8) { (void)wv; (void)utf8; }
 void webview_scroll(struct webview *wv, double dx, double dy) { (void)wv; (void)dx; (void)dy; }
 
 void webview_composite(struct webview *wv, int x, int y, int w, int h) {
-	if (!wv || !wv->frame) {
+	if (!wv) {
 		return;
 	}
 	double corners[4][3] = {
 		{ x, y, 0 }, { x + w, y, 0 }, { x, y + h, 0 }, { x + w, y + h, 0 },
 	};
-	zmc_gpu_quad(wv->frame, wv->frame_rev, corners, 1.0);
+	if (wv->image) {
+		zmc_gpu_dmabuf(wv->image, corners, 1.0);	/* straight from WebKit's buffer */
+	} else if (wv->frame) {
+		zmc_gpu_quad(wv->frame, wv->frame_rev, corners, 1.0);
+	}
 }
 
 void webview_pump(void) {
