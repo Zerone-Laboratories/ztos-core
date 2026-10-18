@@ -89,7 +89,7 @@ static double draw_history(cairo_t *cr) {
 	}
 	if (n_calls == 0) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		y += zmc_text(cr, "No calls yet. Swipe to the keypad to make one.", FONT_REGULAR, 14, MARGIN, y,
+		y += zmc_text(cr, "No calls.", FONT_REGULAR, 14, MARGIN, y,
 			zmc.width - 2 * MARGIN) + 20;
 		return y;
 	}
@@ -256,7 +256,7 @@ static double draw_entry(cairo_t *cr) {
 	y = zmc_entry(cr, y, "call", entry, ACT_ENTRY_CALL, 0);
 	y = zmc_entry(cr, y, "text", entry, ACT_ENTRY_TEXT, 0);
 	if (!known) {
-		y = zmc_entry(cr, y, "add to people", "keep this number under a name", ACT_ENTRY_SAVE, 0);
+		y = zmc_entry(cr, y, "add to people", "", ACT_ENTRY_SAVE, 0);
 	}
 	/* the calls there have been with this number */
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);

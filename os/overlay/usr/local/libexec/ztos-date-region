@@ -13,6 +13,26 @@ REGIONS = {'en_US.UTF-8', 'en_GB.UTF-8', 'si_LK.UTF-8', 'ta_LK.UTF-8',
            'en_IN.UTF-8', 'de_DE.UTF-8', 'fr_FR.UTF-8', 'ja_JP.UTF-8',
            'en_AU.UTF-8', 'zh_CN.UTF-8', 'C.UTF-8'}
 
+LANGUAGES = REGIONS
+
+def locale_values():
+    config = Path('/etc/locale.conf')
+    values = {}
+    for line in config.read_text().splitlines() if config.exists() else []:
+        key, sep, value = line.partition('=')
+        if sep:
+            values[key] = value.strip('"\'')
+    return values
+
+def ensure_locale(name):
+    installed = {value.lower().replace('-', '') for value in run('locale', '-a').splitlines()}
+    if name != 'C.UTF-8' and name.lower().replace('-', '') not in installed:
+        run('localedef', '-i', name.split('.')[0], '-f', 'UTF-8', name)
+
+def set_locale(values):
+    # localectl replaces the whole set: always pass every key we keep
+    run('localectl', 'set-locale', *[key + '=' + value for key, value in values.items() if value])
+
 def run(*args):
     return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=60).strip()
 
@@ -62,15 +82,9 @@ def save_servers(servers):
 def status():
     print(run('timedatectl', 'show', '-p', 'Timezone', '-p', 'NTP', '-p', 'NTPSynchronized'))
     print('Servers=' + ntp_servers())
-    region = 'C.UTF-8'
-    config = Path('/etc/locale.conf')
-    values = {}
-    for line in config.read_text().splitlines() if config.exists() else []:
-        key, sep, value = line.partition('=')
-        if sep:
-            values[key] = value.strip('"\'')
-    region = values.get('LC_TIME', values.get('LANG', region))
-    print('Region=' + region)
+    values = locale_values()
+    print('Region=' + values.get('LC_TIME', values.get('LANG', 'C.UTF-8')))
+    print('Language=' + values.get('LANG', 'C.UTF-8'))
     now = datetime.datetime.now()
     print('Date=' + now.strftime('%Y-%m-%d'))
     print('Time=' + now.strftime('%H:%M'))
@@ -85,12 +99,11 @@ if __name__ == '__main__':
             servers = validate_servers(sys.argv[7] if len(sys.argv) == 8 else ntp_servers())
             if os.geteuid() != 0:
                 raise ValueError('Administrator access is required to save these settings.')
-            installed = {value.lower().replace('-', '') for value in run('locale', '-a').splitlines()}
-            if region != 'C.UTF-8' and region.lower().replace('-', '') not in installed:
-                run('localedef', '-i', region.split('.')[0], '-f', 'UTF-8', region)
+            ensure_locale(region)
             run('timedatectl', 'set-timezone', zone)
-            run('localectl', 'set-locale', *[key + '=' + region for key in
-                ('LC_TIME', 'LC_NUMERIC', 'LC_MONETARY', 'LC_MEASUREMENT')])
+            values = locale_values()
+            values.update({key: region for key in ('LC_TIME', 'LC_NUMERIC', 'LC_MONETARY', 'LC_MEASUREMENT')})
+            set_locale(values)
             save_servers(servers)
             run('timedatectl', 'set-ntp', automatic)
             if automatic == 'yes':
@@ -99,6 +112,18 @@ if __name__ == '__main__':
                 run('timedatectl', 'set-time', stamp + ':00')
             status()
             print('Note=Saved. Regional formats apply to newly opened applications.')
+        elif len(sys.argv) == 3 and sys.argv[1] == 'language':
+            language = sys.argv[2]
+            if language not in LANGUAGES:
+                raise ValueError('Choose a supported language.')
+            if os.geteuid() != 0:
+                raise ValueError('Administrator access is required to change the language.')
+            ensure_locale(language)
+            values = locale_values()
+            values['LANG'] = language
+            set_locale(values)
+            status()
+            print('Note=Applies to apps opened from now on.')
         elif len(sys.argv) == 3 and sys.argv[1] == 'sync':
             servers = validate_servers(sys.argv[2])
             if os.geteuid() != 0:

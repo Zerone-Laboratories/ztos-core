@@ -31,6 +31,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
+#include <pthread.h>
+#include <sys/eventfd.h>
 #include <math.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -75,6 +77,8 @@
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_text_input_v3.h>
+#include <wlr/types/wlr_screencopy_v1.h>
+#include <wlr/types/wlr_xdg_output_v1.h>
 #include <wlr/types/wlr_touch.h>
 #include <wlr/types/wlr_viewporter.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
@@ -137,6 +141,7 @@
 #define MAX_CARDS	8	/* apps in the switcher */
 #define VOLUME_H	58
 #define MEDIA_H		74	/* what is playing, and its buttons, under the volume */
+#define OUTPUT_H	44	/* where the sound goes, at the banner's foot: tap for the next */
 #define TOAST_H		58	/* a notification's banner, where the volume's goes */
 #define TOAST_MS	4500
 #define MAX_NOTES	12
@@ -153,6 +158,8 @@
 #define FOV_DEG		34	/* vertical field of view of the one projection */
 /* the press, as everywhere (ZMC_TILT_* in core/zrnmetrocore.h) */
 #define TILT_DEG	14	/* how far a pressed tile leans toward the finger */
+#define TORCH_PATH	"/sys/class/leds/white:torch/brightness"	/* leds/zrn-flash.ko */
+#define TORCH_LEVEL	9	/* of 15: the top of Samsung's torch table */
 #define TILT_IN_MS	70
 #define TILT_OUT_MS	160
 /* Turns round the screen's left edge; positive takes the right-hand side
@@ -239,6 +246,15 @@ struct tile {
 	 * sets off, how fast it comes and from how far. Nothing lands twice
 	 * the same way. */
 	float jit_start, jit_speed, jit_travel;
+	/* live: a back face, as a Windows Phone Flip tile has, from
+	 * $XDG_RUNTIME_DIR/ztos-live/<its command's name> (see live_read) */
+	bool live;
+	char live_title[48], live_lines[3][64];
+	int live_count;
+	time_t live_mtime;
+	struct zt_layer back_layer;
+	float flip;		/* degrees about its horizontal axis: 0 front, 180 back */
+	uint32_t next_flip_ms;
 };
 
 /* One line of the app list: an application, or the letter above a group. */
@@ -351,6 +367,7 @@ enum touch_role {
 	ROLE_CURSOR,	/* holding the keyboard cursor dot */
 	ROLE_SHADE,	/* dragging or interacting with the status bar shade / Action Center */
 	ROLE_MENU,	/* while the app list's menu is open */
+	ROLE_HYPER,	/* on Hyperscan, the search over everything */
 };
 
 struct touch_point {
@@ -432,6 +449,13 @@ struct zt_server {
 
 	struct zt_layer osk_layer, nav_layer, status_layer, shade_layer;
 	struct zt_layer lock_layer, keypop_layer;
+	/* wallpapers (config start_wallpaper, lock_wallpaper): Start's photo
+	 * as a texture taller than the screen for its parallax, the lock
+	 * screen's as an image painted under the clock */
+	char start_wall_path[256], lock_wall_path[256];
+	struct zt_layer wall_layer;
+	double wall_h;			/* points: the start photo's height */
+	cairo_surface_t *lock_wall;
 	bool locked;
 	/* app switcher: the apps as a row of cards, newest on the right */
 	bool switcher;
@@ -541,6 +565,10 @@ struct zt_server {
 	bool shade_open;
 	bool shade_wifi;
 	bool shade_bt;
+	/* Bluetooth as ztos-bt-state writes it: the status icon, the live tile */
+	bool bt_on, bt_streaming, bt_blink;
+	char bt_name[64];
+	int bt_battery;			/* percent, -1 unknown */
 	bool shade_torch;
 	bool shade_rotation;
 	bool shade_airplane;
@@ -587,6 +615,22 @@ struct zt_server {
 	struct zt_toplevel *leaving;	/* still drawn while it swings out */
 	struct wl_event_source *launch_timer;
 	uint32_t launch_ms;		/* when the tile was tapped */
+	/* the last finger down in an app: a text field that asks for the
+	 * keyboard soon after it was the user's doing (see text_input_enable) */
+	uint32_t client_tap_ms;
+	double client_tap_y;		/* below the status bar, in screen points, unlifted */
+	bool osk_pending;		/* a field asked by itself: shown at the next tap */
+	/* Hyperscan: the search button's search over apps, settings, files
+	 * and the web (see hyper_open) */
+	bool hyper;
+	float hyper_t;			/* 0 gone .. 1 in place */
+	char hyper_q[128];
+	struct hyper_hit *hyper_hits;
+	int n_hyper;
+	struct zt_layer hyper_layer;
+	double hyper_scroll, hyper_scroll0, hyper_content_h;
+	char (*hyper_files)[256];	/* names under the home folders, read when it opens */
+	int n_hyper_files;
 	uint32_t record_until;		/* "record MS": frames saved to /tmp/ztrec until then */
 	bool record_top;
 
@@ -1733,11 +1777,13 @@ enum hap_group { HG_SYSTEM, HG_NAV, HG_TILES, HG_SLIDE, HG_APPS, HG_KEYS, HG_GRO
 
 /* The motor is a resonant one at 160 Hz: a cycle is 6 ms and it takes two or
  * three to be felt at all, so nothing is shorter than that. */
+/* Levels lowered by 30 % (2026-10-18): everything felt a little too strong
+ * at the user's own settings. */
 static const struct { int ms; double level; } HAPS[HAP_KINDS] = {
-	{ 14, 0.55 }, { 18, 0.75 }, { 24, 0.9 }, { 38, 1.0 },
+	{ 14, 0.385 }, { 18, 0.525 }, { 24, 0.63 }, { 38, 0.7 },
 	/* a key of the keyboard: the shortest thing the motor can be felt to
 	 * do, and light, so that typing fast is a row of precise ticks */
-	{ 7, 0.4 },
+	{ 7, 0.28 },
 };
 
 /* wlroots knows nothing about vibration: find a force-feedback input device
@@ -1935,50 +1981,181 @@ static void config_keep(const char *key, int value) {
 	rename(tmp, path);
 }
 
-/* Set panel brightness via Linux backlight sysfs interface (0..100%).
- * On Galaxy S9, /sys/class/backlight/s9p-panel has max_brightness=572 (AOR register). */
-static void backlight_set(int percent) {
-	static int last_raw = -1;
-	static int max_b = -1;
-	static char dev_path[128] = "";
+/*
+ * The panel's brightness: /sys/class/backlight (s9p-panel, the AOR register,
+ * 0..572), written as seldom as possible.
+ *
+ * A change shows at once by darkening the picture on the GPU (free, every
+ * frame), and the panel is told once, when the value has stayed put for
+ * BL_SETTLE_MS: a slider dragged, or the light sensor's one per cent at a
+ * time, comes to one hardware write instead of dozens. The darkening goes
+ * the frame after the panel has taken the new level. Brighter than the
+ * panel is set cannot be done in software, so that is written straight away.
+ *
+ * The writes are made on a thread of their own (each waits for the panel to
+ * finish a frame), which tells the event loop through an eventfd when one
+ * has landed. Usable only if the shell can write the file (udev gives group
+ * video it); otherwise everything is done by darkening.
+ */
+#define BL_SETTLE_MS	300
+#define BL_LAND_MS	20	/* the panel takes a level at its next frame */
 
-	if (!dev_path[0]) {
-		glob_t g;
-		if (glob("/sys/class/backlight/*/brightness", 0, NULL, &g) == 0 && g.gl_pathc > 0) {
-			snprintf(dev_path, sizeof(dev_path), "%s", g.gl_pathv[0]);
-			char max_path[140];
-			char *slash = strrchr(dev_path, '/');
-			if (slash) {
-				snprintf(max_path, sizeof(max_path), "%.*s/max_brightness", (int)(slash - dev_path), dev_path);
-				FILE *mf = fopen(max_path, "r");
-				if (mf) {
-					if (fscanf(mf, "%d", &max_b) != 1) max_b = -1;
-					fclose(mf);
-				}
-			}
+static struct {
+	pthread_mutex_t lock;
+	pthread_cond_t wake;
+	int max;		/* raw */
+	int want_raw;		/* for the thread: the next level to write, -1 none */
+	int done_raw;		/* from the thread: the level last written */
+	int hw;			/* percent the panel is at, as far as the picture knows */
+	int target;		/* percent wanted */
+	int fd;			/* eventfd: a write has landed */
+	char path[128];
+	int usable;		/* -1 not looked yet, 0 no, 1 yes */
+	struct wl_event_source *settle, *land;
+	struct zt_server *server;
+} bl = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, -1, -1, -1, 100, 100, -1, "", -1 };
+
+static void *bl_thread(void *data) {
+	for (;;) {
+		pthread_mutex_lock(&bl.lock);
+		while (bl.want_raw < 0) {
+			pthread_cond_wait(&bl.wake, &bl.lock);
 		}
-		globfree(&g);
-		if (!dev_path[0]) {
-			snprintf(dev_path, sizeof(dev_path), "none");
+		int raw = bl.want_raw;
+		bl.want_raw = -1;
+		pthread_mutex_unlock(&bl.lock);
+		int fd = open(bl.path, O_WRONLY | O_CLOEXEC);
+		if (fd >= 0) {
+			char text[16];
+			int n = snprintf(text, sizeof(text), "%d\n", raw);
+			if (write(fd, text, n) != n) {}
+			close(fd);
+		}
+		pthread_mutex_lock(&bl.lock);
+		bl.done_raw = raw;
+		pthread_mutex_unlock(&bl.lock);
+		uint64_t one = 1;
+		if (write(bl.fd, &one, sizeof(one)) < 0) {}
+	}
+	return NULL;
+}
+
+static void bl_request(int percent) {
+	int raw = (int)lround((double)percent * bl.max / 100.0);
+	pthread_mutex_lock(&bl.lock);
+	bl.want_raw = raw < 1 ? 1 : raw;
+	pthread_cond_signal(&bl.wake);
+	pthread_mutex_unlock(&bl.lock);
+}
+
+/* the panel has had a frame to take the level: the darkening can go */
+static int bl_landed(void *data) {
+	pthread_mutex_lock(&bl.lock);
+	int raw = bl.done_raw;
+	pthread_mutex_unlock(&bl.lock);
+	bl.hw = (int)lround((double)raw * 100 / bl.max);
+	damage(bl.server);
+	return 0;
+}
+
+static int bl_written(int fd, uint32_t mask, void *data) {
+	uint64_t n;
+	if (read(fd, &n, sizeof(n)) < 0) {}
+	wl_event_source_timer_update(bl.land, BL_LAND_MS);
+	return 0;
+}
+
+static int bl_settled(void *data) {
+	if (bl.target != bl.hw) {
+		bl_request(bl.target);
+	}
+	return 0;
+}
+
+static bool backlight_usable(void) {
+	return bl.usable == 1;
+}
+
+static void backlight_init(struct zt_server *server) {
+	glob_t g;
+	bl.usable = 0;
+	bl.server = server;
+	if (glob("/sys/class/backlight/*/brightness", 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+		snprintf(bl.path, sizeof(bl.path), "%s", g.gl_pathv[0]);
+		char max_path[160], text[16] = "", now[16] = "";
+		snprintf(max_path, sizeof(max_path), "%.*s/max_brightness",
+			(int)(strrchr(bl.path, '/') - bl.path), bl.path);
+		int fd = open(max_path, O_RDONLY | O_CLOEXEC);
+		if (fd >= 0) {
+			if (read(fd, text, sizeof(text) - 1) < 0) {}
+			close(fd);
+		}
+		fd = open(bl.path, O_RDONLY | O_CLOEXEC);
+		if (fd >= 0) {
+			if (read(fd, now, sizeof(now) - 1) < 0) {}
+			close(fd);
+		}
+		bl.max = atoi(text);
+		bl.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		pthread_t thread;
+		if (access(bl.path, W_OK) != 0) {
+			wlr_log(WLR_ERROR, "%s is not writable by the shell (udev rule "
+				"90-zrn-backlight.rules?): dimming in software instead", bl.path);
+		} else if (bl.max > 0 && bl.fd >= 0) {
+			/* the thread takes no signals: SIGHUP (settings changed) is
+			 * read by the event loop through a signalfd, blocked only in
+			 * the main thread; delivered there it would end the shell */
+			sigset_t all, old;
+			sigfillset(&all);
+			pthread_sigmask(SIG_BLOCK, &all, &old);
+			if (pthread_create(&thread, NULL, bl_thread, NULL) == 0) {
+				pthread_detach(thread);
+				bl.usable = 1;
+			}
+			pthread_sigmask(SIG_SETMASK, &old, NULL);
+		}
+		if (bl.usable) {
+			bl.hw = bl.target = (int)lround(atof(now) * 100 / bl.max);
+			wl_event_loop_add_fd(server->loop, bl.fd, WL_EVENT_READABLE, bl_written, NULL);
+			bl.settle = wl_event_loop_add_timer(server->loop, bl_settled, NULL);
+			bl.land = wl_event_loop_add_timer(server->loop, bl_landed, NULL);
 		}
 	}
-	if (strcmp(dev_path, "none") == 0) return;
+	globfree(&g);
+	if (!bl.usable) {
+		wlr_log(WLR_ERROR, "no usable backlight device: dimming the pixels instead, which "
+			"saves no power. Is the kernel built with kernel/s9p-decon-backlight.patch?");
+	}
+}
 
+/* 1..100 %: shown now, and the panel told once it stays put. */
+static void backlight_set(int percent) {
+	if (!backlight_usable()) {
+		return;
+	}
 	if (percent < 1) percent = 1;
 	if (percent > 100) percent = 100;
-
-	int raw = (max_b > 0) ? (int)lround((double)percent * max_b / 100.0) : percent;
-	if (raw < 1) raw = 1;
-	if (max_b > 0 && raw > max_b) raw = max_b;
-
-	if (raw == last_raw) return;
-	last_raw = raw;
-
-	FILE *f = fopen(dev_path, "w");
-	if (f) {
-		fprintf(f, "%d\n", raw);
-		fclose(f);
+	bl.target = percent;
+	if (percent > bl.hw) {
+		bl_request(percent);	/* brighter: only the panel can */
+		wl_event_source_timer_update(bl.settle, 0);
+	} else {
+		wl_event_source_timer_update(bl.settle, BL_SETTLE_MS);
 	}
+	damage(bl.server);
+}
+
+/* How much of the picture to take away for the brightness wanted: all of it
+ * without a backlight, else what the panel's level is above the target
+ * (pixel values darkened by m give m^2.2 of the light). */
+static float backlight_darkening(int percent) {
+	if (!backlight_usable()) {
+		return percent < 100 ? 0.85f * (100 - percent) / 100.0f : 0.0f;
+	}
+	if (bl.target >= bl.hw || bl.hw <= 0) {
+		return 0.0f;
+	}
+	return 1.0f - powf((float)bl.target / bl.hw, 1.0f / 2.2f);
 }
 
 static void load_config(struct zt_server *server) {
@@ -1986,6 +2163,7 @@ static void load_config(struct zt_server *server) {
 	const char *home = getenv("HOME");
 	snprintf(path, sizeof(path), "%s/.config/ztmetro/config", home ? home : "");
 	server->accent = 0x0050ef;	/* cobalt */
+	server->start_wall_path[0] = server->lock_wall_path[0] = 0;
 	server->haptics_enabled = true;
 	server->haptic_strength = 80;
 	for (int i = 0; i < 8; i++) {
@@ -2015,7 +2193,11 @@ static void load_config(struct zt_server *server) {
 		}
 		*eq = 0;
 		char *key = trim(line), *value = trim(eq + 1);
-		if (strcmp(key, "accent") == 0) {
+		if (strcmp(key, "start_wallpaper") == 0) {
+			snprintf(server->start_wall_path, sizeof(server->start_wall_path), "%s", value);
+		} else if (strcmp(key, "lock_wallpaper") == 0) {
+			snprintf(server->lock_wall_path, sizeof(server->lock_wall_path), "%s", value);
+		} else if (strcmp(key, "accent") == 0) {
 			server->accent = parse_color(server, value);
 		} else if (strcmp(key, "key_height") == 0) {
             int n = atoi(value);
@@ -2408,11 +2590,118 @@ static void draw_glyph(struct zt_server *server, cairo_t *cr, const char *icon,
 }
 
 /* Each tile is its own texture, so each can lean and swing on its own. */
+/* ---- wallpapers ------------------------------------------------------------ */
+
+#define WALL_PARALLAX	0.25	/* Start's photo moves at a quarter of the tiles' speed */
+#define WALL_TALL	1.6	/* and is this many screens tall, for that */
+#define WALL_TINT	0.15	/* black over a tile's window onto the photo, for its label */
+
+/* A photo scaled to cover pw x ph pixels and cropped about its middle, as a
+ * cairo image (premultiplied ARGB). NULL if it cannot be read. */
+static cairo_surface_t *image_cover(const char *path, int pw, int ph) {
+	GError *error = NULL;
+	GdkPixbuf *src = gdk_pixbuf_new_from_file(path, &error);
+	if (!src) {
+		wlr_log(WLR_ERROR, "wallpaper %s: %s", path, error ? error->message : "unreadable");
+		g_clear_error(&error);
+		return NULL;
+	}
+	GdkPixbuf *upright = gdk_pixbuf_apply_embedded_orientation(src);
+	g_object_unref(src);
+	int sw = gdk_pixbuf_get_width(upright), sh = gdk_pixbuf_get_height(upright);
+	double k = fmax((double)pw / sw, (double)ph / sh);
+	int cw = (int)ceil(sw * k), ch = (int)ceil(sh * k);
+	GdkPixbuf *scaled = gdk_pixbuf_scale_simple(upright, cw, ch, GDK_INTERP_BILINEAR);
+	g_object_unref(upright);
+	if (!scaled) {
+		return NULL;
+	}
+	cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
+	cairo_surface_flush(out);
+	int ox = (cw - pw) / 2, oy = (ch - ph) / 2, n = gdk_pixbuf_get_n_channels(scaled);
+	int sstride = gdk_pixbuf_get_rowstride(scaled), dstride = cairo_image_surface_get_stride(out);
+	const guchar *sp = gdk_pixbuf_read_pixels(scaled);
+	unsigned char *dp = cairo_image_surface_get_data(out);
+	for (int y = 0; y < ph; y++) {
+		const guchar *row = sp + (size_t)(y + oy) * sstride + (size_t)ox * n;
+		uint32_t *drow = (uint32_t *)(dp + (size_t)y * dstride);
+		for (int x = 0; x < pw; x++, row += n) {
+			uint32_t a = n == 4 ? row[3] : 255;
+			drow[x] = a << 24 | (uint32_t)(row[0] * a / 255) << 16 |
+				(uint32_t)(row[1] * a / 255) << 8 | (uint32_t)(row[2] * a / 255);
+		}
+	}
+	cairo_surface_mark_dirty(out);
+	g_object_unref(scaled);
+	return out;
+}
+
+/* Read the two photos again (at start, on SIGHUP, when the screen size is
+ * known). */
+static void walls_load(struct zt_server *server) {
+	if (server->width == 0) {
+		return;
+	}
+	if (server->lock_wall) {
+		cairo_surface_destroy(server->lock_wall);
+		server->lock_wall = NULL;
+	}
+	if (server->lock_wall_path[0]) {
+		server->lock_wall = image_cover(server->lock_wall_path,
+			(int)ceil(server->width * server->scale), (int)ceil(server->height * server->scale));
+	}
+	server->wall_h = 0;
+	if (server->start_wall_path[0]) {
+		double h = server->height * WALL_TALL;
+		cairo_surface_t *img = image_cover(server->start_wall_path,
+			(int)ceil(server->width * server->scale), (int)ceil(h * server->scale));
+		if (img) {
+			cairo_t *cr;
+			struct zt_buffer *buffer = zt_buffer_create(server, server->width, h, &cr);
+			cairo_scale(cr, 1.0 / server->scale, 1.0 / server->scale);
+			cairo_set_source_surface(cr, img, 0, 0);
+			cairo_paint(cr);
+			cairo_surface_destroy(img);
+			g_dump_name = "start-wallpaper";
+			zt_buffer_show(server, &server->wall_layer, buffer, cr, server->width, h);
+			server->wall_h = h;
+		}
+	}
+}
+
+/* A tile's window onto Start's photo: the part of it behind the tile, drawn
+ * with the tile's own transform (`m`, before its last scale to w x h), so it
+ * leans and turns with the tile. The photo rides at WALL_PARALLAX of the
+ * scroll. */
+static void wall_under(struct zt_server *server, const float model[16], double tx, double ty,
+		double tw, double th, float alpha) {
+	struct zt_layer *w = &server->wall_layer;
+	if (server->wall_h <= 0 || !w->tex || !w->tw || !w->th) {
+		return;
+	}
+	double py = STATUS_H + ty - server->scroll * (1.0 - WALL_PARALLAX);
+	double max = server->wall_h - th;
+	py = py < 0 ? 0 : py > max ? max : py;
+	double s = server->scale;
+	server->uv_off[0] = (float)(tx * s / w->tw);
+	server->uv_off[1] = (float)(py * s / w->th);
+	quad(server, GL_TEXTURE_2D, w->tex, model, alpha, true, true,
+		(float)(tw * s / w->tw), (float)(th * s / w->th));
+	server->uv_off[0] = server->uv_off[1] = 0;
+}
+
+static double text_width(const char *text, const char *font, double size);
+
 static void draw_tile(struct zt_server *server, int i) {
 	struct tile *t = &server->tiles[i];
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, t->w, t->h, &cr);
-	set_rgb(cr, t->color);
+	if (server->wall_h > 0) {
+		/* a window onto Start's photo (wall_under), darkened a little */
+		cairo_set_source_rgba(cr, 0, 0, 0, WALL_TINT);
+	} else {
+		set_rgb(cr, t->color);
+	}
 	cairo_paint(cr);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	/* a glyph made from an icon fills its box to the edge: a little smaller */
@@ -2424,7 +2713,140 @@ static void draw_tile(struct zt_server *server, int i) {
 		draw_glyph(server, cr, t->icon, t->label, t->w / 2, t->h * 0.44, t->h * 0.46 * k);
 		draw_text(cr, t->label, FONT_REGULAR, 13, 8, t->h - 23, t->w - 16, 0, false);
 	}
+	if (t->live && t->live_count > 0) {
+		/* the count, top right, as a Flip tile's front has it */
+		char count[16];
+		snprintf(count, sizeof(count), "%d", t->live_count);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		draw_text(cr, count, FONT_LIGHT, t->size == TILE_SMALL ? 16 : 22,
+			t->w - 8 - text_width(count, FONT_LIGHT, t->size == TILE_SMALL ? 16 : 22), 4, 0, 0, false);
+	}
 	zt_buffer_show(server, &t->layer, buffer, cr, t->w, t->h);
+}
+
+/* ---- live tiles ----------------------------------------------------------------
+ *
+ * Any program can give a tile a back: a file named after the tile's command
+ * (its last path element: "ztsettings", "com.zerone.music") in
+ * $XDG_RUNTIME_DIR/ztos-live/, with
+ *
+ *	title=Back title		along the bottom, where the front's name is
+ *	line=First line			up to three, at the top
+ *	count=3				on the front's corner (0: none)
+ *
+ * The SDK writes it (ztos.tile_update). Start then turns the tile over now
+ * and then, about its horizontal axis, and back again: a random 4 to 10 s
+ * apart, one tile at a time, as Windows Phone's Flip tiles do. Small tiles
+ * keep still (they have no back there either).
+ */
+static void tile_key(const struct tile *t, char *out, size_t size) {
+	char word[256];
+	snprintf(word, sizeof(word), "%s", t->command);
+	word[strcspn(word, " \t")] = 0;
+	const char *base = strrchr(word, '/');
+	snprintf(out, size, "%s", base ? base + 1 : word);
+}
+
+static void draw_tile_back(struct zt_server *server, int i) {
+	struct tile *t = &server->tiles[i];
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, t->w, t->h, &cr);
+	if (server->wall_h > 0) {
+		cairo_set_source_rgba(cr, 0, 0, 0, WALL_TINT);
+	} else {
+		set_rgb(cr, t->color);
+	}
+	cairo_paint(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	double size = t->size == TILE_WIDE ? 17 : 15;
+	for (int k = 0; k < 3; k++) {
+		if (t->live_lines[k][0]) {
+			draw_text(cr, t->live_lines[k], k == 0 ? FONT_SEMIBOLD : FONT_REGULAR, size, 8,
+				8 + k * (size + 5), t->w - 16, 0, false);
+		}
+	}
+	draw_text(cr, t->live_title[0] ? t->live_title : t->label, FONT_REGULAR, 13, 8, t->h - 23,
+		t->w - 16, 0, false);
+	g_dump_name = "tile-back";
+	zt_buffer_show(server, &t->back_layer, buffer, cr, t->w, t->h);
+}
+
+static void live_read(struct zt_server *server) {
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	for (int i = 0; i < server->n_tiles; i++) {
+		struct tile *t = &server->tiles[i];
+		char key[128], path[384];
+		tile_key(t, key, sizeof(key));
+		snprintf(path, sizeof(path), "%s/ztos-live/%s", runtime ? runtime : "/tmp", key);
+		struct stat st;
+		if (t->size == TILE_SMALL || stat(path, &st) != 0) {
+			if (t->live) {
+				t->live = false;
+				t->live_mtime = 0;
+				if (t->flip > 1.0f) {
+					animate(server, &t->flip, 0.0f, 500, 0, false);	/* back to its front */
+				}
+			}
+			continue;
+		}
+		if (t->live && st.st_mtime == t->live_mtime) {
+			continue;
+		}
+		FILE *f = fopen(path, "r");
+		if (!f) {
+			continue;
+		}
+		char line[160];
+		int n = 0;
+		t->live_title[0] = 0;
+		memset(t->live_lines, 0, sizeof(t->live_lines));
+		t->live_count = 0;
+		while (fgets(line, sizeof(line), f)) {
+			line[strcspn(line, "\n")] = 0;
+			if (strncmp(line, "title=", 6) == 0) {
+				snprintf(t->live_title, sizeof(t->live_title), "%s", line + 6);
+			} else if (strncmp(line, "line=", 5) == 0 && n < 3) {
+				snprintf(t->live_lines[n++], sizeof(t->live_lines[0]), "%s", line + 5);
+			} else if (strncmp(line, "count=", 6) == 0) {
+				t->live_count = atoi(line + 6);
+			}
+		}
+		fclose(f);
+		if (!t->live) {
+			t->next_flip_ms = now_ms() + 2000 + (uint32_t)(rand() % 4000);
+		}
+		t->live = true;
+		t->live_mtime = st.st_mtime;
+		if (server->width > 0) {
+			draw_tile_back(server, i);
+			draw_tile(server, i);	/* its count, on the front */
+		}
+	}
+}
+
+/* Once a second: the files again every third, and at most one tile turns. */
+static void live_tick(struct zt_server *server) {
+	static int ticks;
+	if (++ticks % 3 == 0) {
+		live_read(server);
+	}
+	if (server->shown || !server->screen_on || server->locked || server->editing) {
+		return;
+	}
+	uint32_t now = now_ms();
+	for (int i = 0; i < server->n_tiles; i++) {
+		struct tile *t = &server->tiles[i];
+		if (!t->live || !t->back_layer.tex || now < t->next_flip_ms) {
+			continue;
+		}
+		bool to_back = t->flip < 90.0f;
+		animate(server, &t->flip, to_back ? 180.0f : 0.0f, 520, 0, false);
+		/* the back stays up a while to be read; the front a random while */
+		t->next_flip_ms = now + (to_back ? 5000 + (uint32_t)(rand() % 3000) :
+			4000 + (uint32_t)(rand() % 6000));
+		damage(server);
+		break;
+	}
 }
 
 static void draw_start(struct zt_server *server) {
@@ -3193,6 +3615,18 @@ static void status_row(struct zt_server *server, cairo_t *cr, bool details, bool
 			status_pop_end(cr, server->st_arrow);
 		}
 		status_pop_end(cr, server->st_wifi);
+		x += s + 8;
+	}
+	/* Bluetooth: white with a device connected, grey only on; it blinks
+	 * (one second each) while sound streams to the device */
+	if (server->bt_on && !(server->bt_streaming && server->bt_blink)) {
+		double s = cell * 1.25;
+		if (server->bt_name[0]) {
+			cairo_set_source_rgb(cr, 1, 1, 1);
+		} else {
+			cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		}
+		draw_icon(cr, "bluetooth", x + s * 0.35, base - s / 2, s);
 	}
 	cairo_set_source_rgb(cr, 1, 1, 1);
 
@@ -3305,7 +3739,9 @@ static void status_row(struct zt_server *server, cairo_t *cr, bool details, bool
 				cairo_fill(pc);
 
 				zt_buffer_show(server, &server->plug_layer, pb, pc, pw_i, ph_i);
-			} else if (server->battery_full || server->st_plug > 0.5f) {
+			} else if (server->battery_full) {
+				/* while charging it blinks: drawn over this row as plug_layer
+				 * (plug_over), not baked into a picture redrawn once a minute */
 				double py_body_top = cy - body_h / 2.0;
 				double py_prongs_top = py_body_top - prong_h;
 				double py_cord_top = py_body_top + body_h;
@@ -3465,6 +3901,16 @@ static int peek_timed_out(void *data) {
  * light with the day and the date under it. It is pushed up off the screen
  * to unlock.
  */
+/* The charging plug, blinking, over a row drawn at oy that has it left
+ * out (the lock screen's, the action centre's): the same layer and the
+ * same once-a-second toggle as the status bar's. */
+static void plug_over(struct zt_server *server, float oy) {
+	if (server->charging && !server->battery_full && server->plug_layer.tex &&
+	    server->st_plug > 0.5f) {
+		layer_draw(server, &server->plug_layer, server->plug_x, server->plug_y + oy, 1.0f);
+	}
+}
+
 static void draw_lock(struct zt_server *server) {
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, server->width, server->height, &cr);
@@ -3477,6 +3923,22 @@ static void draw_lock(struct zt_server *server) {
 	cairo_set_source(cr, fade);
 	cairo_paint(cr);
 	cairo_pattern_destroy(fade);
+	if (server->lock_wall) {
+		/* the photo, and a shade rising from the bottom for the clock */
+		cairo_save(cr);
+		cairo_scale(cr, 1.0 / server->scale, 1.0 / server->scale);
+		cairo_set_source_surface(cr, server->lock_wall, 0, 0);
+		cairo_paint(cr);
+		cairo_restore(cr);
+		cairo_pattern_t *shade = cairo_pattern_create_linear(0, 0, 0, server->height);
+		cairo_pattern_add_color_stop_rgba(shade, 0.0, 0, 0, 0, 0.25);
+		cairo_pattern_add_color_stop_rgba(shade, 0.15, 0, 0, 0, 0.0);
+		cairo_pattern_add_color_stop_rgba(shade, 0.55, 0, 0, 0, 0.0);
+		cairo_pattern_add_color_stop_rgba(shade, 1.0, 0, 0, 0, 0.5);
+		cairo_set_source(cr, shade);
+		cairo_paint(cr);
+		cairo_pattern_destroy(shade);
+	}
 	status_row(server, cr, false, false);
 
 	time_t now = time(NULL);
@@ -3491,6 +3953,26 @@ static void draw_lock(struct zt_server *server) {
 	strftime(line, sizeof(line), "%B %-d", &tm);
 	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 120, 0, 0, false);
 	zt_buffer_show(server, &server->lock_layer, buffer, cr, server->width, server->height);
+}
+
+/* The system sounds (sounds/ztos-sounds.c plays them, indices as its
+ * files[]): Windows Phone's own, from its sound kit. */
+enum ui_sound { UIS_KEY, UIS_SPACE, UIS_FUNCTION, UIS_LOCK, UIS_UNLOCK, UIS_NOTIFY,
+	UIS_COPY, UIS_MENU, UIS_BATTERY_LOW, UIS_PIP };
+
+/* Played at the ring volume, and not at all with it at zero. */
+static void ui_sound(struct zt_server *server, enum ui_sound sound) {
+	if (!server->ring_volume) return;
+	if (server->key_sound_fd < 0)
+		server->key_sound_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (server->key_sound_fd < 0) return;
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	if (!runtime) return;
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/ztos-sounds.sock", runtime);
+	unsigned char packet[2] = { (unsigned char)sound,
+		(unsigned char)(server->ring_volume * 100 / VOLUME_MAX) };
+	sendto(server->key_sound_fd, packet, sizeof(packet), MSG_DONTWAIT, (struct sockaddr *)&addr, sizeof(addr));
 }
 
 static void lock(struct zt_server *server) {
@@ -3510,6 +3992,36 @@ static void lock(struct zt_server *server) {
 /* Once a second, and only while the screen is on: whether the network in use
  * carried anything since the last look (its arrow shows for as long as it
  * does), and the plug in the battery while it charges. */
+/* $XDG_RUNTIME_DIR/ztos-bt (os/overlay/usr/local/bin/ztos-bt-state): true if
+ * anything the status bar or a tile shows of it changed. */
+static bool bt_state_read(struct zt_server *server) {
+	char path[256], line[160], name[64] = "";
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	snprintf(path, sizeof(path), "%s/ztos-bt", runtime ? runtime : "/tmp");
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		return false;
+	}
+	bool on = false, streaming = false;
+	int battery = -1;
+	while (fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\n")] = 0;
+		if (strncmp(line, "on=", 3) == 0) on = line[3] == '1';
+		else if (strncmp(line, "connected=", 10) == 0) snprintf(name, sizeof(name), "%s", line + 10);
+		else if (strncmp(line, "battery=", 8) == 0 && line[8]) battery = atoi(line + 8);
+		else if (strncmp(line, "streaming=", 10) == 0) streaming = line[10] == '1';
+	}
+	fclose(f);
+	bool changed = on != server->bt_on || streaming != server->bt_streaming ||
+		battery != server->bt_battery || strcmp(name, server->bt_name) != 0;
+	server->bt_on = on;
+	server->shade_bt = on;
+	server->bt_streaming = streaming;
+	server->bt_battery = battery;
+	snprintf(server->bt_name, sizeof(server->bt_name), "%s", name);
+	return changed;
+}
+
 static int net_tick(void *data) {
 	struct zt_server *server = data;
 	if (!server->screen_on || server->width == 0) {
@@ -3553,8 +4065,23 @@ static int net_tick(void *data) {
 	server->net_bytes = bytes ? bytes : 1;
 	server->net_active = active;
 
+	if (bt_state_read(server)) {
+		redraw = true;
+	}
+	live_tick(server);
+	if (server->bt_streaming) {
+		server->bt_blink = !server->bt_blink;
+		redraw = true;
+	} else {
+		server->bt_blink = false;
+	}
 	bool charging = on_charger();
 	int battery = read_battery();
+	/* unplugged and going down through 15 % or 5 %: the low battery chime */
+	if (!charging && battery >= 0 && server->battery_level > battery &&
+	    ((server->battery_level > 15 && battery <= 15) || (server->battery_level > 5 && battery <= 5))) {
+		ui_sound(server, UIS_BATTERY_LOW);
+	}
 	if (charging != server->charging || (battery >= 0 && battery != server->battery_level)) {
 		server->charging = charging;
 		server->battery_level = battery;
@@ -3654,12 +4181,15 @@ static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double
 		cairo_fill(cr);
 		return;
 	}
-	/* Bluetooth, rotation, the flashlight and location have nothing behind
-	 * them on this phone yet (no driver, no service): shown, faint, and not
-	 * pretending to switch */
-	bool missing = q == Q_BLUETOOTH || q == Q_ROTATION || q == Q_FLASHLIGHT || q == Q_LOCATION;
+	/* Bluetooth, rotation and location have nothing behind them on this
+	 * phone yet (no driver, no service), nor the flashlight while
+	 * zrn-flash is not loaded: shown, faint, and not pretending to switch */
+	bool missing = q == Q_ROTATION || q == Q_LOCATION ||
+		(q == Q_FLASHLIGHT && access(TORCH_PATH, W_OK) != 0) ||
+		(q == Q_BLUETOOTH && access("/sys/class/bluetooth/hci0", F_OK) != 0);
 	bool on = q == Q_WIFI ? server->shade_wifi : q == Q_AIRPLANE ? server->shade_airplane :
 		q == Q_DATA ? server->cell_data_on : q == Q_VIBRATE ? server->haptics_enabled :
+		q == Q_FLASHLIGHT ? server->shade_torch : q == Q_BLUETOOTH ? server->shade_bt :
 		q == Q_BRIGHTNESS;
 	/* on: the accent colour; off: a dark grey block */
 	if (on) {
@@ -4658,6 +5188,16 @@ static pid_t *started_pid(struct zt_server *server, const char *command) {
 
 /* Start `command`, or bring what it started before to the front. Whoever
  * calls says first which tile or row was tapped: that one leaves last. */
+
+/* A child of ours keeps nothing of the shell's open: the DRM device and its
+ * buffers above all. A program started from here that outlives the shell
+ * (ztnotifyd, ztos-sounds, an app) otherwise holds the old shell's scanout
+ * buffers in CMA, and after a few restarts the new shell cannot allocate one
+ * and the screen stays blank. */
+static void close_inherited(void) {
+	close_range(3, ~0U, 0);
+}
+
 static void launch(struct zt_server *server, const char *command) {
     struct zt_toplevel *existing;
     wl_list_for_each(existing, &server->toplevels, link) {
@@ -4735,6 +5275,7 @@ static void launch(struct zt_server *server, const char *command) {
 		/* exec, so that the pid we remember is the app's own */
 		char line[300];
 		snprintf(line, sizeof(line), "exec %s", command);
+		close_inherited();
 		execl("/bin/sh", "/bin/sh", "-c", line, (void *)NULL);
 		_exit(127);
 	}
@@ -4948,6 +5489,7 @@ static void run_detached(const char *program, const char *a1, const char *a2, co
 			dup2(null, 1);
 			dup2(null, 2);
 		}
+		close_inherited();
 		execlp(program, program, a1, a2, a3, (char *)NULL);
 		_exit(127);
 	}
@@ -4991,9 +5533,32 @@ static void shade_activate(struct zt_server *server, int index) {
 		draw_shade(server);
 		damage(server);
 		break;
+	case 100 + Q_FLASHLIGHT: {
+		/* the rear flash LED at a torch's current (leds/zrn-flash.ko) */
+		FILE *f = fopen(TORCH_PATH, "w");
+		if (!f) {
+			break;	/* not loaded: the tile is drawn faint */
+		}
+		hap(server, HAP_TAP, HG_SYSTEM);
+		server->shade_torch = !server->shade_torch;
+		fprintf(f, "%d\n", server->shade_torch ? TORCH_LEVEL : 0);
+		fclose(f);
+		draw_shade(server);
+		damage(server);
+		break;
+	}
 	case 100 + Q_BLUETOOTH:
+		/* bluetoothd's adapter (zrn-bluetooth.service attaches it) */
+		if (access("/sys/class/bluetooth/hci0", F_OK) != 0) {
+			break;	/* not attached: the tile is drawn faint */
+		}
+		hap(server, HAP_TAP, HG_SYSTEM);
+		server->shade_bt = !server->shade_bt;
+		run_detached("bluetoothctl", "power", server->shade_bt ? "on" : "off", NULL);
+		draw_shade(server);
+		damage(server);
+		break;
 	case 100 + Q_ROTATION:
-	case 100 + Q_FLASHLIGHT:
 	case 100 + Q_LOCATION:
 	case 100 + Q_NONE:
 		break;	/* nothing behind them yet: see shade_tile_draw */
@@ -5145,24 +5710,455 @@ static void search_key(struct zt_server *server, struct osk_key *key) {
 	list_relayout(server);
 }
 
+/* ---- Hyperscan: one search over everything ----------------------------------
+ *
+ * The search button opens it, over Start or an app: a box at the top with
+ * the keyboard up, and what matches below it in groups, as Windows Phone's
+ * search did: the best match, then apps, settings, files, and the web.
+ * Tapping a row opens it; back closes. Files are the names under the home
+ * folders (Documents, Downloads, Pictures, Music, Videos), read each time
+ * it opens.
+ */
+enum hyper_kind { HK_APP, HK_SETTING, HK_FILE, HK_WEB, HK_KINDS };
+struct hyper_hit {
+	int kind, score, item;		/* item: the app list's row, for an app */
+	char title[96], sub[160], icon[80], arg[256];
+	double y0, y1;			/* on the layer, for a tap */
+};
+#define HYPER_MAX	40
+#define HYPER_GROUP	4		/* rows a group shows */
+#define HYPER_BOX_Y	56
+#define HYPER_BOX_H	40
+#define HYPER_LIST_Y	114
+#define HYPER_ROW_H	56
+#define HYPER_BEST_H	68
+
+static const struct { const char *page, *title, *words; } HYPER_SETTINGS[] = {
+	{ "theme", "theme", "accent colour color background wallpaper photo start columns" },
+	{ "display", "display", "brightness screen timeout scale sleep" },
+	{ "wifi", "Wi-Fi", "wireless network internet hotspot" },
+	{ "bluetooth", "Bluetooth", "headset headphones speaker pair audio earbuds" },
+	{ "mobile", "cellular + SIM", "mobile data network roaming sim" },
+	{ "apn", "access point", "apn mobile data internet" },
+	{ "audio", "ringtones + sounds", "volume sound ringtone vibrate media" },
+	{ "battery", "battery", "power saver charge" },
+	{ "keyboard", "keyboard", "typing key height key sound" },
+	{ "haptics", "haptics", "vibration feedback" },
+	{ "quick", "notifications + actions", "quick actions action centre" },
+	{ "date", "date + time", "clock time zone" },
+	{ "about", "about", "phone version software information" },
+	{ "cpu", "processor", "cpu governor performance" },
+	{ "gpu", "graphics", "gpu governor" },
+	{ "vm", "memory", "ram zram swap" },
+	{ "perf", "performance", "speed profile" },
+	{ "dev", "developer", "debug touches slow motion" },
+};
+
+/* How well `text` answers the query: its start 300, a word's start 200,
+ * anywhere 100, not at all 0. Both already lower case. */
+static int hyper_score(const char *text, const char *q) {
+	char low[256];
+	size_t n = 0;
+	for (; text[n] && n + 1 < sizeof(low); n++) {
+		low[n] = (char)tolower((unsigned char)text[n]);
+	}
+	low[n] = 0;
+	const char *at = strstr(low, q);
+	if (!at) {
+		return 0;
+	}
+	if (at == low) {
+		return 300;
+	}
+	for (const char *w = low; (w = strstr(w, q)); w++) {
+		if (w == low || w[-1] == ' ' || w[-1] == '-' || w[-1] == '_' || w[-1] == '.') {
+			return 200;
+		}
+	}
+	return 100;
+}
+
+static void hyper_files_read(struct zt_server *server, const char *dir, int depth) {
+	DIR *d = opendir(dir);
+	struct dirent *e;
+	while (d && (e = readdir(d)) && server->n_hyper_files < 3000) {
+		if (e->d_name[0] == '.') {
+			continue;
+		}
+		char path[256];
+		if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path)) {
+			continue;
+		}
+		snprintf(server->hyper_files[server->n_hyper_files++], 256, "%s", path);
+		if (depth < 4 && e->d_type == DT_DIR) {
+			hyper_files_read(server, path, depth + 1);
+		}
+	}
+	if (d) {
+		closedir(d);
+	}
+}
+
+static void hyper_add(struct zt_server *server, int kind, int score, int item, const char *title,
+		const char *sub, const char *icon, const char *arg) {
+	if (server->n_hyper >= HYPER_MAX) {
+		/* full: a better one takes the place of the weakest of its kind */
+		int weakest = -1;
+		for (int i = 0; i < server->n_hyper; i++) {
+			struct hyper_hit *h = &server->hyper_hits[i];
+			if (h->kind == kind && h->score < score && (weakest < 0 || h->score < server->hyper_hits[weakest].score)) {
+				weakest = i;
+			}
+		}
+		if (weakest < 0) {
+			return;
+		}
+		server->hyper_hits[weakest] = server->hyper_hits[--server->n_hyper];
+	}
+	struct hyper_hit *h = &server->hyper_hits[server->n_hyper++];
+	memset(h, 0, sizeof(*h));
+	h->kind = kind;
+	h->score = score;
+	h->item = item;
+	snprintf(h->title, sizeof(h->title), "%s", title);
+	snprintf(h->sub, sizeof(h->sub), "%s", sub);
+	snprintf(h->icon, sizeof(h->icon), "%s", icon);
+	snprintf(h->arg, sizeof(h->arg), "%s", arg);
+}
+
+static int hyper_order(const void *a, const void *b) {
+	const struct hyper_hit *x = a, *y = b;
+	if (x->kind != y->kind) {
+		return x->kind - y->kind;
+	}
+	if (x->score != y->score) {
+		return y->score - x->score;
+	}
+	return strcasecmp(x->title, y->title);
+}
+
+static void hyper_search(struct zt_server *server) {
+	server->n_hyper = 0;
+	server->hyper_scroll = 0;
+	char q[128];
+	size_t n = 0;
+	for (const char *c = server->hyper_q; *c == ' '; c++) {
+		;
+	}
+	for (const char *c = server->hyper_q; *c && n + 1 < sizeof(q); c++) {
+		q[n++] = (char)tolower((unsigned char)*c);
+	}
+	while (n > 0 && q[n - 1] == ' ') {
+		n--;
+	}
+	q[n] = 0;
+	if (!q[0]) {
+		return;
+	}
+	for (int i = 0; i < server->n_items; i++) {
+		struct app_item *it = &server->items[i];
+		int sc = it->header ? 0 : hyper_score(it->name, q);
+		if (sc) {
+			char icon[80];
+			snprintf(icon, sizeof(icon), "@%s", it->key);
+			hyper_add(server, HK_APP, sc + 20, i, it->name, "app", icon, it->command);
+		}
+	}
+	for (size_t i = 0; i < sizeof(HYPER_SETTINGS) / sizeof(HYPER_SETTINGS[0]); i++) {
+		int sc = hyper_score(HYPER_SETTINGS[i].title, q);
+		int sw = hyper_score(HYPER_SETTINGS[i].words, q);
+		if (sw > sc) {
+			sc = sw - 50;
+		}
+		if (sc > 0) {
+			hyper_add(server, HK_SETTING, sc, -1, HYPER_SETTINGS[i].title,
+				"settings", "gear", HYPER_SETTINGS[i].page);
+		}
+	}
+	const char *home = getenv("HOME");
+	size_t home_len = home ? strlen(home) : 0;
+	for (int i = 0; i < server->n_hyper_files; i++) {
+		const char *path = server->hyper_files[i], *base = strrchr(path, '/');
+		base = base ? base + 1 : path;
+		int sc = hyper_score(base, q);
+		if (!sc) {
+			continue;
+		}
+		char where[160];
+		size_t dir_len = (size_t)(base - path) - 1;
+		if (home && strncmp(path, home, home_len) == 0) {
+			snprintf(where, sizeof(where), "~%.*s", (int)(dir_len - home_len), path + home_len);
+		} else {
+			snprintf(where, sizeof(where), "%.*s", (int)dir_len, path);
+		}
+		const char *dot = strrchr(base, '.');
+		const char *icon = !dot ? "folder" :
+			!strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg") || !strcasecmp(dot, ".png") ||
+			!strcasecmp(dot, ".webp") ? "photo" :
+			!strcasecmp(dot, ".mp3") || !strcasecmp(dot, ".flac") || !strcasecmp(dot, ".ogg") ||
+			!strcasecmp(dot, ".m4a") || !strcasecmp(dot, ".wav") ? "music" : "pencil";
+		hyper_add(server, HK_FILE, sc - 10, -1, base, where, icon, path);
+	}
+	char sub[160];
+	snprintf(sub, sizeof(sub), "search the web for \"%.120s\"", server->hyper_q);
+	hyper_add(server, HK_WEB, 1, -1, server->hyper_q, sub, "globe", server->hyper_q);
+	qsort(server->hyper_hits, server->n_hyper, sizeof(server->hyper_hits[0]), hyper_order);
+}
+
+static void hyper_row(struct zt_server *server, cairo_t *cr, struct hyper_hit *h, double y, bool best) {
+	double row = best ? HYPER_BEST_H : HYPER_ROW_H, sq = best ? 56 : 42, x = 12;
+	set_rgb(cr, server->accent);
+	cairo_rectangle(cr, x, y + (row - sq) / 2, sq, sq);
+	cairo_fill(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	draw_glyph(server, cr, h->icon, h->title, x + sq / 2, y + row / 2, sq * 0.55);
+	double tx = x + sq + 14, tw = server->width - tx - 12;
+	draw_text(cr, h->title, FONT_SEMILIGHT, best ? 22 : 19, tx, y + row / 2 - (best ? 22 : 19), tw, 0, false);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	draw_text(cr, h->sub, FONT_REGULAR, 12.5, tx, y + row / 2 + 4, tw, 0, false);
+	h->y0 = y;
+	h->y1 = y + row;
+}
+
+/* The whole of it, from under the status bar to the nav bar. */
+static void draw_hyper(struct zt_server *server) {
+	double w = server->width, h = server->height - STATUS_H - NAV_H;
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, w, h, &cr);
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_paint(cr);
+	/* the ring, and the name */
+	set_rgb(cr, server->accent);
+	cairo_set_line_width(cr, 3);
+	cairo_arc(cr, 12 + 14, 16 + 14, 12, 0, 2 * M_PI);
+	cairo_stroke(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	draw_text(cr, "Hyperscan", FONT_SEMILIGHT, 24, 12 + 38, 13, 0, 0, false);
+	/* the box, white with the keyboard up for it, and its caret */
+	cairo_rectangle(cr, 12, HYPER_BOX_Y, w - 24, HYPER_BOX_H);
+	cairo_fill(cr);
+	if (server->hyper_q[0]) {
+		cairo_set_source_rgb(cr, 0, 0, 0);
+		draw_text(cr, server->hyper_q, FONT_REGULAR, 17, 22, HYPER_BOX_Y + 9, w - 48, 0, false);
+	} else {
+		cairo_set_source_rgb(cr, 0.55, 0.55, 0.55);
+		draw_text(cr, "search apps, settings, files and the web", FONT_REGULAR, 15, 22,
+			HYPER_BOX_Y + 11, w - 48, 0, false);
+	}
+	double caret = 22 + (server->hyper_q[0] ? text_width(server->hyper_q, FONT_REGULAR, 17) + 1 : 0);
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_rectangle(cr, fmin(caret, w - 24), HYPER_BOX_Y + 9, 1.5, HYPER_BOX_H - 18);
+	cairo_fill(cr);
+	/* what was found, scrolled under the box */
+	cairo_rectangle(cr, 0, HYPER_LIST_Y - 6, w, h - HYPER_LIST_Y + 6);
+	cairo_clip(cr);
+	double y = HYPER_LIST_Y - server->hyper_scroll;
+	if (!server->hyper_q[0]) {
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		draw_text(cr, "Type to search everything on this phone.", FONT_REGULAR, 15, 12, y + 4, w - 24, 0, false);
+	}
+	static const char *names[HK_KINDS] = { "apps", "settings", "files", "web" };
+	/* the best match: the strongest of all, above the groups */
+	int best = -1;
+	for (int i = 0; i < server->n_hyper; i++) {
+		server->hyper_hits[i].y0 = server->hyper_hits[i].y1 = -1;
+		if (server->hyper_hits[i].kind != HK_WEB &&
+				(best < 0 || server->hyper_hits[i].score > server->hyper_hits[best].score)) {
+			best = i;
+		}
+	}
+	if (best >= 0) {
+		set_rgb(cr, server->accent);
+		draw_text(cr, "best match", FONT_SEMIBOLD, 15, 12, y, 0, 0, false);
+		y += 30;
+		hyper_row(server, cr, &server->hyper_hits[best], y, true);
+		y += HYPER_BEST_H + 18;
+	}
+	for (int k = 0; k < HK_KINDS; k++) {
+		int shown = 0, total = 0;
+		for (int i = 0; i < server->n_hyper; i++) {
+			if (server->hyper_hits[i].kind == k && i != best) {
+				total++;
+			}
+		}
+		if (!total) {
+			continue;
+		}
+		set_rgb(cr, server->accent);
+		draw_text(cr, names[k], FONT_SEMIBOLD, 15, 12, y, 0, 0, false);
+		y += 30;
+		for (int i = 0; i < server->n_hyper && shown < HYPER_GROUP; i++) {
+			if (server->hyper_hits[i].kind != k || i == best) {
+				continue;
+			}
+			hyper_row(server, cr, &server->hyper_hits[i], y, false);
+			y += HYPER_ROW_H;
+			shown++;
+		}
+		if (total > shown) {
+			char more[48];
+			snprintf(more, sizeof(more), "and %d more", total - shown);
+			cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+			draw_text(cr, more, FONT_REGULAR, 13, 68, y + 2, 0, 0, false);
+			y += 24;
+		}
+		y += 14;
+	}
+	server->hyper_content_h = y + server->hyper_scroll - HYPER_LIST_Y;
+	if (!g_dump_name || strcmp(g_dump_name, "hyperscan-query") != 0) {
+		g_dump_name = "hyperscan";
+	}
+	zt_buffer_show(server, &server->hyper_layer, buffer, cr, w, h);
+}
+
+static void hyper_open(struct zt_server *server) {
+	if (server->hyper) {
+		return;
+	}
+	if (!server->hyper_hits) {
+		server->hyper_hits = calloc(HYPER_MAX, sizeof(*server->hyper_hits));
+		server->hyper_files = calloc(3000, sizeof(*server->hyper_files));
+		if (!server->hyper_hits || !server->hyper_files) {
+			return;
+		}
+	}
+	server->hyper = true;
+	server->hyper_q[0] = 0;
+	server->n_hyper = 0;
+	server->hyper_scroll = 0;
+	server->n_hyper_files = 0;
+	const char *home = getenv("HOME");
+	static const char *dirs[] = { "Documents", "Downloads", "Pictures", "Music", "Videos", "Desktop" };
+	for (size_t i = 0; home && i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		char dir[256];
+		snprintf(dir, sizeof(dir), "%s/%s", home, dirs[i]);
+		hyper_files_read(server, dir, 0);
+	}
+	draw_hyper(server);
+	server->hyper_t = 0;
+	animate(server, &server->hyper_t, 1.0f, 250, 0, false);
+	server->osk_terminal = false;
+	osk_show(server, true);
+	wlr_log(WLR_INFO, "hyperscan: open (%d files)", server->n_hyper_files);
+}
+
+static void hyper_close(struct zt_server *server) {
+	if (!server->hyper) {
+		return;
+	}
+	server->hyper = false;
+	animate(server, &server->hyper_t, 0.0f, 180, 0, true);
+	if (!server->osk_terminal) {
+		osk_show(server, false);
+	}
+	damage(server);
+}
+
+static void hyper_launch(struct zt_server *server, struct hyper_hit *h) {
+	hap(server, HAP_TAP, HG_APPS);
+	struct hyper_hit hit = *h;	/* the list goes with the close */
+	hyper_close(server);
+	char cmd[300];
+	switch (hit.kind) {
+	case HK_APP:
+		if (hit.item >= 0 && hit.item < server->n_items) {
+			launch_item(server, hit.item);
+		}
+		break;
+	case HK_SETTING:
+		snprintf(cmd, sizeof(cmd), "ztsettings %s", hit.arg);
+		launch(server, cmd);
+		break;
+	case HK_FILE:
+		run_detached("xdg-open", hit.arg, NULL, NULL);
+		break;
+	case HK_WEB: {
+		char url[700] = "https://duckduckgo.com/?q=";
+		size_t n = strlen(url);
+		for (const unsigned char *c = (const unsigned char *)hit.arg; *c && n + 4 < sizeof(url); c++) {
+			if (isalnum(*c) || *c == '-' || *c == '_' || *c == '.') {
+				url[n++] = (char)*c;
+			} else if (*c == ' ') {
+				url[n++] = '+';
+			} else {
+				n += (size_t)snprintf(url + n, 4, "%%%02X", *c);
+			}
+		}
+		url[n] = 0;
+		run_detached("xdg-open", url, NULL, NULL);
+		break;
+	}
+	}
+}
+
+/* A key from the on-screen keyboard while Hyperscan is open. */
+static void hyper_key(struct zt_server *server, struct osk_key *key) {
+	size_t len = strlen(server->hyper_q);
+	if (key->keycode == KEY_BACKSPACE) {
+		while (len > 0 && ((unsigned char)server->hyper_q[len - 1] & 0xc0) == 0x80) {
+			len--;
+		}
+		server->hyper_q[len > 0 ? len - 1 : 0] = 0;
+	} else if (key->keycode == KEY_ENTER) {
+		int best = -1;
+		for (int i = 0; i < server->n_hyper; i++) {
+			if (best < 0 || server->hyper_hits[i].score > server->hyper_hits[best].score) {
+				best = i;
+			}
+		}
+		if (best >= 0) {
+			hyper_launch(server, &server->hyper_hits[best]);
+		}
+		return;
+	} else if (key->keycode == KEY_SPACE) {
+		if (len + 1 < sizeof(server->hyper_q)) {
+			server->hyper_q[len] = ' ';
+			server->hyper_q[len + 1] = 0;
+		}
+	} else if (key->label && key->label[0] && len + strlen(key->label) < sizeof(server->hyper_q)) {
+		strcat(server->hyper_q, key->label);
+	} else {
+		return;
+	}
+	hyper_search(server);
+	draw_hyper(server);
+	damage(server);
+}
+
+/* A tap on it at (x, y) on the screen. */
+static void hyper_tap(struct zt_server *server, double x, double y) {
+	double ly = y - STATUS_H;
+	if (ly >= HYPER_BOX_Y && ly < HYPER_BOX_Y + HYPER_BOX_H) {
+		if (!server->osk_visible) {
+			osk_show(server, true);
+		}
+		return;
+	}
+	for (int i = 0; i < server->n_hyper; i++) {
+		struct hyper_hit *h = &server->hyper_hits[i];
+		if (h->y1 > h->y0 && ly >= h->y0 && ly < h->y1 && ly >= HYPER_LIST_Y - 6) {
+			hyper_launch(server, h);
+			return;
+		}
+	}
+}
+
 static void keyboard_sound(struct zt_server *server, const struct osk_key *key) {
-    if (!server->key_sound || !server->ring_volume) return;
-    if (server->key_sound_fd < 0)
-        server->key_sound_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (server->key_sound_fd < 0) return;
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
-    if (!runtime) return;
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/ztos-sounds.sock", runtime);
-    unsigned char packet[2] = {
-        key->keycode == KEY_SPACE ? 1 : key->action != ACT_CHAR || key->keycode == KEY_BACKSPACE || key->keycode == KEY_ENTER ? 2 : 0,
-        (unsigned char)(server->ring_volume * 100 / VOLUME_MAX) };
-    sendto(server->key_sound_fd, packet, sizeof(packet), MSG_DONTWAIT, (struct sockaddr *)&addr, sizeof(addr));
+    if (!server->key_sound) return;
+    ui_sound(server, key->keycode == KEY_SPACE ? UIS_SPACE :
+        key->action != ACT_CHAR || key->keycode == KEY_BACKSPACE || key->keycode == KEY_ENTER ?
+        UIS_FUNCTION : UIS_KEY);
 }
 
 static void osk_activate(struct zt_server *server, int index) {
 	if (index < 0 || index >= server->n_keys) return;
 	struct osk_key *key = &server->keys[index];
+	if (server->hyper && key->action == ACT_CHAR) {
+		hyper_key(server, key);
+		if (server->osk_shift || server->osk_ctrl || server->osk_alt) server->osk_base_dirty = true;
+		server->osk_shift = server->osk_ctrl = server->osk_alt = false;
+		return;
+	}
 	if (!server->shown && server->searching && key->action == ACT_CHAR) {
 		search_key(server, key);
 		if (server->osk_shift || server->osk_ctrl || server->osk_alt) server->osk_base_dirty = true;
@@ -5382,21 +6378,39 @@ static void text_input_commit(struct wl_listener *listener, void *data) {
 	}
 	struct wlr_box *r = &ti->input->current.cursor_rectangle;
 	struct wlr_box *geo = &server->shown->xdg_toplevel->base->geometry;
-	/* the line being typed on, and a little below for the box around it */
-	double bottom = r->y + r->height - geo->y + 8;
+	/* the line being typed on, and a little below for the box around it;
+	 * in screen points, for a window shown smaller than it is (app_fit) */
+	double bottom = (r->y + r->height - geo->y + 8) * app_fit(server, server->shown);
 	if (bottom != server->osk_box_bottom) {
 		server->osk_box_bottom = bottom;
 		osk_lift(server);
 	}
 }
 
+/* A field asking for the keyboard. Shown only when it follows the user's own
+ * tap in the app, as Android does: a page that focuses a field by itself
+ * (autofocus, a page loaded, the window coming back) does not pull the
+ * keyboard up over it; it waits for the next tap. */
+#define OSK_TAP_MS	1500
 static void text_input_enable(struct wl_listener *listener, void *data) {
 	struct zt_text_input *ti = wl_container_of(listener, ti, enable);
-	osk_show(ti->server, true);
+	struct zt_server *server = ti->server;
+	if (now_ms() - server->client_tap_ms > OSK_TAP_MS) {
+		server->osk_pending = true;
+		return;
+	}
+	server->osk_pending = false;
+	if (!(ti->input->current.features & WLR_TEXT_INPUT_V3_FEATURE_CURSOR_RECTANGLE)) {
+		/* no cursor rectangle from this app: the field is where the finger
+		 * was, and a line below it is kept in view */
+		server->osk_box_bottom = server->client_tap_y + 36;
+	}
+	osk_show(server, true);
 }
 
 static void text_input_disable(struct wl_listener *listener, void *data) {
 	struct zt_text_input *ti = wl_container_of(listener, ti, disable);
+	ti->server->osk_pending = false;
 	if (!ti->server->osk_terminal) {
 		osk_show(ti->server, false);
 	}
@@ -5999,6 +7013,14 @@ static int long_press_fired(void *data) {
 			hap(server, HAP_HEAVY, HG_NAV);
 			wlr_log(WLR_INFO, "nav: long press on start");
 			switcher_open(server);
+		} else if (p->used && p->role == ROLE_NAV && p->index == NAV_SEARCH && !p->moved) {
+			/* held: the keyboard, for an app that does not ask for it */
+			p->long_pressed = true;
+			hap(server, HAP_HEAVY, HG_NAV);
+			wlr_log(WLR_INFO, "nav: long press on search (keyboard toggle)");
+			if (server->shown && !server->hyper) {
+				osk_show(server, !server->osk_visible);
+			}
 		}
 	}
 	return 0;
@@ -6021,8 +7043,71 @@ static void perf_tell(const char *command) {
 
 /* The volume keys: a banner drops from the top with the level, as a count
  * out of thirty, and goes again two seconds after the last press. */
+/* The audio outputs, for the banner's last row. pactl is asked in the
+ * background, into $XDG_RUNTIME_DIR/ztos-outputs ("*|name|description" for the
+ * default, "-|..." for the others), and the banner only reads that file, so
+ * drawing never waits on PipeWire. */
+#define OUTPUTS_SH \
+	"d=$(pactl get-default-sink 2>/dev/null); f=$XDG_RUNTIME_DIR/ztos-outputs; " \
+	"pactl list sinks 2>/dev/null | awk -v d=\"$d\" '/^\\tName:/ { n = $2 } " \
+	"/^\\tDescription:/ { sub(/^\\tDescription: /, \"\"); print (n == d ? \"*\" : \"-\") \"|\" n \"|\" $0 }' " \
+	"> \"$f.new\" && mv \"$f.new\" \"$f\""
+static void outputs_refresh(void) {
+	run_detached("sh", "-c", OUTPUTS_SH, NULL);
+}
+
+#define MAX_OUTPUTS 8
+struct output_entry { bool current; char name[160], desc[96]; };
+static int outputs_read(struct output_entry *out) {
+	char path[256], line[320];
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	snprintf(path, sizeof(path), "%s/ztos-outputs", runtime ? runtime : "/tmp");
+	FILE *f = fopen(path, "r");
+	int n = 0;
+	while (f && n < MAX_OUTPUTS && fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\n")] = 0;
+		char *a = strchr(line, '|'), *b = a ? strchr(a + 1, '|') : NULL;
+		if (!a || !b) continue;
+		*a = *b = 0;
+		out[n].current = line[0] == '*';
+		snprintf(out[n].name, sizeof(out[n].name), "%s", a + 1);
+		snprintf(out[n].desc, sizeof(out[n].desc), "%s", b + 1);
+		n++;
+	}
+	if (f) fclose(f);
+	return n;
+}
+
+/* The next output: made the default, and what plays now moved to it. The name
+ * reaches the shell as $0, never inside the command. */
+static void output_next(struct zt_server *server) {
+	struct output_entry out[MAX_OUTPUTS];
+	int n = outputs_read(out), cur = 0;
+	if (n < 2) {
+		outputs_refresh();
+		return;
+	}
+	for (int i = 0; i < n; i++) {
+		if (out[i].current) cur = i;
+	}
+	const char *to = out[(cur + 1) % n].name;
+	run_detached("sh", "-c", "pactl set-default-sink \"$0\" && "
+		"pactl list short sink-inputs | cut -f1 | while read -r i; do pactl move-sink-input \"$i\" \"$0\"; done; "
+		OUTPUTS_SH, to);
+	/* the file says so in a moment; the banner says so now */
+	char path[256];
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	snprintf(path, sizeof(path), "%s/ztos-outputs", runtime ? runtime : "/tmp");
+	FILE *f = fopen(path, "w");
+	for (int i = 0; f && i < n; i++) {
+		fprintf(f, "%c|%s|%s\n", i == (cur + 1) % n ? '*' : '-', out[i].name, out[i].desc);
+	}
+	if (f) fclose(f);
+	wlr_log(WLR_INFO, "audio output: %s", out[(cur + 1) % n].desc);
+}
+
 static double banner_h(struct zt_server *server) {
-	return VOLUME_H + (server->media ? MEDIA_H : 0);
+	return VOLUME_H + (server->media ? MEDIA_H : 0) + OUTPUT_H;
 }
 
 static void draw_volume(struct zt_server *server) {
@@ -6079,6 +7164,24 @@ static void draw_volume(struct zt_server *server) {
 			cairo_fill(cr);
 		}
 	}
+	/* where it plays: the output's name, and the way to the next one */
+	struct output_entry out[MAX_OUTPUTS];
+	int n_out = outputs_read(out);
+	const char *where = "phone";
+	for (int i = 0; i < n_out; i++) {
+		if (out[i].current) where = out[i].desc;
+	}
+	double oy = height - OUTPUT_H;
+	cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
+	cairo_rectangle(cr, 16, oy, server->width - 32, 1);
+	cairo_fill(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	draw_icon(cr, "music", 16 + 9, oy + OUTPUT_H / 2, 16);
+	draw_text(cr, where, FONT_REGULAR, 13.5, 40, oy + 13, server->width - 40 - 96, 0, false);
+	if (n_out > 1) {
+		set_rgb(cr, server->accent);
+		draw_text(cr, "change ›", FONT_SEMIBOLD, 13.5, server->width - 16 - 70, oy + 13, 70, 0, false);
+	}
 	zt_buffer_show(server, &server->volume_layer, buffer, cr, server->width, height);
 }
 
@@ -6112,6 +7215,7 @@ static void note_add(struct zt_server *server, const char *app, const char *titl
 		server->n_notes++;
 	}
 	wlr_log(WLR_INFO, "notification: %s: %s", title, text);
+	ui_sound(server, UIS_NOTIFY);
 	if (server->width == 0) {
 		return;	/* no screen yet: it is in the list when there is one */
 	}
@@ -6281,12 +7385,12 @@ static void dialog_handle_action(struct zt_server *server, const char *act) {
 		pipe_tell("/run/ztoscsf.ctl", "reboot_recovery\n");
 		run_detached("reboot", "recovery", NULL, NULL);
 		run_detached("systemctl", "reboot", NULL, NULL);
-		run_detached("/bin/sh", "-c", "echo REDACTED | sudo -S reboot recovery 2>/dev/null", NULL);
+		run_detached("/bin/sh", "-c", "sudo -n systemctl reboot --reboot-argument=recovery 2>/dev/null", NULL);
 	} else if (strcmp(act, "stop_sensorhub") == 0) {
 		pipe_tell("/run/ztoscsf.ctl", "stop_sensorhub\n");
 		run_detached("/bin/sh", "-c",
 			"touch /run/ztoscsf-sensorhub.stopped /run/sensorhub.stopped; "
-			"echo REDACTED | sudo -S systemctl stop zrn-sensorhub.service ztoscsf-sensorhub.service zrnsensord.service ztoscsf-sensord.service 2>/dev/null",
+			"sudo -n systemctl stop zrn-sensorhub.service ztoscsf-sensorhub.service zrnsensord.service ztoscsf-sensord.service 2>/dev/null",
 			NULL);
 		note_add(server, "ztOSCoreSensorFramework", "Sensor Hub Stopped", "Sensor hub has been stopped for this boot.");
 	} else if (act[0] == '/' || strchr(act, ' ')) {
@@ -6358,7 +7462,7 @@ static void uninstall_item(struct zt_server *server, int index) {
 
 static int volume_hide(void *data) {
 	struct zt_server *server = data;
-	animate(server, &server->volume_y, (float)-(VOLUME_H + MEDIA_H), 180, 0, false);
+	animate(server, &server->volume_y, (float)-(VOLUME_H + MEDIA_H + OUTPUT_H), 180, 0, false);
 	return 0;
 }
 
@@ -6369,6 +7473,7 @@ static void volume_step(struct zt_server *server, int by) {
     *level = to < 0 ? 0 : to > VOLUME_MAX ? VOLUME_MAX : to;
     config_keep(server->volume_is_media ? "media_volume" : "ring_volume",
         (*level * 100 + VOLUME_MAX - 1) / VOLUME_MAX);
+    outputs_refresh();	/* a headset may have come or gone: for the next look */
     draw_volume(server);
     animate(server, &server->volume_y, 0.0f, 140, 0, false);
     wl_event_source_timer_update(server->volume_timer, server->media ? 4000 : 2000);
@@ -6378,6 +7483,9 @@ static void volume_step(struct zt_server *server, int by) {
         run_detached("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", percent);
     }
     hap(server, !server->volume_is_media && previous > 0 && *level == 0 ? HAP_TAP : HAP_TICK, HG_SYSTEM);
+    if (!server->volume_is_media && *level != previous) {
+        ui_sound(server, UIS_PIP);	/* the ringer at its new level, as Windows Phone does */
+    }
 }
 
 /* What white becomes at a colour temperature, against 6500 K as (1, 1, 1):
@@ -6418,6 +7526,9 @@ static void screen_set(struct zt_server *server, bool on) {
 							 * boot level otherwise: a flash */
 	wlr_log(WLR_INFO, "screen %s", on ? "on" : "off");
 	if (!on) {
+		/* locked as it goes dark (lock() itself runs as it comes back on,
+		 * and waking is silent) */
+		ui_sound(server, UIS_LOCK);
 		perf_tell("screen off\n");
 		if (server->wifi_suspend && wifi_up()) {
 			server->wifi_suspended_by_sleep = true;
@@ -6486,7 +7597,7 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		if (x >= pad && x <= pad + content_w) {
 			if (y >= btn_y1 && y <= btn_y1 + btn_h) {
 				hap(server, HAP_TAP, HG_SYSTEM);
-				run_detached("/bin/sh", "-c", "echo REDACTED | sudo -S systemctl reboot --reboot-argument=recovery 2>/dev/null || reboot recovery 2>/dev/null || reboot 2>/dev/null", NULL);
+				run_detached("/bin/sh", "-c", "sudo -n systemctl reboot --reboot-argument=recovery 2>/dev/null || reboot recovery 2>/dev/null || reboot 2>/dev/null", NULL);
 				p->role = ROLE_NONE;
 				return;
 			} else if (y >= btn_y2 && y <= btn_y2 + btn_h) {
@@ -6569,7 +7680,7 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 	}
 	if (server->volume_y > -10.0f && y < banner_h(server) && !server->locked) {
 		/* the volume banner: its three buttons work the player */
-		if (server->media && y >= VOLUME_H) {
+		if (server->media && y >= VOLUME_H && y < VOLUME_H + MEDIA_H) {
 			double bw = 46, bx = server->width - 16 - 3 * bw;
 			int k = x < bx ? -1 : (int)((x - bx) / bw);
 			if (k >= 0 && k <= 2) {
@@ -6582,6 +7693,13 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 					damage(server);
 				}
 			}
+		}
+		if (y >= banner_h(server) - OUTPUT_H) {
+			/* the output row: on to the next one */
+			hap(server, HAP_TAP, HG_SYSTEM);
+			output_next(server);
+			draw_volume(server);
+			damage(server);
 		}
 		wl_event_source_timer_update(server->volume_timer, 4000);
 		p->role = ROLE_NONE;
@@ -6651,9 +7769,7 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		server->nav_pressed = p->index;
 		draw_nav(server);
 		hap(server, HAP_TAP, HG_NAV);
-		if (p->index != NAV_SEARCH) {
-			wl_event_source_timer_update(server->long_press_timer, LONG_PRESS_MS);
-		}
+		wl_event_source_timer_update(server->long_press_timer, LONG_PRESS_MS);
 		return;
 	}
 	if (server->osk_visible && y >= server->height - NAV_H - server->osk_h) {
@@ -6681,6 +7797,11 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		if (p->index >= 0) keyboard_sound(server, &server->keys[p->index]);
 		draw_osk(server);
 		hap(server, HAP_KEY, HG_KEYS);
+		return;
+	}
+	if (server->hyper) {
+		p->role = ROLE_HYPER;
+		server->hyper_scroll0 = server->hyper_scroll;
 		return;
 	}
 	if (!server->shown) {
@@ -6754,6 +7875,14 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		p->fit = app_fit(server, server->shown);
 		wlr_seat_touch_notify_down(server->seat, surface, time, id, sx, sy);
 		wlr_seat_touch_notify_frame(server->seat);
+		server->client_tap_ms = now_ms();
+		server->client_tap_y = y + server->app_lift - STATUS_H;
+		if (server->osk_pending) {
+			/* a field the page focused by itself: now the user is in it */
+			server->osk_pending = false;
+			server->osk_box_bottom = server->client_tap_y + 36;
+			osk_show(server, true);
+		}
 	}
 }
 
@@ -6915,7 +8044,28 @@ static void touch_update(struct zt_server *server, int32_t id, double x, double 
 			p->ox + (x - p->x0) / p->fit, p->oy + (y - p->y0) / p->fit);
 		wlr_seat_touch_notify_frame(server->seat);
 		break;
+	case ROLE_HYPER:
+		if (p->moved && server->hyper) {
+			double bottom = server->osk_visible ? server->height - NAV_H - server->osk_h : server->height - NAV_H;
+			double room = bottom - STATUS_H - HYPER_LIST_Y;
+			double max = fmax(0, server->hyper_content_h - room);
+			double to = server->hyper_scroll0 - (y - p->y0);
+			server->hyper_scroll = to < 0 ? 0 : to > max ? max : to;
+			draw_hyper(server);
+			damage(server);
+		}
+		break;
     case ROLE_CURSOR:
+        if (!server->osk_trackpad && server->osk_cursor_touch == p && p->moved) {
+            /* dragged off the dot at once: that starts the trackpad too,
+             * not only a still hold (which a drag never becomes) */
+            p->lx = p->x; p->ly = p->y;
+            server->osk_trackpad = true;
+            server->osk_pressed = -1;
+            hap(server, HAP_TICK, HG_KEYS);
+            draw_osk(server);
+            damage(server);
+        }
         if (server->osk_trackpad && server->osk_cursor_touch == p) {
             /* Accumulate sub-cell movement, with no acceleration or sound. */
             bool ctrl = server->osk_ctrl, alt = server->osk_alt;
@@ -7014,6 +8164,7 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 		if (!cancelled && p->y - p->y0 < -server->height / 5.0) {
 			server->locked = false;
 			hap(server, HAP_TAP, HG_SLIDE);
+			ui_sound(server, UIS_UNLOCK);
 			animate(server, &server->lock_y, (float)-server->height, 200, 0, false);
 			wlr_log(WLR_INFO, "unlocked");
 		} else if (!p->moved) {
@@ -7155,6 +8306,12 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 			switcher_close(server);	/* any button: back to where we were */
 			break;
 		}
+		if (server->hyper && p->index != NAV_SEARCH) {
+			hyper_close(server);	/* back, or Start: it goes, and nothing else */
+			if (p->index == NAV_BACK) {
+				break;
+			}
+		}
 		if (p->index == NAV_START) {
 			wlr_log(WLR_INFO, "nav: start");
 			if (server->shown) {
@@ -7180,10 +8337,23 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 				page_go(server, 0.0f, 0.0f);
 			}
 		} else {
-			wlr_log(WLR_INFO, "nav: search (keyboard toggle)");
-			if (server->shown) {
-				osk_show(server, !server->osk_visible);
+			wlr_log(WLR_INFO, "nav: search (Hyperscan)");
+			if (server->hyper) {
+				hyper_close(server);
+			} else {
+				if (server->shade_open || server->shade_h > 10.0f) {
+					shade_set_open(server, false);
+				}
+				if (server->searching) {
+					search_end(server);
+				}
+				hyper_open(server);
 			}
+		}
+		break;
+	case ROLE_HYPER:
+		if (!cancelled && !p->moved) {
+			hyper_tap(server, p->x0, p->y0);
 		}
 		break;
     case ROLE_CURSOR:
@@ -8001,11 +9171,22 @@ static void render_frame(struct zt_server *server) {
 			}
 			mat_rotate_x(m, t->tilt_x);			/* lean, about the tile's centre */
 			mat_rotate_y(m, t->tilt_y);
+			/* a live tile turning over: the face that is toward us */
+			struct zt_layer *face = &t->layer;
+			if (t->flip > 0.01f) {
+				float a = t->flip;
+				if (a > 90.0f && t->back_layer.tex) {
+					a -= 180.0f;
+					face = &t->back_layer;
+				}
+				mat_rotate_x(m, a);
+			}
 			mat_scale(m, t->press * grow, t->press * grow);
 			mat_translate(m, (float)(-t->w / 2), (float)(-t->h / 2));
 			mat_scale(m, (float)t->w, (float)t->h);
-			quad(server, GL_TEXTURE_2D, t->layer.tex, m, alpha * dim, true, false,
-				(float)t->layer.pw / t->layer.tw, (float)t->layer.ph / t->layer.th);
+			wall_under(server, m, t->x, t->y, t->w, t->h, alpha * dim);
+			quad(server, GL_TEXTURE_2D, face->tex, m, alpha * dim, true, false,
+				(float)face->pw / face->tw, (float)face->ph / face->th);
 		}
 		if (server->edit_t > 0.3f && server->edit >= 0 && server->edit < n && server->badge_unpin.tex) {
 			/* its two buttons, on its right-hand corners */
@@ -8142,6 +9323,11 @@ static void render_frame(struct zt_server *server) {
 	}
 	draw_loading(server);
 
+	if (server->hyper_t > 0.003f && server->hyper_layer.tex) {
+		/* Hyperscan, rising into place and fading in */
+		layer_draw(server, &server->hyper_layer, 0,
+			(float)STATUS_H + (1.0f - server->hyper_t) * 40.0f, server->hyper_t);
+	}
 	if (server->osk_slide > 0.003f && server->osk_layer.tex) {
 		layer_draw(server, &server->osk_layer, 0,
 			(float)(server->height - NAV_H - server->osk_h * server->osk_slide), 1.0f);
@@ -8160,6 +9346,7 @@ static void render_frame(struct zt_server *server) {
 		glEnable(GL_SCISSOR_TEST);
 		glScissor(0, 0, output->width, (int)((STATUS_H + (PEEK_H - STATUS_H) * server->peek) * server->scale));
 		layer_draw(server, &server->peek_layer, 0, 0, 1.0f);
+		plug_over(server, 0.0f);
 		glDisable(GL_SCISSOR_TEST);
 	}
 	if (server->shade_h > 0.5f && server->shade_layer.tex) {
@@ -8188,14 +9375,18 @@ static void render_frame(struct zt_server *server) {
 		if (server->shade_row && server->peek_layer.tex) {
 			layer_draw(server, &server->peek_layer, 0, 0, 1.0f);
 		}
+		plug_over(server, 0.0f);
 		for (int i = 0; i < 8; i++) {
 			struct zt_layer *layer = &server->shade_tile_layer[i];
 			double x, y, w, h;
 			shade_tile_rect(server, i, &x, &y, &w, &h);
 			mat_identity(m);
 			mat_translate(m, (float)(x + w / 2), (float)(y + h / 2));
-			mat_rotate_x(m, server->shade_tilt_x[i]);	/* lean, about its centre */
-			mat_rotate_y(m, server->shade_tilt_y[i]);
+			/* lean, about its centre. Negated: without Start's turn_place
+			 * in front of it, the same angles brought the pressed corner
+			 * forward instead of pushing it in */
+			mat_rotate_x(m, -server->shade_tilt_x[i]);
+			mat_rotate_y(m, -server->shade_tilt_y[i]);
 			mat_scale(m, server->shade_press[i], server->shade_press[i]);
 			mat_translate(m, (float)(-w / 2), (float)(-h / 2));
 			mat_scale(m, (float)w, (float)h);
@@ -8228,6 +9419,7 @@ static void render_frame(struct zt_server *server) {
 	}
 	if (server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height)) {
 		layer_draw(server, &server->lock_layer, 0, server->lock_y, 1.0f);
+		plug_over(server, server->lock_y);
 	}
 	if (server->splash && !animating(server, &server->lock_y) && server->lock_y >= 0.0f) {
 		server->splash = false;
@@ -8285,20 +9477,14 @@ static void render_frame(struct zt_server *server) {
 		quad(server, GL_TEXTURE_2D, server->tone_tex, m, 1.0f, false, true, 1.0f, 1.0f);
 		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 	}
-	/* Only fall back to pixel darkening overlay if there is no hardware backlight device */
-	static int has_hw_bl = -1;
-	if (has_hw_bl < 0) {
-		glob_t g;
-		has_hw_bl = (glob("/sys/class/backlight/*/brightness", 0, NULL, &g) == 0 && g.gl_pathc > 0) ? 1 : 0;
-		globfree(&g);
-	}
-	if (!has_hw_bl && server->shade_brightness < 100) {
-		/* Fallback: no hardware backlight device, so dim pixels via software overlay */
+	/* darkened in software: always without a backlight, and with one for the
+	 * moment until the panel has been told (see backlight_set) */
+	float dark = backlight_darkening(server->shade_brightness);
+	if (dark > 0.002f) {
 		float m[16];
 		mat_identity(m);
 		mat_scale(m, server->width, server->height);
-		quad(server, GL_TEXTURE_2D, server->black_tex, m,
-			0.85f * (100 - server->shade_brightness) / 100.0f, false, false, 1.0f, 1.0f);
+		quad(server, GL_TEXTURE_2D, server->black_tex, m, dark, false, false, 1.0f, 1.0f);
 	}
 
 	if (server->record_until && (int32_t)(server->record_until - now) > 0) {
@@ -8485,6 +9671,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	damage(server);
 
 	load_logo(server);
+	walls_load(server);
 	place_tiles(server);
 	draw_start(server);
 	set_scroll(server, 0);
@@ -8564,6 +9751,9 @@ static int reload(int signal_number, void *data) {
 			if (server->tiles[i].layer.tex) {
 				glDeleteTextures(1, &server->tiles[i].layer.tex);
 			}
+			if (server->tiles[i].back_layer.tex) {
+				glDeleteTextures(1, &server->tiles[i].back_layer.tex);
+			}
 		}
 		gl_end(server);
 	}
@@ -8576,6 +9766,7 @@ static int reload(int signal_number, void *data) {
 	server->edit_t = 0;
 	load_tiles(server);
 	if (server->width > 0) {
+		walls_load(server);
 		place_tiles(server);
 		draw_start(server);
 		set_scroll(server, server->scroll);
@@ -8584,6 +9775,7 @@ static int reload(int signal_number, void *data) {
 		}
 		draw_status(server);
 		draw_shade(server);
+		draw_lock(server);	/* its photo may have changed */
 		draw_nav(server);
 		osk_layout(server);
 		if (server->osk_visible) {
@@ -8643,6 +9835,22 @@ static int render_to_files(struct zt_server *server, const char *dir) {
 	place_tiles(server);
 	g_dump_name = "status";
 	draw_status(server);
+	/* ZTMETRO_WALL=photo: the lock screen and Start's photo with it */
+	const char *wall = getenv("ZTMETRO_WALL");
+	if (wall) {
+		snprintf(server->start_wall_path, sizeof(server->start_wall_path), "%s", wall);
+		snprintf(server->lock_wall_path, sizeof(server->lock_wall_path), "%s", wall);
+		walls_load(server);
+	}
+	g_dump_name = "lock";
+	draw_lock(server);
+	load_apps(server);
+	hyper_open(server);	/* saved as hyperscan.png: empty, then a query */
+	snprintf(server->hyper_q, sizeof(server->hyper_q), "%s", getenv("ZTMETRO_HYPER") ? getenv("ZTMETRO_HYPER") : "th");
+	hyper_search(server);
+	g_dump_name = "hyperscan-query";
+	draw_hyper(server);
+	server->hyper = false;
 	g_dump_name = "nav";
 	draw_nav(server);
 	g_dump_name = "splash";
@@ -8709,7 +9917,7 @@ int main(int argc, char *argv[]) {
 	server.lock_enabled = true;
 	server.key_sound_fd = -1;
 	server.volume = 24;
-	server.volume_y = -(VOLUME_H + MEDIA_H);
+	server.volume_y = -(VOLUME_H + MEDIA_H + OUTPUT_H);
 	server.toast_y = -TOAST_H;
 	server.dialog_h = 240;
 	server.dialog_y = -240.0f;
@@ -8748,6 +9956,8 @@ int main(int argc, char *argv[]) {
 
 	server.wl_display = wl_display_create();
 	server.loop = wl_display_get_event_loop(server.wl_display);
+	backlight_init(&server);
+	backlight_set(server.shade_brightness);	/* (load_config ran before the loop) */
 	server.backend = wlr_backend_autocreate(server.loop, NULL);
 	if (!server.backend) {
 		wlr_log(WLR_ERROR, "failed to create the backend");
@@ -8835,6 +10045,9 @@ int main(int argc, char *argv[]) {
 	server.deco_mgr = wlr_xdg_decoration_manager_v1_create(server.wl_display);
 	server.new_decoration.notify = server_new_decoration;
 	wl_signal_add(&server.deco_mgr->events.new_toplevel_decoration, &server.new_decoration);
+	/* screenshots (grim): how the shell's look is checked on the phone */
+	wlr_screencopy_manager_v1_create(server.wl_display);
+	wlr_xdg_output_manager_v1_create(server.wl_display, server.output_layout);
 	server.text_input_mgr = wlr_text_input_manager_v3_create(server.wl_display);
 	server.new_text_input.notify = server_new_text_input;
 	wl_signal_add(&server.text_input_mgr->events.new_text_input, &server.new_text_input);
@@ -8889,6 +10102,10 @@ int main(int argc, char *argv[]) {
 		char line[32];
 		snprintf(line, sizeof(line), "shell %d\n", getpid());
 		perf_tell(line);
+		/* and that the screen is on: the shell before this one, going away,
+		 * said off, and zrnperfd (and sensord's auto brightness after it)
+		 * would believe that until the next time the screen changes */
+		perf_tell("screen on\n");
 	}
 	server.clock_timer = wl_event_loop_add_timer(server.loop, clock_tick, &server);
 	clock_tick(&server);
@@ -8898,7 +10115,22 @@ int main(int argc, char *argv[]) {
 	run_detached("sh", "-c", "command -v hypridle >/dev/null && exec hypridle", NULL);
 	/* and the one that keeps the list of applications (see apps/ztapps.c) */
 	run_detached("ztapps", NULL, NULL, NULL);
-	run_detached("ztnotifyd", NULL, NULL, NULL);	/* notifications from programs, media, push */
+	/* notifications from programs, media, push: one of it, which outlives a
+	 * restart of the shell */
+	run_detached("sh", "-c", "pgrep -x ztnotifyd >/dev/null || exec ztnotifyd", NULL);
+	run_detached("sh", "-c", "pgrep -x ztos-bt-state >/dev/null || exec /usr/local/bin/ztos-bt-state", NULL);
+	/* whether Bluetooth is on, for its quick action (bluetoothd keeps it
+	 * across restarts) */
+	FILE *bt = popen("timeout 2 bluetoothctl show 2>/dev/null", "r");
+	if (bt) {
+		char line[128];
+		while (fgets(line, sizeof(line), bt)) {
+			if (strstr(line, "Powered: yes")) {
+				server.shade_bt = true;
+			}
+		}
+		pclose(bt);
+	}
 	wl_display_run(server.wl_display);
 
 	wl_display_destroy_clients(server.wl_display);

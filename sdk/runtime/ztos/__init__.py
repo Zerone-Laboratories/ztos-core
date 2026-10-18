@@ -163,6 +163,34 @@ def notify(title: str, text: str = "") -> None:
     _ctl(f"notify {clean(manifest().get('name', 'App'))}|{clean(title)}|{clean(text)}")
 
 
+def _live_path() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    return os.path.join(runtime, "ztos-live", manifest().get("id", "ztos.app"))
+
+
+def tile_update(title: str = "", lines=(), count: int = 0) -> None:
+    """Make this app's Start tile live, as a Windows Phone Flip tile: now and
+    then it turns over to a back with up to three `lines` at the top and
+    `title` along the bottom; `count` (if not 0) sits on the front's corner.
+    Small tiles keep still. Kept until tile_clear() or the session ends."""
+    clean = lambda s: str(s).replace("\n", " ").strip()
+    path = _live_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    body = f"title={clean(title)}\n" + "".join(f"line={clean(l)}\n" for l in list(lines)[:3])
+    body += f"count={int(count)}\n"
+    with open(path + ".new", "w") as f:
+        f.write(body)
+    os.replace(path + ".new", path)
+
+
+def tile_clear() -> None:
+    """The tile goes back to its plain front."""
+    try:
+        os.remove(_live_path())
+    except FileNotFoundError:
+        pass
+
+
 def osk(show: bool, box: Optional[QWidget] = None) -> None:
     """Bring up (or put away) the on-screen keyboard. It lies over the app; with
     `box` (what is typed into), the shell lifts the app just enough for that

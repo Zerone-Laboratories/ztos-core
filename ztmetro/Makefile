@@ -1,12 +1,24 @@
 # Builds on the phone itself (aarch64 Arch Linux ARM, wlroots 0.20).
-PKGS = wlroots-0.20 wayland-server xkbcommon cairo pangocairo librsvg-2.0 pixman-1 libdrm egl glesv2
-APP_PKGS = xkbcommon wayland-client wayland-egl egl glesv2 cairo pangocairo
+PKGS = wlroots-0.20 wayland-server xkbcommon cairo pangocairo librsvg-2.0 gdk-pixbuf-2.0 pixman-1 libdrm egl glesv2
+APP_PKGS = xkbcommon wayland-client wayland-egl egl glesv2 cairo pangocairo gdk-pixbuf-2.0
 WP := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
 XDG := $(WP)/stable/xdg-shell/xdg-shell.xml
 CFLAGS ?= -O2 -g
 WARN = -std=c11 -Wall -Wno-unused-parameter
 
-all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
+# Programs built on another machine (the laptop's x86-64 builds, copied over
+# with the sources by tar) look up to date to make. Delete every executable in
+# the tree that is not for this machine before make looks at anything, so it
+# builds them again here; check-arch below still refuses to install one.
+HOST_MACHINE := $(shell od -An -tx1 -j18 -N2 /bin/sh | tr -d ' \n')
+FOREIGN := $(shell for f in $$(find . -type f -perm -u+x ! -name '*.sh' ! -name '*.py' ! -path './.git/*'); do \
+	[ "$$(od -An -tc -j1 -N3 $$f 2>/dev/null | tr -d ' ')" = ELF ] || continue; \
+	[ "$$(od -An -tx1 -j18 -N2 $$f | tr -d ' \n')" = "$(HOST_MACHINE)" ] || { rm -f $$f; echo $$f; }; done)
+ifneq ($(FOREIGN),)
+$(info removed programs built for another machine, to build them here: $(FOREIGN))
+endif
+
+all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
 	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts splash/ztos-splash
 
 sounds/ztos-sounds: sounds/ztos-sounds.c
@@ -14,7 +26,7 @@ sounds/ztos-sounds: sounds/ztos-sounds.c
 
 ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h
 	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
-		-o $@ ztmetro.c $(shell pkg-config --libs $(PKGS)) -lm
+		-o $@ ztmetro.c $(shell pkg-config --libs $(PKGS)) -lm -lpthread
 
 xdg-shell-protocol.h:
 	wayland-scanner server-header $(XDG) $@
@@ -36,6 +48,10 @@ settings/ztsettings: settings/ztsettings.c $(CORE_DEPS)
 
 devtest/zrndevtest: devtest/zrndevtest.c $(CORE_DEPS)
 	$(APP_BUILD) -o $@ devtest/zrndevtest.c $(CORE) $(APP_LIBS)
+
+# Devices and Services: what is running, crashed or missing
+devices/ztdevices: devices/ztdevices.c $(CORE_DEPS)
+	$(APP_BUILD) -o $@ devices/ztdevices.c $(CORE) $(APP_LIBS)
 
 perfd/zrnperfd: perfd/zrnperfd.c perfd/tickle.c perfd/tickle.h
 	$(CC) $(CFLAGS) $(WARN) -o $@ perfd/zrnperfd.c perfd/tickle.c
@@ -105,6 +121,9 @@ install: check-arch
 	install -Dm755 apps/ztapps /usr/local/bin/ztapps
 	install -Dm755 settings/ztsettings /usr/local/bin/ztsettings
 	install -Dm755 devtest/zrndevtest /usr/local/bin/zrndevtest
+	install -Dm755 devices/ztdevices /usr/local/bin/ztdevices
+	install -Dm644 devices/ztdevices.desktop /usr/local/share/applications/ztdevices.desktop
+	install -Dm644 devices/ztdevices.svg /usr/local/share/icons/hicolor/scalable/apps/ztdevices.svg
 	install -Dm755 perfd/zrnperfd /usr/local/sbin/zrnperfd
 	install -Dm644 perfd/zrnperfd.service /etc/systemd/system/zrnperfd.service
 	install -Dm755 sensord/ztoscsf-sensord /usr/local/sbin/ztoscsf-sensord
@@ -123,7 +142,7 @@ install: check-arch
 	install -Dm644 csf/ztoscoresensorframework.service /etc/systemd/system/ztoscoresensorframework.service
 
 clean:
-	rm -f auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf notifyd/ztnotifyd splash/ztos-splash \
+	rm -f auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf notifyd/ztnotifyd splash/ztos-splash \
 		phone/ztphone messages/ztmessages contacts/ztcontacts core/viewporter-protocol.c core/viewporter-client-protocol.h \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c
 

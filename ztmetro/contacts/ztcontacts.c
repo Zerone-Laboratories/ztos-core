@@ -85,8 +85,7 @@ static double draw_all(cairo_t *cr) {
 
 	if (n_contacts == 0) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		y += zmc_text(cr, "Nobody here yet. Tap new to add someone; their name then shows in Phone "
-			"and Messaging instead of their number.", FONT_REGULAR, 14, MARGIN, y,
+		y += zmc_text(cr, "Nobody here yet.", FONT_REGULAR, 14, MARGIN, y,
 			zmc.width - 2 * MARGIN) + 20;
 		return y;
 	}
@@ -146,7 +145,7 @@ static double draw_card(cairo_t *cr) {
 	}
 	if (!c->mobile[0] && !c->other[0]) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		y += zmc_text(cr, "No number yet: tap edit to add one.", FONT_REGULAR, 14, MARGIN, y,
+		y += zmc_text(cr, "No number.", FONT_REGULAR, 14, MARGIN, y,
 			zmc.width - 2 * MARGIN) + 16;
 	}
 	if (c->email[0]) {

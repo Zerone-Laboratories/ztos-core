@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -28,6 +29,8 @@
 #include <unistd.h>
 
 #include <cairo.h>
+#include <dirent.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
 #include <pango/pangocairo.h>
 #include <wayland-client.h>
 
@@ -56,14 +59,23 @@ enum page {
 	PAGE_WIFI_JOIN,	/* a network's password, the first time */
 	PAGE_WIFI_NET,	/* one network: its state, its address, forgetting it */
 	PAGE_DATE,
+	PAGE_BLUETOOTH,
 };
 
 enum action {
-	ACT_DATE_AUTO = 500, ACT_DATE_FIELD, ACT_DATE_REGION, ACT_DATE_SAVE, ACT_DATE_SYNC,
+	ACT_DATE_AUTO = 500, ACT_DATE_FIELD, ACT_DATE_REGION, ACT_DATE_SAVE, ACT_DATE_SYNC, ACT_DATE_LANG,
 	ACT_NONE = 0,
 	ACT_OPEN_PAGE,
 	ACT_BACK,
 	ACT_ACCENT,
+	ACT_WALL,		/* arg: 0 none, else the photo walls[arg - 1] */
+	ACT_WALL_TARGET,	/* arg: 0 start and lock, 1 start, 2 lock */
+	ACT_BT_POWER,
+	ACT_BT_DEVICE,		/* arg: which device: pair, connect or disconnect it */
+	ACT_BT_FORGET,		/* arg: which device */
+	ACT_BT_SCAN,
+	ACT_BT_MENU,		/* an item of a held device's menu */
+	ACT_BT_MENU_CLOSE,
 	ACT_COLUMNS,
 	ACT_HAPTICS,
 	ACT_WIFI_RADIO,
@@ -81,6 +93,7 @@ enum action {
 	ACT_WIFI_AUTO,
 	ACT_BRIGHTNESS_STEP,
 	ACT_AUTOBRIGHTNESS,
+	ACT_OPENTONE,
 	ACT_TIMEOUT_CYCLE,
 	ACT_SCALE_CYCLE,
 	ACT_NAV_SIZE_CYCLE,
@@ -163,12 +176,15 @@ static const struct { const char *name; unsigned color; } ACCENTS[] = {
 static struct {
 	/* Settings state */
 	int accent;
+	char start_wall[256], lock_wall[256];	/* the photos, or "" */
+	int wall_target;			/* 0 both, 1 Start, 2 lock screen */
 	int columns;
 	bool haptics;
 	char scale_text[16];
 
 	int brightness;
 	bool autobrightness;
+	bool opentone;
 	int timeout_idx;
 	int nav_size_idx;
 	int scale_idx;
@@ -288,7 +304,11 @@ static void config_load(void) {
 		if (line[0] == '#' || !eq) continue;
 		*eq = 0;
 		char *key = trim(line), *val = trim(eq + 1);
-		if (strcmp(key, "accent") == 0) {
+		if (strcmp(key, "start_wallpaper") == 0) {
+			snprintf(app.start_wall, sizeof(app.start_wall), "%s", val);
+		} else if (strcmp(key, "lock_wallpaper") == 0) {
+			snprintf(app.lock_wall, sizeof(app.lock_wall), "%s", val);
+		} else if (strcmp(key, "accent") == 0) {
 			for (int i = 0; i < N_ACCENTS; i++) {
 				if (strcmp(ACCENTS[i].name, val) == 0) {
 					app.accent = i;
@@ -466,6 +486,8 @@ static void auto_load(void) {
 	while (f && fgets(line, sizeof(line), f)) {
 		if (strncmp(line, "auto=", 5) == 0) {
 			app.autobrightness = strncmp(line + 5, "on", 2) == 0;
+		} else if (strncmp(line, "opentone=", 9) == 0) {
+			app.opentone = strncmp(line + 9, "on", 2) == 0;
 		}
 	}
 	if (f) fclose(f);
@@ -473,8 +495,8 @@ static void auto_load(void) {
 
 static void config_save(void) {
 	static const int timeouts[] = { 30, 60, 180, 300, 0 };
-	enum { N_KEYS = 17 + N_HAPTIC_GROUPS };
-	struct { const char *key; char value[128]; bool written; } keys[N_KEYS] = {
+	enum { N_KEYS = 19 + N_HAPTIC_GROUPS };
+	struct { const char *key; char value[300]; bool written; } keys[N_KEYS] = {
 		{ .key = "accent" }, { .key = "columns" }, { .key = "haptics" },
 		{ .key = "brightness" }, { .key = "timeout" }, { .key = "demo_tiles" },
 		{ .key = "slow_motion" }, { .key = "show_touches" }, { .key = "lock" },
@@ -497,6 +519,10 @@ static void config_save(void) {
 		keys[17 + g].key = HAPTIC_GROUPS[g].key;
 		snprintf(keys[17 + g].value, 32, "%d", app.haptic_group[g]);
 	}
+	keys[17 + N_HAPTIC_GROUPS].key = "start_wallpaper";
+	snprintf(keys[17 + N_HAPTIC_GROUPS].value, sizeof(keys[0].value), "%s", app.start_wall);
+	keys[18 + N_HAPTIC_GROUPS].key = "lock_wallpaper";
+	snprintf(keys[18 + N_HAPTIC_GROUPS].value, sizeof(keys[0].value), "%s", app.lock_wall);
 	snprintf(keys[0].value, 32, "%s", ACCENTS[app.accent].name);
 	snprintf(keys[1].value, 32, "%d", app.columns);
 	snprintf(keys[2].value, 32, "%s", app.haptics ? "on" : "off");
@@ -569,6 +595,7 @@ static char *nm_field(char **cursor) {
 	"nmcli -t -f IN-USE,SSID,SIGNAL,SECURITY device wifi list 2>/dev/null; echo @known; " \
 	"nmcli -t -f NAME connection show 2>/dev/null"
 
+static void bt_summary(char *out, size_t size);	/* Bluetooth, below */
 static FILE *wifi_pipe;
 static char wifi_buf[16384];
 static size_t wifi_len;
@@ -786,6 +813,9 @@ static double draw_main(cairo_t *cr) {
 	wifi_summary(wifi, sizeof(wifi));
 	y = zmc_entry(cr, y, "Wi-Fi", wifi, ACT_OPEN_PAGE, PAGE_WIFI);
 
+	bt_summary(detail, sizeof(detail));
+	y = zmc_entry(cr, y, "Bluetooth", detail, ACT_OPEN_PAGE, PAGE_BLUETOOTH);
+
 	cell_load();
 	snprintf(detail, sizeof(detail), "%s%s%s%s", cell.operator[0] ? cell.operator : "no service",
 		cell.tech[0] ? ", " : "", cell.tech, !cell.data_on ? ", data off" : cell.data ?
@@ -849,6 +879,134 @@ static double draw_apps(cairo_t *cr) {
 	return y + 20;
 }
 
+/* ---- wallpapers: the photos to choose from ---------------------------------- */
+
+#define MAX_WALLS 30
+static char walls[MAX_WALLS][256];
+static cairo_surface_t *wall_thumbs[MAX_WALLS];
+static int n_walls = -1;	/* -1: not looked for yet */
+
+/* A photo scaled to cover pw x ph pixels, cropped about its middle. */
+static cairo_surface_t *thumb_cover(const char *path, int pw, int ph) {
+	GdkPixbuf *src = gdk_pixbuf_new_from_file_at_scale(path, pw * 3, ph * 3, TRUE, NULL);
+	if (!src) return NULL;
+	GdkPixbuf *up = gdk_pixbuf_apply_embedded_orientation(src);
+	g_object_unref(src);
+	int sw = gdk_pixbuf_get_width(up), sh = gdk_pixbuf_get_height(up);
+	double k = fmax((double)pw / sw, (double)ph / sh);
+	int cw = (int)ceil(sw * k), ch = (int)ceil(sh * k);
+	GdkPixbuf *sc = gdk_pixbuf_scale_simple(up, cw, ch, GDK_INTERP_BILINEAR);
+	g_object_unref(up);
+	if (!sc) return NULL;
+	cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
+	cairo_surface_flush(out);
+	int ox = (cw - pw) / 2, oy = (ch - ph) / 2, n = gdk_pixbuf_get_n_channels(sc);
+	int ss = gdk_pixbuf_get_rowstride(sc), ds = cairo_image_surface_get_stride(out);
+	const guchar *sp = gdk_pixbuf_read_pixels(sc);
+	unsigned char *dp = cairo_image_surface_get_data(out);
+	for (int y = 0; y < ph; y++) {
+		const guchar *row = sp + (size_t)(y + oy) * ss + (size_t)ox * n;
+		uint32_t *d = (uint32_t *)(dp + (size_t)y * ds);
+		for (int x = 0; x < pw; x++, row += n) {
+			uint32_t a = n == 4 ? row[3] : 255;
+			d[x] = a << 24 | (uint32_t)(row[0] * a / 255) << 16 |
+				(uint32_t)(row[1] * a / 255) << 8 | (uint32_t)(row[2] * a / 255);
+		}
+	}
+	cairo_surface_mark_dirty(out);
+	g_object_unref(sc);
+	return out;
+}
+
+/* Photos in ~/Pictures, ~/Pictures/Wallpapers and the system's backgrounds. */
+static void walls_scan(void) {
+	char dirs[3][300];
+	const char *home = getenv("HOME");
+	snprintf(dirs[0], sizeof(dirs[0]), "%s/Pictures", home ? home : "");
+	snprintf(dirs[1], sizeof(dirs[1]), "%s/Pictures/Wallpapers", home ? home : "");
+	snprintf(dirs[2], sizeof(dirs[2]), "/usr/local/share/backgrounds/ztos");
+	n_walls = 0;
+	for (int d = 0; d < 3; d++) {
+		DIR *dir = opendir(dirs[d]);
+		struct dirent *e;
+		while (dir && (e = readdir(dir)) && n_walls < MAX_WALLS) {
+			const char *dot = strrchr(e->d_name, '.');
+			if (!dot || (strcasecmp(dot, ".jpg") && strcasecmp(dot, ".jpeg") &&
+					strcasecmp(dot, ".png") && strcasecmp(dot, ".webp"))) continue;
+			snprintf(walls[n_walls++], sizeof(walls[0]), "%s/%s", dirs[d], e->d_name);
+		}
+		if (dir) closedir(dir);
+	}
+}
+
+static double draw_walls(cairo_t *cr, double y) {
+	static const char *targets[] = { "start + lock", "start", "lock screen" };
+	double gap = 8;
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text(cr, "Background photo", FONT_REGULAR, 13.5, MARGIN, y, 0);
+	y += 24;
+	double btn_w = (zmc.width - 2 * MARGIN - 2 * gap) / 3.0;
+	for (int i = 0; i < 3; i++) {
+		double bx = MARGIN + i * (btn_w + gap);
+		if (app.wall_target == i) zmc_set_rgb(cr, ACCENTS[app.accent].color);
+		else cairo_set_source_rgb(cr, 0.18, 0.18, 0.18);
+		cairo_rectangle(cr, bx, y, btn_w, 36);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, targets[i], FONT_REGULAR, 13, bx + 10, y + 9, 0);
+		zmc_add_hit(bx, y, btn_w, 36, ACT_WALL_TARGET, i);
+	}
+	y += 36 + 12;
+	if (n_walls < 0) walls_scan();
+	const char *current = app.wall_target == 2 ? app.lock_wall : app.start_wall;
+	/* three across, the screen's own shape; "none" first */
+	double tw = (zmc.width - 2 * MARGIN - 2 * gap) / 3.0, th = tw * 16.0 / 9.0;
+	for (int i = 0; i <= n_walls; i++) {
+		double x = MARGIN + (i % 3) * (tw + gap), ty = y + (i / 3) * (th + gap);
+		bool chosen;
+		if (i == 0) {
+			cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
+			cairo_rectangle(cr, x, ty, tw, th);
+			cairo_fill(cr);
+			cairo_set_source_rgb(cr, 0.75, 0.75, 0.75);
+			zmc_text(cr, "none", FONT_SEMILIGHT, 18, x + 10, ty + th - 32, 0);
+			chosen = !current[0];
+		} else {
+			int k = i - 1;
+			if (!wall_thumbs[k]) wall_thumbs[k] = thumb_cover(walls[k], (int)(tw * 2), (int)(th * 2));
+			if (wall_thumbs[k]) {
+				cairo_save(cr);
+				cairo_rectangle(cr, x, ty, tw, th);
+				cairo_clip(cr);
+				cairo_translate(cr, x, ty);
+				cairo_scale(cr, 0.5, 0.5);
+				cairo_set_source_surface(cr, wall_thumbs[k], 0, 0);
+				cairo_paint(cr);
+				cairo_restore(cr);
+			} else {
+				cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
+				cairo_rectangle(cr, x, ty, tw, th);
+				cairo_fill(cr);
+			}
+			chosen = strcmp(current, walls[k]) == 0;
+		}
+		if (chosen) {
+			zmc_set_rgb(cr, ACCENTS[app.accent].color);
+			cairo_set_line_width(cr, 4);
+			cairo_rectangle(cr, x + 2, ty + 2, tw - 4, th - 4);
+			cairo_stroke(cr);
+		}
+		zmc_add_hit(x, ty, tw, th, ACT_WALL, i);
+	}
+	y += ((n_walls + 1 + 2) / 3) * (th + gap);
+	if (n_walls == 0) {
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, "No photos in Pictures.", FONT_REGULAR, 13, MARGIN, y, 0);
+		y += 24;
+	}
+	return y;
+}
+
 static double draw_theme(cairo_t *cr) {
 	double y = zmc_header(cr, "theme");
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
@@ -894,7 +1052,27 @@ static double draw_theme(cairo_t *cr) {
 		zmc_text(cr, label, FONT_REGULAR, 13, bx + 10, y + 9, 0);
 		zmc_add_hit(bx, y, btn_w, 36, ACT_COLUMNS, c);
 	}
-	return y + 60;
+	return draw_walls(cr, y + 60) + 24;
+}
+
+/* The panel's brightness as it is now, in percent (the shell or sensord may
+ * have changed it); -1 when there is no backlight and the shell dims in software. */
+static int brightness_now(void) {
+	char a[16], b[16];
+	read_sys_file("/sys/class/backlight/s9p-panel/brightness", a, sizeof(a));
+	read_sys_file("/sys/class/backlight/s9p-panel/max_brightness", b, sizeof(b));
+	int level = atoi(a), max = atoi(b);
+	return a[0] && max > 0 ? (level * 100 + max / 2) / max : -1;
+}
+
+/* While the display page is open the slider follows the screen, except
+ * under the finger. */
+static void display_tick(void) {
+	int now = brightness_now();
+	if (zmc.page == PAGE_DISPLAY && !zmc.sliding && now > 0 && now != app.brightness) {
+		app.brightness = now < 10 ? 10 : now;
+		zmc_redraw();
+	}
 }
 
 static double draw_display(cairo_t *cr) {
@@ -910,6 +1088,14 @@ static double draw_display(cairo_t *cr) {
 	zmc_text(cr, app.autobrightness ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
 	zmc_toggle(cr, zmc.width - MARGIN - 54, y + 6, app.autobrightness);
 	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_AUTOBRIGHTNESS, 0);
+	y += 66;
+
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text(cr, "OpenTone", FONT_SEMILIGHT, 20, MARGIN, y, 0);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text(cr, app.opentone ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
+	zmc_toggle(cr, zmc.width - MARGIN - 54, y + 6, app.opentone);
+	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_OPENTONE, 0);
 	y += 66;
 
 	static const char *const timeouts[] = { "30 seconds", "1 minute", "3 minutes", "5 minutes", "Never" };
@@ -945,6 +1131,198 @@ static int wifi_menu_items(const struct network *n, const char *items[3]) {
 	return count;
 }
 
+/* ---- Bluetooth (bluetoothctl; the controller is bluetooth/README.md's) ------ */
+
+#define MAX_BT 24
+struct bt_device {
+	char mac[18], name[64], icon[32];
+	bool paired, connected;
+};
+static struct {
+	bool on, loading;
+	struct bt_device dev[MAX_BT];
+	int n;
+	char status[120];
+} bt;
+
+/* "yes|no", then "@devices" and one "MAC|name|paired|connected|icon" each */
+#define BT_QUERY "p=$(bluetoothctl show 2>/dev/null | sed -n 's/.*Powered: //p'); echo \"${p:-no}\"; " \
+	"echo @devices; bluetoothctl devices 2>/dev/null | while read -r _ mac name; do " \
+	"i=$(bluetoothctl info \"$mac\" 2>/dev/null); " \
+	"echo \"$mac|$name|$(echo \"$i\" | sed -n 's/.*Paired: //p')|$(echo \"$i\" | sed -n 's/.*Connected: //p')|" \
+	"$(echo \"$i\" | sed -n 's/.*Icon: //p')\"; done"
+static FILE *bt_pipe;
+static char bt_buf[8192];
+static size_t bt_len;
+
+static void bt_parse(char *text) {
+	bool devices = false;
+	bt.n = 0;
+	for (char *line = strtok(text, "\n"); line; line = strtok(NULL, "\n")) {
+		if (strcmp(line, "@devices") == 0) {
+			devices = true;
+		} else if (!devices) {
+			bt.on = strncmp(line, "yes", 3) == 0;
+		} else if (bt.n < MAX_BT) {
+			char *f[5] = { line, "", "", "", "" };
+			for (int i = 1; i < 5; i++) {
+				char *bar = strchr(f[i - 1], '|');
+				if (!bar) break;
+				*bar = 0;
+				f[i] = bar + 1;
+			}
+			struct bt_device *d = &bt.dev[bt.n++];
+			snprintf(d->mac, sizeof(d->mac), "%s", f[0]);
+			snprintf(d->name, sizeof(d->name), "%s", f[1][0] ? f[1] : f[0]);
+			d->paired = strncmp(f[2], "yes", 3) == 0;
+			d->connected = strncmp(f[3], "yes", 3) == 0;
+			snprintf(d->icon, sizeof(d->icon), "%s", f[4]);
+		}
+	}
+	/* connected first, then paired, then the rest */
+	for (int i = 1; i < bt.n; i++) {
+		struct bt_device d = bt.dev[i];
+		int rank = d.connected * 2 + d.paired, j = i;
+		while (j > 0 && bt.dev[j - 1].connected * 2 + bt.dev[j - 1].paired < rank) {
+			bt.dev[j] = bt.dev[j - 1];
+			j--;
+		}
+		bt.dev[j] = d;
+	}
+}
+
+static void bt_ready(int fd, void *data) {
+	ssize_t n = read(fd, bt_buf + bt_len, sizeof(bt_buf) - 1 - bt_len);
+	if (n > 0) {
+		bt_len += (size_t)n;
+		if (bt_len < sizeof(bt_buf) - 1) return;
+	}
+	zmc_watch_fd(fd, NULL, NULL);
+	pclose(bt_pipe);
+	bt_pipe = NULL;
+	bt_buf[bt_len] = 0;
+	bt_parse(bt_buf);
+	bt.loading = false;
+	zmc_busy(false);
+	zmc_redraw();
+}
+
+/* Ask again, after running `first` (a shell command, or NULL). */
+static void bt_refresh(const char *first) {
+	if (bt_pipe) return;
+	char command[2048];
+	snprintf(command, sizeof(command), "%s%s" BT_QUERY, first ? first : "", first ? "; " : "");
+	bt_pipe = popen(command, "r");
+	if (!bt_pipe) return;
+	bt_len = 0;
+	bt.loading = true;
+	zmc_watch_fd(fileno(bt_pipe), bt_ready, NULL);
+	if (zmc.page == PAGE_BLUETOOTH) {
+		zmc_busy(true);	/* (the hub's line fills in by itself) */
+	}
+}
+
+/* A MAC address, as bluetoothctl prints it, is safe in a command: checked. */
+static bool bt_mac_ok(const char *mac) {
+	if (strlen(mac) != 17) return false;
+	for (int i = 0; i < 17; i++) {
+		if (i % 3 == 2 ? mac[i] != ':' : !isxdigit((unsigned char)mac[i])) return false;
+	}
+	return true;
+}
+
+static void bt_summary(char *out, size_t size) {
+	if (!bt.on) {
+		snprintf(out, size, "off");
+		return;
+	}
+	for (int i = 0; i < bt.n; i++) {
+		if (bt.dev[i].connected) {
+			snprintf(out, size, "connected to %s", bt.dev[i].name);
+			return;
+		}
+	}
+	snprintf(out, size, "on");
+}
+
+/* The connected device's battery, as ztos-bt-state has it (-1: not said). */
+static int bt_battery(void) {
+	char path[256], line[64];
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	snprintf(path, sizeof(path), "%s/ztos-bt", runtime ? runtime : "/tmp");
+	FILE *f = fopen(path, "r");
+	int battery = -1;
+	while (f && fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "battery=", 8) == 0 && line[8] >= '0' && line[8] <= '9') battery = atoi(line + 8);
+	}
+	if (f) fclose(f);
+	return battery;
+}
+
+static int bt_menu = -1;	/* the device whose menu is open, or -1 */
+
+/* As Windows Phone 8.1 has it: "Status" with its switch, the line that says
+ * the phone can be found, then the devices in one flat list, the name large
+ * and its state under it. The page looks for devices by itself while it is
+ * open. Tap: pair, connect or disconnect; tap and hold: a menu. */
+static double draw_bluetooth(cairo_t *cr) {
+	double y = zmc_header(cr, "bluetooth");
+	y = zmc_switch(cr, y, "Status", bt.on, ACT_BT_POWER);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	if (!bt.on) {
+		return y;
+	}
+	y += zmc_text(cr, "Now discoverable as \"ztOS Bluetooth Device\". Your phone is searching for "
+		"Bluetooth devices.", FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 18;
+	if (bt.status[0]) {
+		zmc_set_rgb(cr, ACCENTS[app.accent].color);
+		y += zmc_text(cr, bt.status, FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 14;
+	}
+	int battery = bt_battery();
+	double menu_at = -1;
+	for (int i = 0; i < bt.n; i++) {
+		struct bt_device *d = &bt.dev[i];
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text_line(cr, d->name, FONT_SEMILIGHT, 26, MARGIN, y, zmc.width - 2 * MARGIN);
+		char line[64];
+		if (d->connected && battery >= 0) {
+			snprintf(line, sizeof(line), "Connected, battery %d%%", battery);
+		} else {
+			snprintf(line, sizeof(line), "%s", d->connected ? "Connected" : d->paired ? "Not connected" :
+				"Tap to pair");
+		}
+		if (d->connected) {
+			zmc_set_rgb(cr, ACCENTS[app.accent].color);
+		} else {
+			cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		}
+		zmc_text(cr, line, FONT_REGULAR, 14, MARGIN, y + 34, 0);
+		zmc_add_hit(0, y - 4, zmc.width, 64, ACT_BT_DEVICE, i);
+		if (i == bt_menu) {
+			menu_at = y + 60;
+		}
+		y += 70;
+	}
+	if (bt.n == 0) {
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		y += zmc_text(cr, "No devices.", FONT_REGULAR,
+			14, MARGIN, y, zmc.width - 2 * MARGIN) + 20;
+	}
+	if (bt_menu >= 0 && bt_menu < bt.n && menu_at >= 0) {
+		struct bt_device *d = &bt.dev[bt_menu];
+		const char *items[2] = { d->connected ? "disconnect" : d->paired ? "connect" : "pair", "delete" };
+		zmc_menu(cr, menu_at, items, d->paired ? 2 : 1, ACT_BT_MENU, ACT_BT_MENU_CLOSE);
+	}
+	return y + 20;
+}
+
+/* While the page is open: look again every 15 s (8 s of searching). */
+static void bt_tick(void) {
+	if (zmc.page == PAGE_BLUETOOTH && bt.on && bt_menu < 0) {
+		bt_refresh("bluetoothctl --timeout 8 scan on >/dev/null 2>&1");
+	}
+}
+
 static double draw_wifi(cairo_t *cr) {
 	double y = zmc_header(cr, "Wi-Fi");
 	y = zmc_switch(cr, y, "Wi-Fi networking", app.wifi_on, ACT_WIFI_RADIO);
@@ -955,9 +1333,6 @@ static double draw_wifi(cairo_t *cr) {
 		y += zmc_text(cr, app.wifi_status, FONT_REGULAR, 13.5, MARGIN, y - 6, zmc.width - 2 * MARGIN) + 10;
 	}
 	if (!app.wifi_on) {
-		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		y += zmc_text(cr, "Turn Wi-Fi on to see the networks around you.", FONT_REGULAR, 13.5, MARGIN, y,
-			zmc.width - 2 * MARGIN) + 20;
 		return y;
 	}
 	if (app.wifi_loading && app.n_networks == 0) {
@@ -1006,9 +1381,7 @@ static double draw_wifi(cairo_t *cr) {
 	zmc_set_rgb(cr, ACCENTS[app.accent].color);
 	zmc_text(cr, "search again", FONT_SEMILIGHT, 19, MARGIN, y + 8, 0);
 	zmc_add_hit(0, y, zmc.width, 46, ACT_WIFI_RESCAN, 0);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	y += 52 + zmc_text(cr, "Tap a network to connect. Tap and hold one for more: details, or deleting it "
-		"from the phone.", FONT_REGULAR, 12.5, MARGIN, y + 52, zmc.width - 2 * MARGIN) + 20;
+	y += 72;
 
 	if (wifi_menu >= 0 && wifi_menu < app.n_networks && menu_at >= 0) {
 		const char *items[3];
@@ -1051,11 +1424,11 @@ static double draw_wifi_net(cairo_t *cr) {
 	}
 	y = zmc_switch(cr, y + 6, "Connect automatically", wifi_net_auto, ACT_WIFI_AUTO);
 	if (n && n->in_use) {
-		y = zmc_entry(cr, y, "disconnect", "stay off this network until asked again", ACT_WIFI_DISCONNECT, 0);
+		y = zmc_entry(cr, y, "disconnect", "", ACT_WIFI_DISCONNECT, 0);
 	} else if (n) {
-		y = zmc_entry(cr, y, "connect", "join this network now", ACT_WIFI_CONNECT, (int)(n - app.networks));
+		y = zmc_entry(cr, y, "connect", "", ACT_WIFI_CONNECT, (int)(n - app.networks));
 	}
-	y = zmc_entry(cr, y, "delete", "forget this network and its password", ACT_WIFI_FORGET, 0);
+	y = zmc_entry(cr, y, "delete", "", ACT_WIFI_FORGET, 0);
 	return y + 20;
 }
 
@@ -1151,10 +1524,6 @@ static double draw_apn(cairo_t *cr) {
 	}
 	y = picker(cr, y, "Authentication", auths, 3, apn_auth, ACT_APN_AUTH);
 	y = zmc_entry(cr, y, "save", apn_note[0] ? apn_note : "write it and connect again", ACT_APN_SAVE, 0);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	y += zmc_text(cr, "Tap a box to type in it. Most networks need only the APN; yours gives it "
-		"with the SIM or on its website (Dialog: dialogbb).", FONT_REGULAR, 13, MARGIN, y,
-		zmc.width - 2 * MARGIN) + 16;
 	return y + 20;
 }
 
@@ -1169,6 +1538,11 @@ static const char *const DATE_REGIONS[] = { "United States", "United Kingdom",
 static const char *const DATE_LOCALES[] = { "en_US.UTF-8", "en_GB.UTF-8",
     "si_LK.UTF-8", "ta_LK.UTF-8", "en_IN.UTF-8", "de_DE.UTF-8",
     "fr_FR.UTF-8", "ja_JP.UTF-8", "en_AU.UTF-8", "zh_CN.UTF-8", "C.UTF-8" };
+/* the display language: LANG, for the programs that are translated */
+static const char *const LANG_NAMES[] = { "English (United States)", "English (United Kingdom)",
+    "සිංහල", "தமிழ்", "English (India)", "Deutsch", "Français", "日本語", "English (Australia)", "中文",
+    "English (plain)" };
+static int date_lang = 0;
 static char date_fields[4][256]; /* date, time, IANA zone, NTP servers */
 static bool date_synced;
 static char date_region[96] = "C.UTF-8", date_note[384];
@@ -1202,6 +1576,8 @@ static void date_ready(int fd, void *data) {
             snprintf(date_region, sizeof(date_region), "%s", eq);
             date_selected = -1;
             for (int i=0; i<11; i++) if (!strcmp(eq, DATE_LOCALES[i])) date_selected = i;
+        } else if (!strcmp(line, "Language")) {
+            for (int i=0; i<11; i++) if (!strcmp(eq, DATE_LOCALES[i])) date_lang = i;
         } else if (!strcmp(line, "Note")) snprintf(date_note, sizeof(date_note), "%s", eq);
     }
     if (result && !date_note[0]) snprintf(date_note, sizeof(date_note), "Could not update date and region. Try again.");
@@ -1226,7 +1602,10 @@ static void date_job(int operation) {
         shell_quote(date, sizeof(date), date_fields[0]);
         shell_quote(clock, sizeof(clock), date_fields[1]);
         shell_quote(servers, sizeof(servers), date_fields[3]);
-        if (operation == 2)
+        if (operation == 3)
+            snprintf(command, sizeof(command), "ztos-auth /usr/local/libexec/ztos-date-region language %s 2>&1",
+                DATE_LOCALES[date_lang]);
+        else if (operation == 2)
             snprintf(command, sizeof(command), "ztos-auth /usr/local/libexec/ztos-date-region sync %s 2>&1", servers);
         else
             snprintf(command, sizeof(command), "ztos-auth /usr/local/libexec/ztos-date-region apply %s %s %s %s %s %s 2>&1",
@@ -1252,8 +1631,7 @@ static double draw_date(cairo_t *cr) {
         y = zmc_textbox(cr, y, "Time (HH:MM)", date_fields[1], date_focus == 1, ACT_DATE_FIELD, 1);
     }
     y = zmc_textbox(cr, y, "Time zone", date_fields[2], date_focus == 2, ACT_DATE_FIELD, 2);
-    cairo_set_source_rgb(cr, .6, .6, .6);
-    y += zmc_text(cr, "For example: Asia/Colombo, Europe/London, or America/New_York.", FONT_REGULAR, 13, MARGIN, y, zmc.width-2*MARGIN)+12;
+    y = picker(cr, y, "Display language", LANG_NAMES, 11, date_lang, ACT_DATE_LANG);
     y = picker(cr, y, "Regional formats", DATE_REGIONS, 11, date_selected, ACT_DATE_REGION);
     y = zmc_textbox(cr, y, "NTP servers", date_fields[3], date_focus == 3, ACT_DATE_FIELD, 3);
     y = zmc_entry(cr, y, "sync now", date_synced ? "Time synchronized" : "Request time from your NTP server",
@@ -1530,9 +1908,6 @@ static double draw_haptics(cairo_t *cr) {
 	double y = zmc_header(cr, "haptics");
 	y = zmc_switch(cr, y, "Vibrate on touch", app.haptics, ACT_HAPTICS);
 	if (!app.haptics) {
-		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		y += zmc_text(cr, "Nothing is felt anywhere while this is off.", FONT_REGULAR, 13, MARGIN, y - 8,
-			zmc.width - 2 * MARGIN) + 16;
 		return y + 20;
 	}
 	zmc_slider(cr, MARGIN, y, zmc.width - 2 * MARGIN, app.haptic_strength, "Overall strength", ACT_HAPTIC_STRENGTH);
@@ -1565,18 +1940,11 @@ static double draw_haptics(cairo_t *cr) {
 /* The action centre's eight quick actions: which one stands in each place. */
 static double draw_quick(cairo_t *cr) {
 	double y = zmc_header(cr, "notifications + actions");
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	y += zmc_text(cr, "Choose the quick actions in the action centre, in the order they stand: "
-		"four across, two rows.", FONT_REGULAR, 13, MARGIN, y, zmc.width - 2 * MARGIN) + 18;
 	for (int i = 0; i < 8; i++) {
 		char caption[32];
 		snprintf(caption, sizeof(caption), "Row %d, place %d", i / 4 + 1, i % 4 + 1);
 		y = picker(cr, y, caption, QUICK_NAMES, N_QUICK, app.quick[i], ACT_QUICK_SLOT + i);
 	}
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	y += zmc_text(cr, "Bluetooth, rotation lock, the flashlight and location have no driver on "
-		"this phone yet: they are shown faint and do nothing.", FONT_REGULAR, 13, MARGIN, y - 4,
-		zmc.width - 2 * MARGIN) + 16;
 	return y + 20;
 }
 
@@ -1638,36 +2006,17 @@ static double draw_about(cairo_t *cr) {
 /* zrnperfd's settings: it runs as root and does the work; this only asks. */
 static double draw_perf(cairo_t *cr) {
 	static const char *const profiles[] = { "Power saver", "Balanced", "Performance" };
-	static const char *about[] = {
-		"Caps both clusters at about half speed and the GPU at 455 MHz.",
-		"Full range, with the governor changing frequency less often: every change stalls this SoC for about 3 ms.",
-		"Clusters and GPU held at full speed. Smoothest, and the warmest.",
-	};
 	double y = zmc_header(cr, "performance");
 	y = picker(cr, y, "Power profile", profiles, 3, app.perf_profile, ACT_PERF_PROFILE);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	y += zmc_text(cr, about[app.perf_profile], FONT_REGULAR, 13, MARGIN, y - 8, zmc.width - 2 * MARGIN) + 12;
 	y = zmc_switch(cr, y, "Low power, screen off", app.perf_deepsleep, ACT_PERF_DEEPSLEEP);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	y += zmc_text(cr, "Both clusters and the GPU are held at their lowest speeds until the "
-		"screen comes back. Cores stay online: this kernel cannot bring one back.",
-		FONT_REGULAR, 13, MARGIN, y - 8, zmc.width - 2 * MARGIN) + 16;
 
 	static const char *const tickle_modes[] = { "None", "Nominal", "Moderate", "High" };
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text(cr, "Tickle", FONT_SEMILIGHT, 26, MARGIN, y, 0);
 	y += 44;
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	y += zmc_text(cr, "Apps that are not in front are paused, and let run for a moment in "
-		"every pulse. Apps playing or recording sound, and ztMETRO's own, are never paused.",
-		FONT_REGULAR, 13, MARGIN, y, zmc.width - 2 * MARGIN) + 16;
 	y = picker(cr, y, "On battery", tickle_modes, 4, app.tickle[0], ACT_TICKLE_BATTERY);
 	y = picker(cr, y, "Plugged in", tickle_modes, 4, app.tickle[1], ACT_TICKLE_CHARGING);
 	y = picker(cr, y, "Power saver profile", tickle_modes, 4, app.tickle[2], ACT_TICKLE_SAVER);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	y += zmc_text(cr, "Nominal: after 30 s, paused 500 ms, running 100 ms. Moderate: after 15 s, "
-		"1 s and 50 ms. High: after 5 s, 2 s and 20 ms. The power saver profile wins over the other two.",
-		FONT_REGULAR, 13, MARGIN, y - 8, zmc.width - 2 * MARGIN) + 16;
 	y = zmc_field(cr, y, "Tickle now", app.tickle_now);
 
 	char value[160], a[32], b[32], online[32];
@@ -1706,6 +2055,7 @@ static double render_page_content(cairo_t *cr, int p) {
 	case PAGE_THEME: return draw_theme(cr);
 	case PAGE_DISPLAY: return draw_display(cr);
 	case PAGE_WIFI: return draw_wifi(cr);
+	case PAGE_BLUETOOTH: return draw_bluetooth(cr);
 	case PAGE_MOBILE: return draw_mobile(cr);
 	case PAGE_AUDIO: return draw_audio(cr);
 	case PAGE_BATTERY: return draw_battery(cr);
@@ -1728,7 +2078,7 @@ static bool is_picker(int action) {
 	case ACT_TIMEOUT_CYCLE: case ACT_SCALE_CYCLE: case ACT_NAV_SIZE_CYCLE:
 	case ACT_NETWORK_MODE: case ACT_COMP_ALGO_CYCLE: case ACT_PERF_PROFILE:
 	case ACT_TICKLE_BATTERY: case ACT_TICKLE_CHARGING: case ACT_TICKLE_SAVER:
-	case ACT_DEV_MENU_SPEED: case ACT_APN_AUTH: case ACT_DATE_REGION:
+	case ACT_DEV_MENU_SPEED: case ACT_APN_AUTH: case ACT_DATE_REGION: case ACT_DATE_LANG:
 		return true;
 	}
 	return action >= ACT_QUICK_SLOT && action <= ACT_QUICK_LAST;
@@ -1787,6 +2137,12 @@ static void activate(int action, int arg) {
             snprintf(date_fields[3], sizeof(date_fields[3]), "%s%spool.ntp.org", pools[arg], pools[arg][0] ? "." : "");
         }
         break;
+    case ACT_DATE_LANG:
+        if (!date_pipe && arg >= 0 && arg < 11 && arg != date_lang) {
+            date_lang = arg;
+            date_job(3);	/* applied at once, not with save */
+        }
+        break;
     case ACT_DATE_SYNC:
         date_focus = -1; zmc_keyboard(false); date_job(2);
         break;
@@ -1803,6 +2159,16 @@ static void activate(int action, int arg) {
 		app.accent = arg;
 		config_save();
 		break;
+	case ACT_WALL_TARGET:
+		app.wall_target = arg;
+		break;
+	case ACT_WALL: {
+		const char *path = arg > 0 && arg <= n_walls ? walls[arg - 1] : "";
+		if (app.wall_target != 2) snprintf(app.start_wall, sizeof(app.start_wall), "%s", path);
+		if (app.wall_target != 1) snprintf(app.lock_wall, sizeof(app.lock_wall), "%s", path);
+		config_save();
+		break;
+	}
 	case ACT_COLUMNS:
 		app.columns = arg;
 		config_save();
@@ -1811,6 +2177,53 @@ static void activate(int action, int arg) {
 		app.haptics = !app.haptics;
 		config_save();
 		break;
+	case ACT_BT_POWER:
+		bt.on = !bt.on;
+		bt.status[0] = 0;
+		bt_refresh(bt.on ? "bluetoothctl power on >/dev/null 2>&1; bluetoothctl discoverable on >/dev/null 2>&1; "
+			"bluetoothctl --timeout 8 scan on >/dev/null 2>&1" :
+			"bluetoothctl power off >/dev/null 2>&1");
+		break;
+	case ACT_BT_MENU_CLOSE:
+		bt_menu = -1;
+		break;
+	case ACT_BT_MENU: {
+		int which = bt_menu;
+		bt_menu = -1;
+		if (which < 0 || which >= bt.n) break;
+		activate(arg == 1 ? ACT_BT_FORGET : ACT_BT_DEVICE, which);
+		return;
+	}
+	case ACT_BT_SCAN:
+		snprintf(bt.status, sizeof(bt.status), "searching for 10 seconds…");
+		bt_refresh("bluetoothctl --timeout 10 scan on >/dev/null 2>&1");
+		zmc_redraw();
+		break;
+	case ACT_BT_DEVICE:
+	case ACT_BT_FORGET: {
+		if (arg < 0 || arg >= bt.n || !bt_mac_ok(bt.dev[arg].mac)) break;
+		struct bt_device *d = &bt.dev[arg];
+		char cmd[400];
+		if (action == ACT_BT_FORGET) {
+			snprintf(cmd, sizeof(cmd), "bluetoothctl remove %s >/dev/null 2>&1", d->mac);
+			snprintf(bt.status, sizeof(bt.status), "forgot %.60s", d->name);
+		} else if (d->connected) {
+			snprintf(cmd, sizeof(cmd), "bluetoothctl disconnect %s >/dev/null 2>&1", d->mac);
+			snprintf(bt.status, sizeof(bt.status), "disconnecting %.60s…", d->name);
+		} else if (d->paired) {
+			snprintf(cmd, sizeof(cmd), "bluetoothctl connect %s >/dev/null 2>&1", d->mac);
+			snprintf(bt.status, sizeof(bt.status), "connecting to %.60s…", d->name);
+		} else {
+			/* headsets pair with "just works": no code to compare */
+			snprintf(cmd, sizeof(cmd), "bluetoothctl --agent NoInputNoOutput pair %s >/dev/null 2>&1 && "
+				"bluetoothctl trust %s >/dev/null 2>&1 && bluetoothctl connect %s >/dev/null 2>&1",
+				d->mac, d->mac, d->mac);
+			snprintf(bt.status, sizeof(bt.status), "pairing with %.60s…", d->name);
+		}
+		bt_refresh(cmd);
+		zmc_redraw();
+		break;
+	}
 	case ACT_WIFI_RADIO:
 		if (app.wifi_on) {
 			if (system("nmcli radio wifi off 2>/dev/null &") != 0) {}
@@ -1992,6 +2405,10 @@ static void activate(int action, int arg) {
 		app.brightness = (app.brightness >= 100) ? 25 : app.brightness + 25;
 		config_save();
 		break;
+	case ACT_OPENTONE:
+		app.opentone = !app.opentone;
+		pipe_tell("/run/ztoscsf-sensord.ctl", app.opentone ? "opentone on\n" : "opentone off\n");
+		break;
 	case ACT_AUTOBRIGHTNESS:
 		app.autobrightness = !app.autobrightness;
 		pipe_tell("/run/ztoscsf-sensord.ctl", app.autobrightness ? "auto on\n" : "auto off\n");
@@ -2113,6 +2530,11 @@ static void slide(int action, int value, bool done) {
 	switch (action) {
 	case ACT_BRIGHTNESS_STEP:
 		app.brightness = value < 10 ? 10 : value;
+		if (app.autobrightness) {
+			/* a hand on the slider takes over from the light sensor */
+			app.autobrightness = false;
+			pipe_tell("/run/ztoscsf-sensord.ctl", "auto off\n");
+		}
 		/* send live brightness to the shell without reloading config/textures */
 		if (done || zmc_now_ms() - saved > 40) {
 			saved = zmc_now_ms();
@@ -2296,16 +2718,32 @@ static void arrived(int page) {
 		zmc_every(0, NULL);
 		apn_load();
 	}
+	if (page == PAGE_BLUETOOTH) {
+		/* found by others while it is open, and looking for them */
+		bt.status[0] = 0;
+		bt_menu = -1;
+		bt_refresh("bluetoothctl discoverable on >/dev/null 2>&1; bluetoothctl --timeout 8 scan on >/dev/null 2>&1");
+		zmc_every(15000, bt_tick);
+	} else if (page == PAGE_MAIN) {
+		bt_refresh(NULL);	/* the hub's line says whether it is on */
+	}
 	if (page == PAGE_WIFI) {
 		wifi_refresh(NULL);
 	} else if (page == PAGE_PERF) {
 		perf_load();
 		zmc_every(2000, perf_tick);	/* "Tickle now", while this page is open */
+	} else if (page == PAGE_DISPLAY) {
+		display_tick();
+		zmc_every(700, display_tick);
 	}
 }
 
 /* A finger held on something: a network's menu. */
 static bool held(int action, int arg) {
+	if (zmc.page == PAGE_BLUETOOTH && action == ACT_BT_DEVICE && arg >= 0 && arg < bt.n && bt_menu < 0) {
+		bt_menu = arg;
+		return true;
+	}
 	if (zmc.page == PAGE_WIFI && action == ACT_WIFI_CONNECT && arg >= 0 && arg < app.n_networks &&
 			wifi_menu < 0) {
 		wifi_menu = arg;
@@ -2322,14 +2760,23 @@ static const struct zmc_app settings = {
 
 /* --render PAGE FILE: draw one page into a PNG and leave, touching no display.
  * That is how the look is checked without opening the app on the phone. */
+/* Pages by name: --render PAGE, and `ztsettings PAGE` (Hyperscan opens one). */
+static const struct { const char *name; enum page page; } pages[] = {
+	{ "date", PAGE_DATE }, { "main", PAGE_MAIN }, { "apps", PAGE_APPS }, { "theme", PAGE_THEME }, { "display", PAGE_DISPLAY },
+	{ "wifi", PAGE_WIFI }, { "bluetooth", PAGE_BLUETOOTH }, { "mobile", PAGE_MOBILE }, { "audio", PAGE_AUDIO },
+	{ "battery", PAGE_BATTERY }, { "cpu", PAGE_CPU }, { "vm", PAGE_VM },
+	{ "gpu", PAGE_GPU }, { "keyboard", PAGE_KEYBOARD }, { "about", PAGE_ABOUT },
+	{ "perf", PAGE_PERF }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET },
+};
+
+static int page_named(const char *name) {
+	for (size_t i = 0; i < sizeof(pages) / sizeof(pages[0]); i++) {
+		if (strcmp(pages[i].name, name) == 0) return pages[i].page;
+	}
+	return -1;
+}
+
 static int render_to_file(const char *name, const char *path) {
-	static const struct { const char *name; enum page page; } pages[] = {
-		{ "date", PAGE_DATE }, { "main", PAGE_MAIN }, { "apps", PAGE_APPS }, { "theme", PAGE_THEME }, { "display", PAGE_DISPLAY },
-		{ "wifi", PAGE_WIFI }, { "mobile", PAGE_MOBILE }, { "audio", PAGE_AUDIO },
-		{ "battery", PAGE_BATTERY }, { "cpu", PAGE_CPU }, { "vm", PAGE_VM },
-		{ "gpu", PAGE_GPU }, { "keyboard", PAGE_KEYBOARD }, { "about", PAGE_ABOUT },
-		{ "perf", PAGE_PERF }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET },
-	};
 	for (size_t i = 0; i < sizeof(pages) / sizeof(pages[0]); i++) {
 		if (strcmp(pages[i].name, name) == 0) {
 			if (pages[i].page == PAGE_WIFI) {
@@ -2356,8 +2803,13 @@ int main(int argc, char **argv) {
 		}
 		return render_to_file(argv[2], argv[3]);
 	}
+	if (argc == 2 && page_named(argv[1]) >= 0) {
+		int page = page_named(argv[1]);
+		if (page == PAGE_WIFI) wifi_load();
+		return zmc_run(&settings, page);
+	}
 	if (argc > 1) {
-		fprintf(stderr, "usage: ztsettings [--render PAGE FILE]\n");
+		fprintf(stderr, "usage: ztsettings [PAGE] [--render PAGE FILE]\n");
 		return 2;
 	}
 	return zmc_run(&settings, PAGE_MAIN);

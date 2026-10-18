@@ -287,7 +287,8 @@ static bool check_part(size_t index) {
 	case 5: /* Sound card */
 		return exists("/proc/asound/ZrnAbox") || exists("/proc/asound/card0");
 	case 6: /* Backlight device */
-		return exists("/sys/class/backlight/s9p-panel") || exists("/sys/class/backlight");
+		/* the folder exists even when no driver registered a device */
+		return exists("/sys/class/backlight/s9p-panel/brightness");
 	case 7: /* Light and motion sensors */
 		return exists("/sys/bus/iio/devices/iio:device0") || exists("/sys/module/zrn_bbd") || exists("/run/ztoscsf/sensord.sock");
 	case 8: /* Vibrator */
@@ -364,13 +365,13 @@ static void arrived(int page) {
 		zmc_every(1000, tick);	/* only while this page is open */
 		break;
 	case PAGE_JOURNAL:
-		stream_start("exec journalctl -f -n 40 -o short --no-pager 2>&1");
+		stream_start("LC_ALL=C.UTF-8 exec journalctl -f -n 40 -o short --no-pager 2>&1");
 		break;
 	case PAGE_KERNEL:
-		stream_start("exec journalctl -k -f -n 40 -o short-monotonic --no-pager 2>&1");
+		stream_start("LC_ALL=C.UTF-8 exec journalctl -k -f -n 40 -o short-monotonic --no-pager 2>&1");
 		break;
 	case PAGE_SHELL:
-		stream_start("exec tail -n 40 -F \"$HOME/.local/state/ztmetro.log\" 2>&1");
+		stream_start("LC_ALL=C.UTF-8 exec tail -n 40 -F \"$HOME/.local/state/ztmetro.log\" 2>&1");
 		break;
 	default:
 		break;

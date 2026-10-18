@@ -232,7 +232,7 @@ static double draw_threads(cairo_t *cr) {
 	y += 76;
 	if (n_threads == 0) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		y += zmc_text(cr, "No messages. Tap new to write one.", FONT_REGULAR, 14, MARGIN, y,
+		y += zmc_text(cr, "No messages.", FONT_REGULAR, 14, MARGIN, y,
 			zmc.width - 2 * MARGIN) + 20;
 		return y;
 	}
@@ -311,13 +311,11 @@ static double draw_thread(cairo_t *cr) {
 	}
 	const double bubble_w = zmc.width * 0.74, pad = 10;
 	time_t since = sample ? 0 : hidden_before(with);
-	bool any = false;
 	for (int i = 0; i < n_messages; i++) {
 		struct message *m = &messages[i];
 		if (!in_thread(m, with) || m->at <= since) {
 			continue;
 		}
-		any = true;
 		bool in = m->state == M_IN;
 		double h = text_height(cr, m->text, FONT_REGULAR, 15, bubble_w - 2 * pad) + 2 * pad;
 		double x = in ? MARGIN : zmc.width - MARGIN - bubble_w;
@@ -355,11 +353,6 @@ static double draw_thread(cairo_t *cr) {
 		double when_w = zmc_text_width(when, FONT_REGULAR, 11.5);
 		zmc_text(cr, when, FONT_REGULAR, 11.5, in ? x : zmc.width - MARGIN - when_w, y + h + (in ? 11 : 19), 0);
 		y += h + (in ? 34 : 42);
-	}
-	if (!any) {
-		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		y += zmc_text(cr, "Nothing yet. Type below and send.", FONT_REGULAR, 14, MARGIN, y,
-			zmc.width - 2 * MARGIN) + 20;
 	}
 	y = draw_compose(cr, y + 6);
 	return y + 12;

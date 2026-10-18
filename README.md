@@ -78,7 +78,7 @@ notes say what. **Broken**: tried, does not work. **Not started**: nothing yet.
 | Boot | Charging while off | Partial | Off with a charger in, it stays in a minimal start until the battery reaches 10 %; written, and not yet tried from below 10 % |
 | Display | Panel, 1440x2960 | Works | DECON scanout |
 | Display | Brightness | Works | Manual, and automatic from the light sensor |
-| Display | Colour tone | Partial | The shell sets the screen's colour temperature; following the room's light (OpenTone, in `third_party/AutoBrightnessLinux`) is written, and untested |
+| Display | Colour tone | Works | OpenTone in ztoscsf-sensord: the hub's light sensor reports the room's colour temperature, and the screen's white follows it part of the way (5000–6500 K); Settings > display |
 | Input | Touchscreen | Works | S6SY761, multi-touch |
 | Input | Power and volume keys | Works | Screen off and on; volume steps with the on-screen indicator |
 | Input | Vibration | Works | Strength per kind of touch, set in Settings > haptics |

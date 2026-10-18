@@ -21,7 +21,8 @@
 #define IDLE_MS 500
 struct sound { int16_t *pcm; size_t frames; };
 struct voice { int sound; size_t position; double gain; uint64_t age; bool active; };
-static struct sound sounds[3];
+#define SOUNDS 10
+static struct sound sounds[SOUNDS];
 static struct voice voices[VOICES];
 static uint64_t next_age, last_tap;
 static pa_context *context;
@@ -32,7 +33,13 @@ static pa_time_event *idle_event, *scan_event;
 static bool corked = true, scanning, again;
 static int fd, playing, reported = -1;
 static char socket_path[108], ctl_path[256];
-static const char *const files[] = {"KbdKeyTap.wav", "KbdSpacebar.wav", "KbdFunction.wav"};
+// Indices are the shell's protocol (ztmetro.c, enum ui_sound): keyboard 0..2,
+// then the Windows Phone system sounds, converted to 48 kHz 16-bit.
+static const char *const files[SOUNDS] = {
+ "keyboard/KbdKeyTap.wav", "keyboard/KbdSpacebar.wav", "keyboard/KbdFunction.wav",
+ "system/lock.wav", "system/unlock.wav", "system/notify.wav", "system/copy.wav",
+ "system/menu.wav", "system/battery-low.wav", "system/pip.wav",
+};
 
 static uint64_t now_ms(void) {
  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -48,13 +55,13 @@ static uint32_t le32(const unsigned char *p) {
  return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24;
 }
 static void load_sound(int index) {
- char path[256]; snprintf(path, sizeof(path), "/usr/local/share/sounds/ztos/keyboard/%s", files[index]);
+ char path[256]; snprintf(path, sizeof(path), "/usr/local/share/sounds/ztos/%s", files[index]);
  FILE *f = fopen(path, "rb"); if (!f) return;
  unsigned char header[12], chunk[8], *raw = NULL;
  uint32_t rate = 0, size = 0; unsigned channels = 0;
  if (fread(header,1,12,f)!=12 || memcmp(header,"RIFF",4) || memcmp(header+8,"WAVE",4)) goto done;
  while (fread(chunk,1,8,f)==8) {
-  uint32_t n=le32(chunk+4); if(n>1024*1024) break;
+  uint32_t n=le32(chunk+4); if(n>4*1024*1024) break;
   if(!memcmp(chunk,"fmt ",4) && n>=16) {
    unsigned char fmt[16]; if(fread(fmt,1,16,f)!=16) break;
    if(fmt[0]!=1 || fmt[1] || fmt[14]!=16 || fmt[15]) break;
@@ -228,7 +235,7 @@ static void tap(pa_mainloop_api *a,pa_io_event *event,int socket_fd,pa_io_event_
  unsigned char recent[VOICES][2];int count=0;
  while((received=recv(socket_fd,packet,sizeof(packet),0))>=0) {
   if(!received){reported=-1;if(pa_context_get_state(context)==PA_CONTEXT_READY)scan();continue;}
-  if(received!=2 || packet[0]>2 || packet[1]>100 || !packet[1] || !sounds[packet[0]].pcm)continue;
+  if(received!=2 || packet[0]>=SOUNDS || packet[1]>100 || !packet[1] || !sounds[packet[0]].pcm)continue;
   memcpy(recent[count%VOICES],packet,2);count++;
  }
  if(!count || pa_context_get_state(context)!=PA_CONTEXT_READY)return;
@@ -257,7 +264,7 @@ int main(void) {
   if(errno!=EADDRINUSE || sendto(fd,"",0,0,(struct sockaddr*)&addr,sizeof(addr))>=0)return 0;
   unlink(socket_path);if(bind(fd,(struct sockaddr*)&addr,sizeof(addr))<0)return 1;
  }
- for(int i=0;i<3;i++)load_sound(i);
+ for(int i=0;i<SOUNDS;i++)load_sound(i);
  loop=pa_mainloop_new();api=pa_mainloop_get_api(loop);
  api->io_new(api,fd,PA_IO_EVENT_INPUT,tap,NULL);connect_audio();
  int result;pa_mainloop_run(loop,&result);unlink(socket_path);return result;

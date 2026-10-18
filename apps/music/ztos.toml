@@ -6,7 +6,7 @@ version = "1.0.0"
 entry = "main.py"
 icon = "icon.svg"
 description = "ztOS Music Player and Streaming"
-requires = ["yt-dlp", "mpv", "cava"]
+requires = ["yt-dlp", "mpv", "mpv-mpris", "cava"]
 performance = "eco"
 
 [build]
