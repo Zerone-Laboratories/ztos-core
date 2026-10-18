@@ -2034,7 +2034,7 @@ static double draw_about(cairo_t *cr) {
 
 	if (app.about_show_repo) {
 		zmc_accent(cr);
-		y += zmc_text(cr, "https://github.com/z3r0n3br4instorm/ztOS", FONT_REGULAR, 13, MARGIN, y, zmc.width - 2 * MARGIN) + 24;
+		y += zmc_text(cr, "https://github.com/Zerone-Laboratories/ztOS", FONT_REGULAR, 13, MARGIN, y, zmc.width - 2 * MARGIN) + 24;
 	} else {
 		y += 4;
 	}
