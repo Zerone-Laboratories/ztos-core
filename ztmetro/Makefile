@@ -19,7 +19,8 @@ $(info removed programs built for another machine, to build them here: $(FOREIGN
 endif
 
 all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
-	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts splash/ztos-splash
+	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts splash/ztos-splash \
+	store/ztstore
 
 sounds/ztos-sounds: sounds/ztos-sounds.c
 	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags libpulse) -o $@ $< $(shell pkg-config --libs libpulse) -lm
@@ -78,6 +79,22 @@ messages/ztmessages: messages/ztmessages.c comm/comm.h $(CORE_DEPS)
 contacts/ztcontacts: contacts/ztcontacts.c comm/comm.h $(CORE_DEPS)
 	$(APP_BUILD) -Icomm -o $@ contacts/ztcontacts.c $(CORE) $(APP_LIBS)
 
+# the App Store: the repos in pacman.conf and the AUR (see store/README.md)
+STORE = store/ztstore.c store/util.c store/json.c store/pkg.c store/repo.c store/appstream.c store/aur.c \
+	store/sections.c store/search.c store/jobs.c store/icons.c store/install.c
+STORE_PKGS = librsvg-2.0 zlib
+store/ztstore: $(STORE) $(wildcard store/*.h) $(CORE_DEPS)
+	$(APP_BUILD) -DHAVE_RSVG $(shell pkg-config --cflags $(STORE_PKGS)) -o $@ $(STORE) $(CORE) $(APP_LIBS) \
+		$(shell pkg-config --libs $(STORE_PKGS)) -lpthread
+
+# the App Store's parsers against a made-up pacman layout (no root, no network)
+.PHONY: check-store
+check-store:
+	sh store/tests/make_fixture.sh /tmp/ztstore-fixture
+	cd store && for t in json repo appstream aur sections; do \
+		$(CC) -std=c11 -Wall -o /tmp/ztstore-test-$$t tests/test_$$t.c util.c json.c pkg.c repo.c appstream.c aur.c sections.c -lz && \
+		/tmp/ztstore-test-$$t || exit 1; done
+
 # ztOSCoreSensorFramework: starts every piece of hardware support with the
 # system, watches them, and reports what fails
 csf/ztoscsf: csf/ztoscsf.c
@@ -124,6 +141,10 @@ install: check-arch
 	install -Dm755 devices/ztdevices /usr/local/bin/ztdevices
 	install -Dm644 devices/ztdevices.desktop /usr/local/share/applications/ztdevices.desktop
 	install -Dm644 devices/ztdevices.svg /usr/local/share/icons/hicolor/scalable/apps/ztdevices.svg
+	install -Dm755 store/ztstore /usr/local/bin/ztstore
+	install -Dm644 store/data/sections /etc/ztstore/sections
+	install -Dm644 store/data/ztstore.desktop /usr/local/share/applications/ztstore.desktop
+	install -Dm644 store/data/ztstore.svg /usr/local/share/icons/hicolor/scalable/apps/ztstore.svg
 	install -Dm755 perfd/zrnperfd /usr/local/sbin/zrnperfd
 	install -Dm644 perfd/zrnperfd.service /etc/systemd/system/zrnperfd.service
 	install -Dm755 sensord/ztoscsf-sensord /usr/local/sbin/ztoscsf-sensord
@@ -143,7 +164,7 @@ install: check-arch
 
 clean:
 	rm -f auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf notifyd/ztnotifyd splash/ztos-splash \
-		phone/ztphone messages/ztmessages contacts/ztcontacts core/viewporter-protocol.c core/viewporter-client-protocol.h \
+		phone/ztphone messages/ztmessages contacts/ztcontacts store/ztstore core/viewporter-protocol.c core/viewporter-client-protocol.h \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c
 
 # Uses a private Wayland seat; does not touch the running compositor or display.
