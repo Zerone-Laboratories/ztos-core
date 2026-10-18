@@ -227,6 +227,7 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 		g_signal_connect(wv->view, "buffer-rendered", G_CALLBACK(on_buffer), wv);
 		wpe_view_map(wv->view);
 		wpe_view_set_visible(wv->view, TRUE);
+		wpe_view_focus_in(wv->view);	/* input (clicks, keys) only reaches a focused view */
 	}
 
 	g_signal_connect(wv->web, "notify::title", G_CALLBACK(notify_title), wv);
@@ -297,6 +298,7 @@ void webview_touch_down(struct webview *wv, int id, double x, double y, unsigned
 	finger.down_y = finger.last_y = y;
 	finger.moved = false;
 	finger.active = true;
+	if (getenv("ZTB_DEBUG")) fprintf(stderr, "ztbrowser: touch down %.0f,%.0f\n", x, y);
 	/* the pointer to where the finger is, so :hover and the click land there */
 	send(wv, wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, wv->view,
 		WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0, x, y, 0, 0));
@@ -325,15 +327,32 @@ void webview_touch_up(struct webview *wv, int id, unsigned time) {
 	if (!wv || !wv->view || !finger.active) return;
 	finger.active = false;
 	double x = finger.last_x, y = finger.last_y;
+	if (getenv("ZTB_DEBUG")) fprintf(stderr, "ztbrowser: touch up %.0f,%.0f moved=%d focus=%d\n", x, y,
+		finger.moved, wpe_view_get_has_focus(wv->view));
 	if (finger.moved) {
 		send(wv, wpe_event_scroll_new(wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0,
 			0, 0, TRUE, TRUE, x, y));
 		return;
 	}
+	/* a tap: a real touch (touchstart/touchend, so touch-driven pages like
+	 * YouTube react) and a mouse click at the same point (WebKit only turns
+	 * pointer presses into clicks when they come from a mouse; from the
+	 * touchscreen source it ignored them, which is why nothing clicked) */
+	if (!wpe_view_get_has_focus(wv->view)) {
+		wpe_view_focus_in(wv->view);
+	}
+	send(wv, wpe_event_touch_new(WPE_EVENT_TOUCH_DOWN, wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN,
+		time, 0, 0, x, y));
+	send(wv, wpe_event_touch_new(WPE_EVENT_TOUCH_UP, wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN,
+		time, 0, 0, x, y));
+	send(wv, wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, wv->view,
+		WPE_INPUT_SOURCE_MOUSE, time, 0, x, y, 0, 0));
 	send(wv, wpe_event_pointer_button_new(WPE_EVENT_POINTER_DOWN, wv->view,
-		WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0, WPE_BUTTON_PRIMARY, x, y, 1));
+		WPE_INPUT_SOURCE_MOUSE, time, 0, WPE_BUTTON_PRIMARY, x, y, 1));
 	send(wv, wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, wv->view,
-		WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0, WPE_BUTTON_PRIMARY, x, y, 1));
+		WPE_INPUT_SOURCE_MOUSE, time, WPE_MODIFIER_POINTER_BUTTON1, WPE_BUTTON_PRIMARY, x, y, 0));
+	/* (a release carries press count 0: WPE refuses to build one with 1, so
+	 * the release used to be dropped and no click ever completed) */
 }
 
 void webview_touch_cancel(struct webview *wv) {

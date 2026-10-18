@@ -716,6 +716,9 @@ struct zt_server {
 	struct osk_key keys[MAX_KEYS];
 	int n_keys;
 	int osk_pressed;		/* -1: none */
+	struct wl_event_source *key_repeat_timer;	/* backspace held: delete on and on */
+	int repeat_index;		/* the key repeating, -1: none */
+	bool repeated;			/* it fired while held: the lift adds no more */
 	bool osk_trackpad;
 	struct touch_point *osk_cursor_touch;
 	double osk_h;
@@ -6418,6 +6421,24 @@ static void osk_activate(struct zt_server *server, int index) {
 	}
 }
 
+#define KEY_REPEAT_DELAY_MS	450
+#define KEY_REPEAT_MS		60
+/* backspace held down: once it has been held a moment it deletes again and
+ * again until the finger lifts or slides off it */
+static int key_repeat_fired(void *data) {
+	struct zt_server *server = data;
+	int i = server->repeat_index;
+	if (i < 0 || server->osk_pressed != i || !server->osk_visible || i >= server->n_keys ||
+			server->keys[i].keycode != KEY_BACKSPACE) {
+		server->repeat_index = -1;
+		return 0;
+	}
+	osk_activate(server, i);
+	server->repeated = true;
+	wl_event_source_timer_update(server->key_repeat_timer, KEY_REPEAT_MS);
+	return 0;
+}
+
 /* ---- xdg-shell ----------------------------------------------------------- */
 
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
@@ -7995,6 +8016,12 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		p->index = key_at(server, x, y);
 		server->osk_pressed = p->index;
 		if (p->index >= 0) keyboard_sound(server, &server->keys[p->index]);
+		server->repeated = false;
+		server->repeat_index = -1;
+		if (p->index >= 0 && server->keys[p->index].keycode == KEY_BACKSPACE) {
+			server->repeat_index = p->index;
+			wl_event_source_timer_update(server->key_repeat_timer, KEY_REPEAT_DELAY_MS);
+		}
 		draw_osk(server);
 		hap(server, HAP_KEY, HG_KEYS);
 		return;
@@ -8571,9 +8598,12 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
         }
         break;
 	case ROLE_KEY:
-		if (!cancelled && p->index >= 0) {
+		wl_event_source_timer_update(server->key_repeat_timer, 0);
+		server->repeat_index = -1;
+		if (!cancelled && p->index >= 0 && !server->repeated) {
 			osk_activate(server, p->index);
 		}
+		server->repeated = false;
 		server->osk_pressed = -1;
 		if (server->osk_visible) {
 			draw_osk(server);
@@ -10226,6 +10256,8 @@ int main(int argc, char *argv[]) {
 	wlr_seat_set_keyboard(server.seat, &server.vkbd);
 
 	server.long_press_timer = wl_event_loop_add_timer(server.loop, long_press_fired, &server);
+	server.key_repeat_timer = wl_event_loop_add_timer(server.loop, key_repeat_fired, &server);
+	server.repeat_index = -1;
 	server.idle_timer = wl_event_loop_add_timer(server.loop, idle_fired, &server);
 	uevent_init(&server);
 	wl_event_loop_add_signal(server.loop, SIGHUP, reload, &server);
