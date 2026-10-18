@@ -46,6 +46,7 @@ __all__ = [
     "menu", "haptic", "notify", "osk", "accent", "resource", "load_ui", "on_device", "manifest",
     "MARGIN", "FONT_LIGHT", "FONT_SEMILIGHT", "FONT_REGULAR", "FONT_SEMIBOLD", "FONT_SYMBOLIC",
     "ProgressBar", "LoadingDots", "Dialog", "message", "performance", "battery", "launch", "store", "Store",
+    "animate", "TRANSITIONS",
 ]
 
 MARGIN = 16
@@ -323,7 +324,8 @@ TILT_DEG, TILT_LIFT, PRESS_SINK = 14.0, 40.0, 0.045
 TILT_IN_MS, TILT_OUT_MS = _dur(70), _dur(160)
 DEPTH_FOV_DEG = 34.0        # the shell's field of view
 ROW_OUT_MS, ROW_IN_MS, ROW_STAGGER_MS, GAP_MS = _dur(110), _dur(180), _dur(33), _dur(120)
-TURN_OUT_DEG = TURN_IN_DEG = 80.0
+TURN_IN_DEG = 80.0
+TURN_OUT_DEG = 50.0   # TurnstileForwardOut ends at 50 deg (Lumia 530 firmware)
 ENTER_STAGGER_MS, ENTER_ROW_MS, ENTER_TRAVEL = _dur(28), _dur(190), 50.0
 ENTER_TITLE_TRAVEL, ENTER_TITLE_MS, ENTER_HOLD_MS = 35.0, _dur(200), _dur(60)
 PIVOT_FLICK = 0.3           # points per ms that throw the tabs on to the next
@@ -461,6 +463,154 @@ def _solid(layer, key, color: QColor):
         image = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
         image.fill(color)
         layer.upload(key, image)
+
+
+
+# ---- named transitions, from the Lumia 530 firmware ------------------------------
+#
+# The standard Windows Phone 8.1 transitions, read out of a Lumia 530's
+# compiled Iris markup (UIXMobile!Animations.uix and the shell's own tables):
+# the angles, durations, the continuum scale and the 33 ms row feather are the
+# firmware's; the Exp/Log/SCurve curves are rebuilt from their names and the
+# weights the firmware stores (the exact formula lives in native UIXrender).
+# animate(widget, name) plays one on any widget; the names are in TRANSITIONS.
+
+_AX_Y, _AX_X, _AX_Z = 0, 1, 2
+
+# name: (axis, from_deg, to_deg, pivot, from_scale, to_scale, from_dy, to_dy,
+#        from_alpha, to_alpha, ms, curve, weight)
+TRANSITIONS = {
+    "turnstile-in":      (_AX_Y, -80, 0, 0.0, 1, 1, 0, 0, 1, 1, 350, "log", 60),
+    "turnstile-out":     (_AX_Y, 0, 50, 0.0, 1, 1, 0, 0, 1, 0, 128, "exp", 60),
+    "swivel-in":         (_AX_X, -60, 0, 0.5, 1, 1, 0, 0, 0, 1, 300, "log", 200),
+    "swivel-out":        (_AX_X, 0, 60, 0.5, 1, 1, 0, 0, 1, 0, 199, "exp", 60),
+    "continuum-hide":    (_AX_X, 0, 80, 0.0, 1, 1, 0, 120, 1, 0, 120, "exp", 60),
+    "continuum-show":    (_AX_X, -50, 0, 0.0, 1.5, 1, -60, 0, 0, 1, 350, "log", 60),
+    "readerboard-in":    (_AX_X, -45, 0, 0.0, 1, 1, 0, 0, 0, 1, 166, "log", 60),
+    "readerboard-out":   (_AX_X, 0, 90, 0.0, 1, 1, 0, 0, 1, 0, 166, "exp", 60),
+    "slide-up-fade-in":  (_AX_Y, 0, 0, 0.0, 1, 1, 24, 0, 0, 1, 240, "log", 150),
+    "rotate-90":         (_AX_Z, 90, 0, 0.5, 1, 1, 0, 0, 1, 1, 167, "scurve", 7.5),
+    "fade-in":           (_AX_Y, 0, 0, 0.0, 1, 1, 0, 0, 0, 1, 350, "log", 150),
+    "fade-out":          (_AX_Y, 0, 0, 0.0, 1, 1, 0, 0, 1, 0, 150, "exp", 150),
+    "tile-flip-notify":  (_AX_X, -180, 0, 0.5, 1, 1, 0, 0, 1, 1, 520, "overshoot", 0),
+}
+
+
+def _shape(curve: str, w: float, t: float) -> float:
+    """Iris easing: Exp gathers speed (things leaving), Log settles (arriving),
+    SCurve both; overshoot is the live-tile notify flip's -180 -> 35 -> -6 -> 0."""
+    if curve == "exp":
+        k = w / 30.0
+        return (math.exp(k * t) - 1) / (math.exp(k) - 1)
+    if curve == "log":
+        k = w / 30.0
+        return 1 - (math.exp(k * (1 - t)) - 1) / (math.exp(k) - 1)
+    if curve == "scurve":
+        f0 = 1 / (1 + math.exp(w / 2)); f1 = 1 / (1 + math.exp(-w / 2))
+        return (1 / (1 + math.exp(-w * (t - 0.5))) - f0) / (f1 - f0)
+    return t
+
+
+def _lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
+
+
+class _Transition(_Moving):
+    """Plays a named transition over a widget: the widget's picture, turned,
+    scaled, moved and faded each frame, laid over where it sits. Drawn like the
+    shell's rows (one projective band per slice), never redrawing the widget."""
+
+    def __init__(self, target: QWidget, spec, repeat: bool, on_done):
+        super().__init__(target.parentWidget())
+        self._target = target
+        self._spec = spec
+        self._repeat = repeat
+        self._on_done = on_done
+        self.setGeometry(target.geometry())
+        self._pic = _snapshot(target, dpr=LEAN_DPR, alpha=True)
+        self._start = _now()
+        self._run = _dur(spec[10]) + (_dur(700) if repeat else 0.0)
+        target.hide()
+        self.show()
+        self.raise_()
+        self._ticker = _Ticker(self, self._step)
+        self._ticker.start()
+
+    def _step(self, now: float) -> bool:
+        ms = now - self._start
+        if ms >= self._run and not self._repeat:
+            self._finish()
+            return False
+        self.update()
+        return True
+
+    def _finish(self):
+        (axis, fd, td, piv, fs, ts, fdy, tdy, fa, ta, mn, cv, wt) = self._spec
+        self._target.setVisible(ta > 0.5)   # shown if it ends visible, hidden if it fades out
+        if self._on_done:
+            self._on_done()
+        self.deleteLater()
+
+    def compose(self, p: QPainter):
+        (axis, fd, td, piv, fs, ts, fdy, tdy, fa, ta, mn, cv, wt) = self._spec
+        run = _dur(mn)
+        ms = (_now() - self._start) % (run + _dur(700)) if self._repeat else (_now() - self._start)
+        t = min(1.0, max(0.0, ms / run))
+        if cv == "overshoot":
+            # the live-tile notify flip: -180 -> 35 (Log 10) -> -6 (SCurve 10) -> 0
+            if t < 0.367:
+                deg = _lerp(-180, 35, _shape("log", 10, t / 0.367))
+            elif t < 0.833:
+                deg = _lerp(35, -6, _shape("scurve", 10, (t - 0.367) / (0.833 - 0.367)))
+            else:
+                deg = _lerp(-6, 0, (t - 0.833) / (1 - 0.833))
+            e = 1.0
+        else:
+            e = _shape(cv, wt, t)
+            deg = _lerp(fd, td, e)
+        scale = _lerp(fs, ts, e); dy = _lerp(fdy, tdy, e); alpha = _lerp(fa, ta, e)
+        w, h = self.width(), self.height()
+        p.setOpacity(max(0.0, min(1.0, alpha)))
+        p.translate(w / 2.0, h / 2.0 + dy)
+        p.scale(scale, scale)
+        p.translate(-w / 2.0, -h / 2.0)
+        if axis == _AX_Z:
+            p.translate(w / 2.0, h / 2.0); p.rotate(deg); p.translate(-w / 2.0, -h / 2.0)
+            _band(p, self._pic, 0, 0, w, h)
+            return
+        # a turn about the Y (vertical) or X (horizontal) axis, in slices
+        n = 20
+        eye = _eye(h)
+        a = math.radians(deg)
+        length = w if axis == _AX_Y else h
+        pivot = length * piv
+        for k in range(n):
+            u0 = length * k / n - pivot
+            u1 = length * (k + 1) / n - pivot
+            s0 = eye / (eye - u0 * math.sin(a)); s1 = eye / (eye - u1 * math.sin(a))
+            q0 = pivot + u0 * math.cos(a) * s0; q1 = pivot + u1 * math.cos(a) * s1
+            if q1 - q0 < 0.05:
+                continue
+            p.save()
+            if axis == _AX_Y:
+                p.setClipRect(QRectF(q0, 0, q1 - q0 + 0.5, h))
+                p.translate(q0, 0); p.scale((q1 - q0) / (u1 - u0), 1.0)
+                _band(p, self._pic, -(u0 + pivot) + 0, 0, length - (u0 + pivot), h)
+            else:
+                p.setClipRect(QRectF(0, q0, w, q1 - q0 + 0.5))
+                p.translate(0, q0); p.scale(1.0, (q1 - q0) / (u1 - u0))
+                _band(p, self._pic, 0, -(u0 + pivot), w, length - (u0 + pivot))
+            p.restore()
+
+
+def animate(widget: QWidget, name: str, repeat: bool = False, on_done=None):
+    """Play a named Windows Phone transition over `widget` (see TRANSITIONS).
+    `repeat` loops it (for a preview); `on_done` is called when a one-shot ends.
+    Returns the overlay, which .deleteLater() stops."""
+    spec = TRANSITIONS.get(name)
+    if spec is None:
+        raise ValueError("unknown transition %r; try %s" % (name, ", ".join(sorted(TRANSITIONS))))
+    return _Transition(widget, spec, repeat, on_done)
 
 
 # ---- the finger ----------------------------------------------------------------------

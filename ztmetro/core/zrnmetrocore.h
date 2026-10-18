@@ -234,6 +234,15 @@ void zmc_text_centred(cairo_t *cr, const char *s, const char *font, double size,
 void zmc_gpu_quad(cairo_surface_t *source, unsigned revision, const double corners[4][3], double alpha);
 void zmc_gpu_rect(double x, double y, double w, double h, double r, double g, double b);
 void zmc_present(void);
+
+/* Named Windows Phone transitions, from the Lumia 530 firmware. Draw one frame
+ * at progress t (0..1) of `source` over the rectangle (x,y,w,h, points), on the
+ * GPU: for a .overlay that plays a transition. zmc_transition_ms(name) is how
+ * long the whole thing runs; the names are those of ztanim[] below. Returns
+ * false for an unknown name. */
+bool zmc_transition(const char *name, double t, double x, double y, double w, double h,
+	cairo_surface_t *source, unsigned revision);
+double zmc_transition_ms(const char *name);
 double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg);
 void zmc_round_button(cairo_t *cr, double cx, double y, const char *glyph, const char *label,
 	int action, int arg);

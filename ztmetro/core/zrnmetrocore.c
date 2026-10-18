@@ -2526,6 +2526,99 @@ void zmc_present(void) {
 	present();
 }
 
+/* ---- named transitions (ztmetro/core; see the Lumia 530 notes) -------------
+ *
+ * The standard Windows Phone 8.1 transitions, read out of a Lumia 530's
+ * compiled Iris markup. Values are the firmware's; the Exp/Log/SCurve curves
+ * are rebuilt from the names and weights it stores. zmc_transition() draws one
+ * frame on the GPU, for an app's .overlay (see zmc_gpu_quad). */
+
+struct ztanim {
+	const char *name;
+	int axis;		/* 0 vertical (Y), 1 horizontal (X), 2 in-plane (Z) */
+	double from_deg, to_deg, pivot, from_scale, to_scale, from_dy, to_dy;
+	double from_alpha, to_alpha, ms, weight;
+	char curve;		/* 'e' exp, 'l' log, 's' scurve, 'o' overshoot */
+};
+
+static const struct ztanim ztanims[] = {
+	{ "turnstile-in",     0, -80, 0, 0.0, 1, 1, 0, 0, 1, 1, 350, 60, 'l' },
+	{ "turnstile-out",    0, 0, 50, 0.0, 1, 1, 0, 0, 1, 0, 128, 60, 'e' },
+	{ "swivel-in",        1, -60, 0, 0.5, 1, 1, 0, 0, 0, 1, 300, 200, 'l' },
+	{ "swivel-out",       1, 0, 60, 0.5, 1, 1, 0, 0, 1, 0, 199, 60, 'e' },
+	{ "continuum-hide",   1, 0, 80, 0.0, 1, 1, 0, 120, 1, 0, 120, 60, 'e' },
+	{ "continuum-show",   1, -50, 0, 0.0, 1.5, 1, -60, 0, 0, 1, 350, 60, 'l' },
+	{ "readerboard-in",   1, -45, 0, 0.0, 1, 1, 0, 0, 0, 1, 166, 60, 'l' },
+	{ "readerboard-out",  1, 0, 90, 0.0, 1, 1, 0, 0, 1, 0, 166, 60, 'e' },
+	{ "slide-up-fade-in", 0, 0, 0, 0.0, 1, 1, 24, 0, 0, 1, 240, 150, 'l' },
+	{ "rotate-90",        2, 90, 0, 0.5, 1, 1, 0, 0, 1, 1, 167, 7.5, 's' },
+	{ "fade-in",          0, 0, 0, 0.0, 1, 1, 0, 0, 0, 1, 350, 150, 'l' },
+	{ "fade-out",         0, 0, 0, 0.0, 1, 1, 0, 0, 1, 0, 150, 150, 'e' },
+	{ "tile-flip-notify", 1, -180, 0, 0.5, 1, 1, 0, 0, 1, 1, 520, 0, 'o' },
+};
+#define N_ZTANIMS (int)(sizeof(ztanims) / sizeof(ztanims[0]))
+
+static double zt_shape(char c, double w, double t) {
+	double k = w / 30.0;
+	switch (c) {
+	case 'e': return (exp(k * t) - 1) / (exp(k) - 1);
+	case 'l': return 1 - (exp(k * (1 - t)) - 1) / (exp(k) - 1);
+	case 's': { double f0 = 1/(1+exp(w/2)), f1 = 1/(1+exp(-w/2));
+		return (1/(1+exp(-w*(t-0.5))) - f0) / (f1 - f0); }
+	default: return t;
+	}
+}
+
+static const struct ztanim *zt_find(const char *name) {
+	for (int i = 0; i < N_ZTANIMS; i++) {
+		if (strcmp(ztanims[i].name, name) == 0) {
+			return &ztanims[i];
+		}
+	}
+	return NULL;
+}
+
+double zmc_transition_ms(const char *name) {
+	const struct ztanim *A = zt_find(name);
+	return A ? A->ms : 0;
+}
+
+bool zmc_transition(const char *name, double t, double x, double y, double w, double h,
+		cairo_surface_t *source, unsigned rev) {
+	const struct ztanim *A = zt_find(name);
+	if (!A) {
+		return false;
+	}
+	if (t < 0) t = 0; else if (t > 1) t = 1;
+	double deg, e;
+	if (A->curve == 'o') {
+		/* the live-tile notify flip: -180 -> 35 (Log 10) -> -6 (SCurve 10) -> 0 */
+		if (t < 0.367) deg = -180 + (35 - -180) * zt_shape('l', 10, t / 0.367);
+		else if (t < 0.833) deg = 35 + (-6 - 35) * zt_shape('s', 10, (t - 0.367) / (0.833 - 0.367));
+		else deg = -6 + (0 - -6) * (t - 0.833) / (1 - 0.833);
+		e = 1;
+	} else {
+		e = zt_shape(A->curve, A->weight, t);
+		deg = A->from_deg + (A->to_deg - A->from_deg) * e;
+	}
+	double scale = A->from_scale + (A->to_scale - A->from_scale) * e;
+	double dy = A->from_dy + (A->to_dy - A->from_dy) * e;
+	double alpha = A->from_alpha + (A->to_alpha - A->from_alpha) * e;
+	double a = deg * M_PI / 180, c[4][3];
+	double lx[4] = { 0, w, 0, w }, ly[4] = { 0, 0, h, h };
+	for (int i = 0; i < 4; i++) {
+		double px = lx[i] - w / 2, py = ly[i] - h / 2, pz = 0;
+		if (A->axis == 0) { double u = lx[i] - w * A->pivot; px = w * A->pivot - w/2 + u*cos(a); pz = u*sin(a); }
+		else if (A->axis == 1) { double u = ly[i] - h * A->pivot; py = h * A->pivot - h/2 + u*cos(a); pz = u*sin(a); }
+		else { double rx = px*cos(a) - py*sin(a), ry = px*sin(a) + py*cos(a); px = rx; py = ry; }
+		c[i][0] = x + w/2 + px*scale;
+		c[i][1] = y + dy + h/2 + py*scale;
+		c[i][2] = pz*scale;
+	}
+	zmc_gpu_quad(source, rev, c, alpha);
+	return true;
+}
+
 double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg) {
 	const double h = 40, line = 2;
 	bool down = zmc.button_down && zmc.pressed.action == action && zmc.pressed.arg == arg &&
