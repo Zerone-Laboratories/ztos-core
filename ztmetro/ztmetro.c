@@ -1476,17 +1476,6 @@ static void draw_icon_vector(cairo_t *cr, const char *name, double cx, double cy
 		cairo_line_to(cr, -u * 0.75, 0);
 		cairo_line_to(cr, -u * 0.15, u * 0.6);
 		cairo_stroke(cr);
-	} else if (strcmp(name, "keyboard") == 0) {
-		/* a keyboard: a frame, three rows of five keys, the keys filled */
-		cairo_rectangle(cr, -u * 0.9, -u * 0.6, u * 1.8, u * 1.2);
-		cairo_stroke(cr);
-		for (int row = 0; row < 3; row++) {
-			for (int col = 0; col < 5; col++) {
-				cairo_rectangle(cr, -u * 0.66 + col * u * 0.33, -u * 0.38 + row * u * 0.36,
-					u * 0.22, u * 0.2);
-				cairo_fill(cr);
-			}
-		}
 	} else if (strcmp(name, "search") == 0) {
 		/* the lens sits top right, the handle runs down to the left; both
 		 * in the same stroke as the back arrow beside it */
@@ -4530,8 +4519,13 @@ static void draw_nav(struct zt_server *server) {
 		if (i == NAV_BACK) {
 			draw_icon(cr, "back", cx, cy, 20);
 		} else if (i == NAV_SEARCH) {
-			/* while the keyboard is up, the same button puts it away */
-			draw_icon(cr, server->osk_visible ? "keyboard" : "search", cx, cy, 20);
+			/* while the keyboard is up, the same button puts it away: the
+			 * phone's keyboard glyph (Segoe UI Symbol E144) */
+			if (server->osk_visible) {
+				draw_text(cr, u8"\ue144", "Segoe UI Symbol, Segoe MDL2 Assets", 24, cx - 20, 0, 40, NAV_H, true);
+			} else {
+				draw_icon(cr, "search", cx, cy, 20);
+			}
 		} else {
 			/* the Start button carries the system's name */
 			/* semilight: its stems are as thick as the arrow and the lens */
