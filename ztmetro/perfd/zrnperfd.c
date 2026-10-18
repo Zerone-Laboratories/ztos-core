@@ -37,12 +37,17 @@
  * Dynamic boost (the balanced profile), from a resting state up, as the load
  * on the app in front asks:
  *
- *	idle0	the resting state: only the first two efficiency cores online
- *		(the rest of that cluster offline), held near 1.3 GHz, the big
- *		cluster parked. Screen on or off. No light.
- *	nominal	the app in front (eco apps too) has used more than 25 % of a
- *		core: all the efficiency cores, at their full little speed. No
- *		light.
+ *	idle0	the resting state, only on the Start screen (nothing in front):
+ *		only the first two efficiency cores online (the rest of that
+ *		cluster offline), held near 1.3 GHz, the big cluster parked.
+ *		Screen on or off. No light.
+ *	nominal	an app is in front (idle0 is left as soon as one opens), or the
+ *		front app (eco apps too) has used more than 25 % of a core: all
+ *		the efficiency cores, at their full little speed. The floor while
+ *		an app is in front. No light.
+ *	idle2	more than 75 % (eco apps too): the efficiency cores to their top
+ *		clock (performance), the big cluster still parked -- as fast as
+ *		the little cores go before any big core is woken. No light.
  *	big	more than 95 % (not an eco app): the big cores open to it, at no
  *		more than 65 % of their top speed
  *	rapid	and still more than 95 %: both clusters at their fastest clock
@@ -64,8 +69,8 @@
  * it is done from here; it only costs wake-ups while the processor is busy
  * anyway. Afterwards the light goes back to what the charger says.
  *
- * What is on the screen comes first: the shell runs at nice -10 and the app
- * in front at -5, and both ask the scheduler for at least half of a big
+ * What is on the screen comes first: the shell runs at nice -15 and the app
+ * in front at -8, and both ask the scheduler for at least half of a big
  * core's speed whenever they run (uclamp), so that a frame never waits for a
  * slow core or a slow clock. Idle, a clamp costs nothing.
  */
@@ -249,8 +254,8 @@ static int condition(void) {
 
 /* ---- the screen first -------------------------------------------------------- */
 
-#define SHELL_NICE	-10
-#define FRONT_NICE	-5
+#define SHELL_NICE	-15	/* the compositor above everything but the kernel */
+#define FRONT_NICE	-8	/* the app in front, just under the shell */
 #define UI_UCLAMP	512	/* of 1024: half a big core */
 
 struct sched_attr_v1 {
@@ -384,8 +389,8 @@ static long capped(const long *table, int n, double share) {
 
 /* ---- dynamic boost ----------------------------------------------------------- */
 
-enum boost { IDLE0, NOMINAL, BIG, RAPID };
-static const char *const boost_names[] = { "idle0", "nominal", "big", "rapid" };
+enum boost { IDLE0, NOMINAL, IDLE2, BIG, RAPID };
+static const char *const boost_names[] = { "idle0", "nominal", "idle2", "big", "rapid" };
 static enum boost boost = IDLE0;	/* the resting state: two cores near 1.3 GHz */
 static bool boost_extreme;	/* rapid, and still pinned for a second */
 static bool led_lit;
@@ -393,7 +398,8 @@ static long led_next;		/* when the light next changes; 0: not blinking */
 #define LED_WHITE	40	/* of 255, each of the three colours */
 #define BOOST_SAMPLE_MS	250
 #define IDLE_UP		0.25	/* idle0 -> idle1 (nominal): the front app, eco apps too */
-#define BOOST_UP	0.95	/* nominal -> big -> rapid: of one core, not eco apps */
+#define IDLE2_UP	0.75	/* idle1 (nominal) -> idle2: eco apps too, still eff-only */
+#define BOOST_UP	0.95	/* idle2 -> big -> rapid: of one core, not eco apps */
 #define BOOST_DOWN	0.55
 #define BIG_SHARE	0.65
 
@@ -539,10 +545,16 @@ static bool boost_sample(void) {
 		return true;
 	}
 	enum boost was = boost, top = profile == POWERSAVE ? BIG : RAPID;
+	/* idle0 is only the Start screen's resting state; the moment an app is in
+	 * front the floor is nominal (idle1). */
+	enum boost floor = front_pid > 0 ? NOMINAL : IDLE0;
 	static int pinned_looks;
-	/* up a rung: idle0 -> nominal when the front app (eco too) passes IDLE_UP;
-	 * nominal -> big -> rapid when it (not eco) passes BOOST_UP. */
-	bool step_up = boost == IDLE0 ? used_any > IDLE_UP : used > BOOST_UP;
+	/* up a rung: idle0 -> nominal at IDLE_UP, nominal -> idle2 at IDLE2_UP (both
+	 * the front app with eco apps too, still efficiency-only); idle2 -> big ->
+	 * rapid at BOOST_UP (not eco apps). */
+	bool step_up = boost <= NOMINAL
+		? used_any > (boost == IDLE0 ? IDLE_UP : IDLE2_UP)
+		: used > BOOST_UP;
 	if (step_up) {
 		calm_since = 0;
 		if (boost < top) {
@@ -554,18 +566,22 @@ static bool boost_sample(void) {
 	} else {
 		pinned_looks = 0;
 		boost_extreme = false;
-		/* down a rung when it has been easy a while (idle0 is the floor) */
-		double u = boost == NOMINAL ? used_any : used;
+		/* down a rung when it has been easy a while (the floor is idle0 on the
+		 * Start screen, nominal with an app in front) */
+		double u = boost <= IDLE2 ? used_any : used;
 		if (u < BOOST_DOWN) {
 			if (!calm_since) {
 				calm_since = now;
-			} else if (boost > IDLE0 && now - calm_since > (boost == RAPID ? 2000 : 3000)) {
+			} else if (boost > floor && now - calm_since > (boost == RAPID ? 2000 : 3000)) {
 				boost--;
 				calm_since = now;
 			}
 		} else {
 			calm_since = 0;
 		}
+	}
+	if (boost < floor) {
+		boost = floor;		/* an app just opened: leave idle0 at once */
 	}
 	if (boost < BIG && top >= BIG && policy_of(front_pid) == POLICY_BIG) {
 		boost = BIG;		/* it asked for the big cores while it is in front */
@@ -586,12 +602,15 @@ static void apply(void) {
 			continue;
 		}
 		long max = profile == POWERSAVE ? capped(table, n, 0.65) : table[n - 1];
-		bool flat_out = (profile == PERFORMANCE || boost == RAPID) && !idle0;
+		/* idle2 runs the efficiency cores flat out (performance); the big
+		 * cluster stays parked there, so only its cores are held back */
+		bool eff_flat = boost == IDLE2 && !big;
+		bool flat_out = (profile == PERFORMANCE || boost == RAPID || eff_flat) && !idle0;
 		if (idle0) {
 			/* the two live efficiency cores near 1.3 GHz; the big cluster, its
 			 * one parked core, at its lowest (race to idle) */
 			max = big ? table[0] : nearest(table, n, IDLE_KHZ_TARGET);
-		} else if (big && boost == NOMINAL) {
+		} else if (big && (boost == NOMINAL || boost == IDLE2)) {
 			max = table[0];		/* the big cluster: nothing runs there, and slowly */
 		} else if (big && boost == BIG) {
 			max = capped(table, n, BIG_SHARE);
@@ -619,7 +638,7 @@ static void apply(void) {
 	/* Programs on the efficiency cores only, and the spare big cores off,
 	 * until something needs more; coming up, the cores first and then the
 	 * leave to use them. idle 0 goes further: only cpu0 and cpu1 stay online. */
-	bool few = boost <= NOMINAL;	/* idle0 and nominal (idle1) are efficiency-only */
+	bool few = boost <= IDLE2;	/* idle0, nominal (idle1) and idle2 are efficiency-only */
 	char eff_set[24], all_set[24];
 	int eff_last = cluster_cpus[0][0];
 	for (int i = 0; cluster_cpus[0][i] >= 0; i++) { eff_last = cluster_cpus[0][i]; }
