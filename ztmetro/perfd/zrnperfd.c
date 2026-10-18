@@ -9,12 +9,8 @@
  *
  *	profile powersave | balanced | performance
  *	deepsleep on | off	whether "screen off" lowers anything
- *	idle 0 | 1		the screen-off deep-sleep mode: 0 holds only two
- *				cores online near 1.3 GHz (race to idle), 1 keeps
- *				all the efficiency cores at their lowest clock
- *				(the default). The daemon finds the processor's
- *				layout at startup, so it fits a four-core phone
- *				as well as this eight-core one.
+ * The daemon finds the processor's layout at startup (detect_topology), so it
+ * fits a four-core phone as well as this eight-core one.
  *	screen off | on		from the shell, as the display goes off and on
  *	focus PID APP_ID	from the shell: the app now in front (PID 0: Start)
  *	shell PID		from the shell as it starts: the compositor's pid
@@ -38,14 +34,17 @@
  * clusters and the GPU held at their lowest operating points, and the big
  * cores but one offline (see dynamic boost).
  *
- * Dynamic boost (the balanced profile, screen on), in three steps, as the
- * laptop's daemon has it:
+ * Dynamic boost (the balanced profile), from a resting state up, as the load
+ * on the app in front asks:
  *
- *	nominal	everything runs on the four efficiency cores; the big cluster
- *		is given nothing to do and is held at its lowest clock
- *	big	the app in front (or the shell) has used more than 95 % of a
- *		core for a moment: the big cores are opened to it, at no more
- *		than 65 % of their top speed
+ *	idle0	the resting state: only the first two efficiency cores online
+ *		(the rest of that cluster offline), held near 1.3 GHz, the big
+ *		cluster parked. Screen on or off. No light.
+ *	nominal	the app in front (eco apps too) has used more than 75 % of a
+ *		core: all the efficiency cores, at their full little speed. No
+ *		light.
+ *	big	more than 95 % (not an eco app): the big cores open to it, at no
+ *		more than 65 % of their top speed
  *	rapid	and still more than 95 %: both clusters at their fastest clock
  *
  * It steps down again when the load has been low for a while. In nominal,
@@ -108,8 +107,7 @@ static int clusters[8];		/* first cpu of each cluster */
 static int cluster_cpus[8][16];	/* the cpus of each cluster, -1 terminated */
 static int n_clusters;
 static int cpu_count = 1;
-#define IDLE_KHZ_TARGET	1300000	/* idle 0: the two live cores held near 1.3 GHz */
-static int idle_mode = 1;	/* 0: two cores, ~1.3 GHz. 1: all efficiency cores, lowest. */
+#define IDLE_KHZ_TARGET	1300000	/* idle0: the two live cores held near 1.3 GHz */
 
 static enum profile profile = BALANCED;
 /* read a cpu list like "0-3" or "4,5,6,7" into out[] (-1 terminated) */
@@ -386,15 +384,16 @@ static long capped(const long *table, int n, double share) {
 
 /* ---- dynamic boost ----------------------------------------------------------- */
 
-enum boost { NOMINAL, BIG, RAPID };
-static const char *const boost_names[] = { "nominal", "big", "rapid" };
-static enum boost boost = NOMINAL;
+enum boost { IDLE0, NOMINAL, BIG, RAPID };
+static const char *const boost_names[] = { "idle0", "nominal", "big", "rapid" };
+static enum boost boost = IDLE0;	/* the resting state: two cores near 1.3 GHz */
 static bool boost_extreme;	/* rapid, and still pinned for a second */
 static bool led_lit;
 static long led_next;		/* when the light next changes; 0: not blinking */
 #define LED_WHITE	40	/* of 255, each of the three colours */
 #define BOOST_SAMPLE_MS	250
-#define BOOST_UP	0.95	/* of one core, by the app in front or the shell */
+#define IDLE_UP		0.75	/* idle0 -> idle1 (nominal): the front app, eco apps too */
+#define BOOST_UP	0.95	/* nominal -> big -> rapid: of one core, not eco apps */
 #define BOOST_DOWN	0.55
 #define BIG_SHARE	0.65
 
@@ -502,7 +501,7 @@ static bool boost_sample(void) {
 	static pid_t sampled_front;
 	long now = boost_ms();
 	if (!boost_live()) {
-		enum boost want = !screen_on ? NOMINAL : RAPID;
+		enum boost want = !screen_on ? IDLE0 : RAPID;
 		last_ms = 0;
 		if (want == boost) {
 			return false;
@@ -512,15 +511,21 @@ static bool boost_sample(void) {
 	}
 	long long front = front_pid > 0 ? cpu_ticks(front_pid) : -1;
 	long long shell = shell_pid > 0 ? cpu_ticks(shell_pid) : -1;
-	double used = 0;
+	double used = 0;		/* for big/rapid: the front app (unless eco) or the shell */
+	double used_any = 0;		/* for idle0 -> nominal: the front app, eco included */
 	if (last_ms && now > last_ms) {
 		double ticks_per_ms = sysconf(_SC_CLK_TCK) / 1000.0, span = (double)(now - last_ms) * ticks_per_ms;
-		if (front >= 0 && last_front >= 0 && sampled_front == front_pid &&
-				policy_of(front_pid) != POLICY_ECO) {
-			used = (double)(front - last_front) / span;	/* (an eco app's does not count) */
+		if (front >= 0 && last_front >= 0 && sampled_front == front_pid) {
+			double f = (double)(front - last_front) / span;
+			used_any = f;
+			if (policy_of(front_pid) != POLICY_ECO) {
+				used = f;	/* (an eco app's does not step past nominal) */
+			}
 		}
-		if (shell >= 0 && last_shell >= 0 && (double)(shell - last_shell) / span > used) {
-			used = (double)(shell - last_shell) / span;
+		if (shell >= 0 && last_shell >= 0) {
+			double sh = (double)(shell - last_shell) / span;
+			if (sh > used) { used = sh; }
+			if (sh > used_any) { used_any = sh; }
 		}
 	}
 	last_ms = now;
@@ -528,15 +533,17 @@ static bool boost_sample(void) {
 	last_shell = shell;
 	sampled_front = front_pid;
 
-	/* and now and then, that the limit is still in place */
+	/* now and then, re-apply if systemd has cleared the cpuset controller */
 	static int looks;
-	if (++looks % 40 == 0 && boost == NOMINAL && access("/sys/fs/cgroup/user.slice/cpuset.cpus", F_OK) != 0) {
-		cores_allowed("0-3");
+	if (++looks % 40 == 0 && access("/sys/fs/cgroup/user.slice/cpuset.cpus", F_OK) != 0) {
+		return true;
 	}
 	enum boost was = boost, top = profile == POWERSAVE ? BIG : RAPID;
 	static int pinned_looks;
-	if (used > BOOST_UP) {
-		/* pinned: one step up each look, so rapid comes only if big was not enough */
+	/* up a rung: idle0 -> nominal when the front app (eco too) passes IDLE_UP;
+	 * nominal -> big -> rapid when it (not eco) passes BOOST_UP. */
+	bool step_up = boost == IDLE0 ? used_any > IDLE_UP : used > BOOST_UP;
+	if (step_up) {
 		calm_since = 0;
 		if (boost < top) {
 			boost++;
@@ -547,18 +554,18 @@ static bool boost_sample(void) {
 	} else {
 		pinned_looks = 0;
 		boost_extreme = false;
-	}
-	if (used > BOOST_UP) {
-	} else if (used < BOOST_DOWN) {
-		/* easy for a while: one step down (two seconds, then three more) */
-		if (!calm_since) {
-			calm_since = now;
-		} else if (boost > NOMINAL && now - calm_since > (boost == RAPID ? 2000 : 3000)) {
-			boost--;
-			calm_since = now;
+		/* down a rung when it has been easy a while (idle0 is the floor) */
+		double u = boost == NOMINAL ? used_any : used;
+		if (u < BOOST_DOWN) {
+			if (!calm_since) {
+				calm_since = now;
+			} else if (boost > IDLE0 && now - calm_since > (boost == RAPID ? 2000 : 3000)) {
+				boost--;
+				calm_since = now;
+			}
+		} else {
+			calm_since = 0;
 		}
-	} else {
-		calm_since = 0;
 	}
 	if (boost < BIG && top >= BIG && policy_of(front_pid) == POLICY_BIG) {
 		boost = BIG;		/* it asked for the big cores while it is in front */
@@ -568,9 +575,9 @@ static bool boost_sample(void) {
 
 static void apply(void) {
 	bool low = !screen_on && deepsleep;
+	bool idle0 = boost == IDLE0;	/* the resting state, screen on or off */
 	char path[160];
 	long table[32];
-	bool idle0 = low && idle_mode == 0;
 	for (int c = 0; c < n_clusters; c++) {
 		bool big = c == n_clusters - 1 && n_clusters > 1;
 		snprintf(path, sizeof(path), CPUFREQ "/policy%d/scaling_available_frequencies", clusters[c]);
@@ -578,14 +585,15 @@ static void apply(void) {
 		if (n == 0) {
 			continue;
 		}
-		long max = low ? table[0] : profile == POWERSAVE ? capped(table, n, 0.65) : table[n - 1];
-		bool flat_out = (profile == PERFORMANCE || boost == RAPID) && !low;
-		if (idle0 && !big) {
-			/* idle 0: the two surviving cores run near 1.3 GHz (race to idle) */
-			max = nearest(table, n, IDLE_KHZ_TARGET);
-		} else if (!low && big && boost == NOMINAL) {
+		long max = profile == POWERSAVE ? capped(table, n, 0.65) : table[n - 1];
+		bool flat_out = (profile == PERFORMANCE || boost == RAPID) && !idle0;
+		if (idle0) {
+			/* the two live efficiency cores near 1.3 GHz; the big cluster, its
+			 * one parked core, at its lowest (race to idle) */
+			max = big ? table[0] : nearest(table, n, IDLE_KHZ_TARGET);
+		} else if (big && boost == NOMINAL) {
 			max = table[0];		/* the big cluster: nothing runs there, and slowly */
-		} else if (!low && big && boost == BIG) {
+		} else if (big && boost == BIG) {
 			max = capped(table, n, BIG_SHARE);
 		}
 		snprintf(path, sizeof(path), CPUFREQ "/policy%d/scaling_governor", clusters[c]);
@@ -599,19 +607,19 @@ static void apply(void) {
 	int n = points(GPU "/available_frequencies", table, 32);
 	if (n > 0) {
 		long top = table[n - 1];
-		long max = low ? table[0] : profile == POWERSAVE ? capped(table, n, 0.8) : top;
+		long max = idle0 ? table[0] : profile == POWERSAVE ? capped(table, n, 0.8) : top;
 		put(GPU "/governor", "simple_ondemand");
 		/* lower the floor before the ceiling, and raise them the other way */
 		put_long(GPU "/min_freq", table[0]);
 		put_long(GPU "/max_freq", max);
-		if (profile == PERFORMANCE && !low) {
+		if (profile == PERFORMANCE && !idle0) {
 			put_long(GPU "/min_freq", top);
 		}
 	}
 	/* Programs on the efficiency cores only, and the spare big cores off,
 	 * until something needs more; coming up, the cores first and then the
 	 * leave to use them. idle 0 goes further: only cpu0 and cpu1 stay online. */
-	bool few = boost == NOMINAL || low;
+	bool few = boost <= NOMINAL;	/* idle0 and nominal (idle1) are efficiency-only */
 	char eff_set[24], all_set[24];
 	int eff_last = cluster_cpus[0][0];
 	for (int i = 0; cluster_cpus[0][i] >= 0; i++) { eff_last = cluster_cpus[0][i]; }
@@ -655,7 +663,7 @@ static void status(void) {
 	if (f) {
 		fprintf(f, "profile=%s\ndeepsleep=%s\nscreen=%s\n", names[profile],
 			deepsleep ? "on" : "off", screen_on ? "on" : "off");
-		fprintf(f, "idle=%d\ncpus=%d\nclusters=%d\n", idle_mode, cpu_count, n_clusters);
+		fprintf(f, "cpus=%d\nclusters=%d\n", cpu_count, n_clusters);
 		fprintf(f, "condition=%s\nboost=%s\n", conditions[condition()], boost_names[boost]);
 		fprintf(f, "wifi=%s\n", wifi_asleep ? "sleeping" : "on");
 		for (int c = 0; c < 3; c++) {
@@ -673,7 +681,6 @@ static void save(void) {
 	FILE *f = fopen(STATE, "w");
 	if (f) {
 		fprintf(f, "profile %s\ndeepsleep %s\n", names[profile], deepsleep ? "on" : "off");
-		fprintf(f, "idle %d\n", idle_mode);
 		for (int c = 0; c < 3; c++) {
 			fprintf(f, "tickle %s %s\n", conditions[c], tickle_names[tickle_when[c]]);
 		}
@@ -738,10 +745,6 @@ static int command(char *line, bool persist) {
 		}
 	} else if (strcmp(what, "deepsleep") == 0) {
 		deepsleep = strcmp(value, "on") == 0;
-	} else if (strcmp(what, "idle") == 0) {
-		/* 0: two cores near 1.3 GHz (race to idle). 1: all efficiency cores,
-		 * lowest clock (the default). Only the screen-off deep-sleep state. */
-		idle_mode = atoi(value) == 0 ? 0 : 1;
 	} else if (strcmp(what, "screen") == 0) {
 		screen_on = strcmp(value, "off") != 0;
 		persist = false;
