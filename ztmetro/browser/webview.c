@@ -2,14 +2,13 @@
 /*
  * webview: WPE WebKit (the unified WPE Platform API, wpewebkit 2.54).
  *
- * The packaged WebKit is the new WPE Platform: no wpebackend-fdo. The web
- * engine runs on a headless WPEDisplay and loads pages fully (title, URL and
- * progress all work), which is what the chrome needs. Putting the page's
- * pixels on screen is a WPEView subclass that overrides render_buffer() to
- * import each frame's WPEBuffer as an EGL image
- * (wpe_buffer_import_to_egl_image) and draw it into a Wayland subsurface --
- * that compositing is the next iteration (see README.md). Until then the
- * content area is blank and the chrome is live.
+ * The packaged WebKit is the new WPE Platform: no wpebackend-fdo. The engine
+ * runs on a WPEDisplay of our own (below): a headless one inside for the GPU
+ * and buffer formats, with frames acked only once they are in one of our
+ * frames, and WebKit's clock on the panel's vblank. Each frame is a DMA-BUF
+ * that zmc draws as a GPU texture, without a copy. ZTB_HEADLESS=1 runs the
+ * plain headless platform instead; ZTB_TRACE=1 logs when frames reach the
+ * screen.
  */
 #define _GNU_SOURCE
 #include <math.h>
@@ -20,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wayland-client.h>
+#include <fcntl.h>
+#include <xf86drm.h>
 
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
@@ -40,6 +41,8 @@ struct webview {
 	cairo_surface_t *frame;	/* fallback only: the latest frame as pixels */
 	unsigned frame_rev;	/* bumped each frame so the GPU re-uploads */
 	void *image;		/* the latest frame as an imported GPU image (no copy) */
+	WPEBuffer *pending;	/* rendered by WebKit, not yet in one of our frames */
+	WPEBuffer *on_screen;	/* in our last frame: WebKit must not draw into it */
 	void *im;		/* ZtIm: the page's text fields */
 	bool logged;
 	struct wv_delegate d;
@@ -89,10 +92,10 @@ static void wait_rendered(WPEBuffer *buffer) {
 
 /* WebKit rendered a frame. Zero copy: a DMA-BUF frame is handed to the GPU as
  * a texture where it already lies; only if that fails is it copied out.
- * Runs on the main thread (the GLib pump below), same as everything else. */
-static void on_buffer(WPEView *view, WPEBuffer *buffer, gpointer u) {
-	(void)view;
-	struct webview *wv = u;
+ * Runs on the main thread (the GLib pump below), same as everything else.
+ * Returns true if the frame is drawn straight from the buffer, which then
+ * stays WebKit's to reuse only once a newer one has replaced it on screen. */
+static bool take_frame(struct webview *wv, WPEBuffer *buffer) {
 	if (!wv->logged) {
 		wv->logged = true;
 		fprintf(stderr, "ztbrowser: frames %dx%d, %s (view %dx%d points at scale %d)\n",
@@ -125,15 +128,14 @@ static void on_buffer(WPEView *view, WPEBuffer *buffer, gpointer u) {
 		if (im) {
 			wait_rendered(buffer);
 			wv->image = im->image;
-			zmc_present();		/* a new frame to put up */
-			return;
+			return true;	/* the caller puts it up (zmc_present) */
 		}
 	}
 	GError *err = NULL;
 	GBytes *px = wpe_buffer_import_to_pixels(buffer, &err);
 	if (!px) {
 		if (err) g_error_free(err);
-		return;
+		return false;
 	}
 	int w = wpe_buffer_get_width(buffer), h = wpe_buffer_get_height(buffer);
 	gsize n = 0;
@@ -154,6 +156,269 @@ static void on_buffer(WPEView *view, WPEBuffer *buffer, gpointer u) {
 		zmc_present();		/* a new frame to put up */
 	}
 	/* no g_bytes_unref: import_to_pixels is transfer-none, the buffer owns them */
+	return false;
+}
+
+/* ---- our own WPE platform: frames paced by the screen ----------------------
+ * The headless platform acks each frame on a timer of its own, out of step
+ * with the display: during a scroll frames came 6 ms apart and then 25, so
+ * about one in five was never seen and the page judders. This display and
+ * view are the headless ones (the GPU, DRM device and buffer formats are
+ * asked of a headless display inside) with one change: a frame is acked
+ * (wpe_view_buffer_rendered) only once it has gone into one of our frames,
+ * so WebKit renders one frame per frame shown, on our clock, and never one
+ * that would be thrown away. */
+
+typedef struct { WPEDisplay parent; WPEDisplay *inner; bool connected; } ZtDisplay;
+typedef struct { WPEDisplayClass parent; } ZtDisplayClass;
+typedef struct { WPEView parent; struct webview *wv; } ZtView;
+typedef struct { WPEViewClass parent; } ZtViewClass;
+typedef struct { WPEToplevel parent; } ZtToplevel;
+typedef struct { WPEToplevelClass parent; } ZtToplevelClass;
+typedef struct { WPEScreen parent; } ZtScreen;
+typedef struct { WPEScreenClass parent; } ZtScreenClass;
+
+typedef struct { WPEScreenSyncObserver parent; int fd; GThread *thread; gint running; } ZtSync;
+typedef struct { WPEScreenSyncObserverClass parent; } ZtSyncClass;
+
+G_DEFINE_TYPE(ZtSync, zt_sync, WPE_TYPE_SCREEN_SYNC_OBSERVER)
+G_DEFINE_TYPE(ZtScreen, zt_screen, WPE_TYPE_SCREEN)
+G_DEFINE_TYPE(ZtToplevel, zt_toplevel, WPE_TYPE_TOPLEVEL)
+G_DEFINE_TYPE(ZtView, zt_view, WPE_TYPE_VIEW)
+G_DEFINE_TYPE(ZtDisplay, zt_display, WPE_TYPE_DISPLAY)
+
+static WPEScreen *the_screen;	/* one phone, one panel */
+
+/* WebKit's clock for animation frames, scrolling and requestAnimationFrame.
+ * Left alone it is a free-running 60 Hz timer that drifts against the panel,
+ * so its frames beat with ours. This one ticks on the panel's own vblank,
+ * read from the display controller (exynos; panfrost has no vblank), which
+ * is the clock the shell flips on. */
+static gpointer sync_loop(gpointer p) {
+	ZtSync *s = p;
+	WPEScreenSyncObserverClass *c = WPE_SCREEN_SYNC_OBSERVER_GET_CLASS(s);
+	while (g_atomic_int_get(&s->running)) {
+		drmVBlank vb = { .request = { .type = DRM_VBLANK_RELATIVE, .sequence = 1 } };
+		if (drmWaitVBlank(s->fd, &vb) != 0) {
+			g_usleep(16667);	/* panel off: keep a slow beat */
+		}
+		if (g_atomic_int_get(&s->running)) {
+			c->sync(WPE_SCREEN_SYNC_OBSERVER(s));
+		}
+	}
+	return NULL;
+}
+static void sync_start(WPEScreenSyncObserver *o) {
+	ZtSync *s = (ZtSync *)o;
+	if (s->thread) return;
+	g_atomic_int_set(&s->running, 1);
+	s->thread = g_thread_new("ztb-vblank", sync_loop, s);
+}
+static void sync_stop(WPEScreenSyncObserver *o) {
+	ZtSync *s = (ZtSync *)o;
+	if (!s->thread) return;
+	g_atomic_int_set(&s->running, 0);
+	if (g_thread_self() == s->thread) {
+		g_thread_unref(s->thread);	/* stopped from its own tick: it ends itself */
+	} else {
+		g_thread_join(s->thread);
+	}
+	s->thread = NULL;
+}
+static void zt_sync_class_init(ZtSyncClass *k) {
+	WPEScreenSyncObserverClass *c = WPE_SCREEN_SYNC_OBSERVER_CLASS(k);
+	c->start = sync_start;
+	c->stop = sync_stop;
+}
+static void zt_sync_init(ZtSync *s) { s->fd = -1; }
+
+/* the display controller: the DRM card that has vblanks */
+static ZtSync *sync_new(void) {
+	for (int i = 0; i < 4; i++) {
+		char path[32];
+		snprintf(path, sizeof path, "/dev/dri/card%d", i);
+		int fd = open(path, O_RDWR | O_CLOEXEC);
+		if (fd < 0) continue;
+		drmVBlank vb = { .request = { .type = DRM_VBLANK_RELATIVE, .sequence = 0 } };
+		if (drmWaitVBlank(fd, &vb) == 0) {
+			ZtSync *s = g_object_new(zt_sync_get_type(), NULL);
+			s->fd = fd;
+			fprintf(stderr, "ztbrowser: WebKit's clock is %s vblank\n", path);
+			return s;
+		}
+		close(fd);
+	}
+	return NULL;
+}
+
+static ZtSync *the_sync;
+static WPEScreenSyncObserver *screen_sync(WPEScreen *screen) {
+	(void)screen;
+	return the_sync ? g_object_ref(WPE_SCREEN_SYNC_OBSERVER(the_sync)) : NULL;
+}
+static void zt_screen_class_init(ZtScreenClass *k) {
+	WPE_SCREEN_CLASS(k)->get_sync_observer = screen_sync;
+}
+static void zt_screen_init(ZtScreen *s) { (void)s; }
+
+static WPEScreen *top_get_screen(WPEToplevel *t) { (void)t; return the_screen; }
+static gboolean top_resize(WPEToplevel *t, int w, int h) {
+	wpe_toplevel_resized(t, w, h);
+	return TRUE;
+}
+static void zt_toplevel_class_init(ZtToplevelClass *k) {
+	WPEToplevelClass *c = WPE_TOPLEVEL_CLASS(k);
+	c->get_screen = top_get_screen;
+	c->resize = top_resize;
+}
+static void zt_toplevel_init(ZtToplevel *t) { (void)t; }
+
+static void glib_tick(void);
+
+/* the frame went into one of ours: the one before it is free again, and
+ * WebKit may start on the next */
+static void frame_shown(struct webview *wv) {
+	WPEBuffer *b = wv->pending;
+	wv->pending = NULL;
+	if (getenv("ZTB_TRACE")) {
+		static gint64 last;
+		gint64 now = g_get_monotonic_time();
+		fprintf(stderr, "ztb-shown %.1f\n", last ? (now - last) / 1000.0 : 0.0);
+		last = now;
+	}
+	if (wv->on_screen && wv->on_screen != b) {
+		wpe_view_buffer_released(wv->view, wv->on_screen);
+	}
+	wv->on_screen = b;
+	wpe_view_buffer_rendered(wv->view, b);
+	/* the ack is GLib work (a message to the web process) that nothing would
+	 * wake the pump for: run it straight after this frame, not inside it */
+	zmc_every(1, glib_tick);
+}
+
+static gboolean view_render_buffer(WPEView *view, WPEBuffer *buffer, const WPERectangle *damage,
+				   guint n_damage, GError **error) {
+	(void)damage; (void)n_damage; (void)error;
+	struct webview *wv = ((ZtView *)view)->wv;
+	if (!wv || !take_frame(wv, buffer)) {
+		/* no one to show it to, or copied out already: done with it now */
+		wpe_view_buffer_rendered(view, buffer);
+		wpe_view_buffer_released(view, buffer);
+		return TRUE;
+	}
+	if (wv->pending && wv->pending != buffer) {
+		/* overtaken before it was ever shown */
+		WPEBuffer *old = wv->pending;
+		wv->pending = NULL;
+		wpe_view_buffer_rendered(view, old);
+		if (old != wv->on_screen) wpe_view_buffer_released(view, old);
+	}
+	wv->pending = buffer;
+	zmc_present();	/* after pending is set: an idle zmc draws (and acks) at once */
+	return TRUE;
+}
+
+/* WebKit swapped its set of buffers (a resize): forget any that went */
+static void view_buffers_changed(WPEView *view, WPEBuffer **buffers, guint n) {
+	struct webview *wv = ((ZtView *)view)->wv;
+	if (!wv) return;
+	bool pending = false, on_screen = false;
+	for (guint i = 0; i < n; i++) {
+		pending |= buffers[i] == wv->pending;
+		on_screen |= buffers[i] == wv->on_screen;
+	}
+	if (!pending) wv->pending = NULL;
+	if (!on_screen) wv->on_screen = NULL;
+}
+
+static void zt_view_class_init(ZtViewClass *k) {
+	WPEViewClass *c = WPE_VIEW_CLASS(k);
+	c->render_buffer = view_render_buffer;
+	c->buffers_changed = view_buffers_changed;
+}
+static void zt_view_init(ZtView *v) { (void)v; }
+
+static gboolean dpy_connect(WPEDisplay *d, GError **error) {
+	ZtDisplay *z = (ZtDisplay *)d;
+	if (!z->connected) z->connected = wpe_display_connect(z->inner, error);
+	return z->connected;
+}
+static WPEToplevel *dpy_create_toplevel(WPEDisplay *d, guint max_views) {
+	return g_object_new(zt_toplevel_get_type(), "display", d, "max-views", max_views, NULL);
+}
+static WPEView *dpy_create_view(WPEDisplay *d) {
+	WPEView *view = g_object_new(zt_view_get_type(), "display", d, NULL);
+	if (!wpe_view_get_toplevel(view)) {
+		WPEToplevel *top = dpy_create_toplevel(d, 1);
+		wpe_view_set_toplevel(view, top);
+		g_object_unref(top);
+	}
+	return view;
+}
+static gpointer dpy_egl(WPEDisplay *d, GError **error) {
+	return wpe_display_get_egl_display(((ZtDisplay *)d)->inner, error);
+}
+static WPEKeymap *dpy_keymap(WPEDisplay *d) { return wpe_display_get_keymap(((ZtDisplay *)d)->inner); }
+static WPEBufferFormats *dpy_formats(WPEDisplay *d) {
+	return wpe_display_get_preferred_buffer_formats(((ZtDisplay *)d)->inner);
+}
+static WPEDRMDevice *dpy_drm(WPEDisplay *d) { return wpe_display_get_drm_device(((ZtDisplay *)d)->inner); }
+static guint dpy_n_screens(WPEDisplay *d) { (void)d; return 1; }
+static WPEScreen *dpy_screen(WPEDisplay *d, guint i) { (void)d; return i == 0 ? the_screen : NULL; }
+
+static void dpy_finalize(GObject *o) {
+	g_clear_object(&((ZtDisplay *)o)->inner);
+	G_OBJECT_CLASS(zt_display_parent_class)->finalize(o);
+}
+static void zt_display_class_init(ZtDisplayClass *k) {
+	WPEDisplayClass *c = WPE_DISPLAY_CLASS(k);
+	G_OBJECT_CLASS(k)->finalize = dpy_finalize;
+	c->connect = dpy_connect;
+	c->create_view = dpy_create_view;
+	c->create_toplevel = dpy_create_toplevel;
+	c->get_egl_display = dpy_egl;
+	c->get_keymap = dpy_keymap;
+	c->get_preferred_buffer_formats = dpy_formats;
+	c->get_drm_device = dpy_drm;
+	c->get_n_screens = dpy_n_screens;
+	c->get_screen = dpy_screen;
+}
+static void zt_display_init(ZtDisplay *z) { z->inner = wpe_display_headless_new(); }
+
+static WPEDisplay *paced_display_new(void) {
+	if (!the_screen) {
+		GObjectClass *sc = g_type_class_ref(zt_screen_get_type());
+		the_screen = g_object_class_find_property(sc, "id")
+			? g_object_new(zt_screen_get_type(), "id", 1, NULL)
+			: g_object_new(zt_screen_get_type(), NULL);
+		g_type_class_unref(sc);
+		wpe_screen_set_refresh_rate(the_screen, 60000);	/* mHz */
+		the_sync = sync_new();
+	}
+	ZtDisplay *z = g_object_new(zt_display_get_type(), NULL);
+	GError *err = NULL;
+	if (!z->inner || !wpe_display_connect(WPE_DISPLAY(z), &err)) {
+		fprintf(stderr, "ztbrowser: paced display failed (%s), using headless\n",
+			err ? err->message : "no display");
+		g_clear_error(&err);
+		g_object_unref(z);
+		return NULL;
+	}
+	return WPE_DISPLAY(z);
+}
+
+/* the headless platform's own view (fallback): it acks frames itself */
+static void on_buffer(WPEView *view, WPEBuffer *buffer, gpointer u) {
+	(void)view;
+	if (take_frame(u, buffer)) zmc_present();
+}
+
+/* headless only: when its frames reach one of ours (for ZTB_TRACE A/B) */
+static void trace_shown(void) {
+	static gint64 last;
+	gint64 now = g_get_monotonic_time();
+	fprintf(stderr, "ztb-shown %.1f\n", last ? (now - last) / 1000.0 : 0.0);
+	last = now;
 }
 
 /* ---- WebKit signals -> the chrome ----------------------------------------- */
@@ -204,7 +469,6 @@ static void tune(WebKitSettings *s) {
 	webkit_settings_set_enable_developer_extras(s, FALSE);
 	webkit_settings_set_enable_webgl(s, TRUE);
 	webkit_settings_set_enable_smooth_scrolling(s, TRUE);
-	webkit_settings_set_enable_offline_web_application_cache(s, TRUE);
 	webkit_settings_set_enable_html5_local_storage(s, TRUE);
 	webkit_settings_set_enable_html5_database(s, TRUE);
 	/* a phone user agent, so sites send their mobile pages */
@@ -285,7 +549,13 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 	wv->d = *delegate;
 	wv->scale = 1;
 
-	wv->wpe = wpe_display_headless_new();
+	wv->wpe = getenv("ZTB_HEADLESS") ? NULL : paced_display_new();	/* (A/B: the old path) */
+	if (wv->wpe) {
+		/* WebKit finds screens (and so the vblank clock) on the primary display */
+		wpe_display_set_primary(wv->wpe);
+	} else {
+		wv->wpe = wpe_display_headless_new();
+	}
 	if (!wv->wpe) {
 		free(wv);
 		return NULL;
@@ -301,7 +571,13 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 	g_object_unref(settings);
 	wv->view = webkit_web_view_get_wpe_view(wv->web);
 	if (wv->view) {
-		g_signal_connect(wv->view, "buffer-rendered", G_CALLBACK(on_buffer), wv);
+		if (G_TYPE_CHECK_INSTANCE_TYPE(wv->view, zt_view_get_type())) {
+			((ZtView *)wv->view)->wv = wv;
+		} else {
+			g_signal_connect(wv->view, "buffer-rendered", G_CALLBACK(on_buffer), wv);
+		}
+		fprintf(stderr, "ztbrowser: %s\n", G_TYPE_CHECK_INSTANCE_TYPE(wv->view, zt_view_get_type())
+			? "frames paced by our display" : "headless frames (timer paced)");
 		wpe_view_map(wv->view);
 		wpe_view_set_visible(wv->view, TRUE);
 		wpe_view_focus_in(wv->view);	/* input (clicks, keys) only reaches a focused view */
@@ -476,6 +752,14 @@ void webview_composite(struct webview *wv, int x, int y, int w, int h) {
 		zmc_gpu_dmabuf(wv->image, corners, 1.0);	/* straight from WebKit's buffer */
 	} else if (wv->frame) {
 		zmc_gpu_quad(wv->frame, wv->frame_rev, corners, 1.0);
+	}
+	if (wv->pending) {
+		frame_shown(wv);	/* on screen with this frame: WebKit may draw the next */
+	}
+	static void *last_image;
+	if (getenv("ZTB_TRACE") && getenv("ZTB_HEADLESS") && wv->image != last_image) {
+		last_image = wv->image;
+		trace_shown();
 	}
 }
 

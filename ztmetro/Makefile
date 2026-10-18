@@ -90,7 +90,7 @@ store/ztstore: $(STORE) $(wildcard store/*.h) $(CORE_DEPS)
 # ztBrowser: WPE WebKit on a Wayland subsurface, in the WP8.1 IE look
 # (see browser/README.md). Needs wpewebkit + wpebackend-fdo on the phone.
 BROWSER = browser/ztbrowser.c browser/webview.c
-BROWSER_PKGS = wpe-webkit-2.0 wpe-platform-2.0 wpe-platform-headless-2.0 glib-2.0 gobject-2.0
+BROWSER_PKGS = wpe-webkit-2.0 wpe-platform-2.0 wpe-platform-headless-2.0 glib-2.0 gobject-2.0 libdrm
 browser/ztbrowser: $(BROWSER) browser/webview.h $(CORE_DEPS)
 	$(APP_BUILD) $(shell pkg-config --cflags $(BROWSER_PKGS)) -o $@ $(BROWSER) $(CORE) $(APP_LIBS) \
 		$(shell pkg-config --libs $(BROWSER_PKGS))
