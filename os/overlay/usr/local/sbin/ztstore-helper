@@ -40,7 +40,7 @@ tell() {
 # it only through checks: never follow a link someone left there.
 req=/run/user/$uid/ztstore/request
 [ -f "$req" ] && [ ! -L "$req" ] && [ "$(stat -c %u "$req")" = "$uid" ] || fail "no request"
-id=$(sed -n '1s/^id \([0-9]\{1,12\}\)$/\1/p' "$req")
+id=$(sed -n '1s/^id \([0-9]\{1,18\}\)$/\1/p' "$req")
 [ -n "$id" ] || { id=0; fail "bad request"; }
 set -- $(sed -n '2p' "$req")
 what=${1:-}

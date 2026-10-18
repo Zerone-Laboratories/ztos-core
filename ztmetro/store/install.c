@@ -114,7 +114,10 @@ static bool request(const char *unit_kind, const char *line) {
 	snprintf(dir, sizeof(dir), "%s/ztstore", runtime);
 	mkdir(dir, 0700);
 	snprintf(path, sizeof(path), "%s/request", dir);
-	st.request_id = (long)time(NULL) * 1000 + (rand() % 1000);
+	/* at most 12 digits: ztstore-helper parses the id with [0-9]\{1,12\} and a
+	 * longer one would not match, so it would answer "bad request" and the app
+	 * would wait for a reply that never comes */
+	st.request_id = (long)(time(NULL) % 1000000000) * 1000 + (rand() % 1000);
 	int n = snprintf(text, sizeof(text), "id %ld\n%s\n", st.request_id, line);
 	unlink(path);	/* never write through a link left there */
 	if (n <= 0 || n >= (int)sizeof(text) || !write_atomic(path, text, n)) {
@@ -136,6 +139,11 @@ static bool request(const char *unit_kind, const char *line) {
 	st.started = false;
 	st.asked = time(NULL);
 	st.step = S_HELPER;
+	/* the admin service asks for the password on the shell's sheet; if the app
+	 * is in the background a word tells the person to come back to it */
+	if (!strcmp(unit_kind, "admin")) {
+		shell_ctl("notify App Store|Requires your attention|Enter your password to finish.");
+	}
 	return st.starter > 0;
 }
 
