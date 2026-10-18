@@ -2053,104 +2053,240 @@ static void config_keep(const char *key, int value) {
 }
 
 /*
- * The panel's brightness: set with brightnessctl, which writes the backlight
- * (s9p-panel, the AOR register) for us. The exact percentage goes to the
- * hardware; there is no software dimming when a backlight is present.
+ * The panel's brightness, by two means, chosen at startup:
  *
- * brightnessctl is run on a thread of its own so a frame is never blocked.
- * The thread writes the latest wanted level and waits for brightnessctl to
- * finish before the next, so a dragged slider or the light sensor's one per
- * cent at a time never has two writes racing the panel: the last value wins.
+ *  - On the Galaxy S9 (the s9p-panel: the AOR register, 0..572) the panel does
+ *    not take an arbitrary level on its own; brightnessctl's plain write does
+ *    not show. So it is driven at four levels only (20, 40, 70, 100 %, each the
+ *    ceiling of its band) with our own timed write, and the rest of the way
+ *    down to the exact brightness is made up by darkening the picture on the
+ *    GPU. A change within a band is all software: no hardware write, no race.
+ *    The write is made on a thread of its own (it waits for the panel to take a
+ *    frame), which tells the event loop through an eventfd when it has landed.
+ *
+ *  - On any other device brightnessctl sets the exact percentage straight on
+ *    the panel, run on the same thread, one call at a time (the last wins).
+ *
+ * Without a writable backlight at all, everything is done by darkening.
  */
+#define BL_SETTLE_MS	300
+#define BL_LAND_MS	20	/* the panel takes a level at its next frame */
+enum bl_mode { BL_NONE, BL_S9, BL_CTL };
+
 static struct {
 	pthread_mutex_t lock;
 	pthread_cond_t wake;
-	int want;		/* the next level to set, -1 none */
+	enum bl_mode mode;
+	int max;		/* raw (S9) */
+	int want_raw;		/* S9: the next level to write, -1 none */
+	int done_raw;		/* S9: the level last written */
+	int hw;			/* S9: percent the panel is at, as the picture knows */
+	int target;		/* percent wanted */
+	int want;		/* brightnessctl: the next percent to set, -1 none */
+	int fd;			/* S9 eventfd: a write has landed */
+	char path[128];
 	int usable;		/* -1 not looked yet, 0 no, 1 yes */
+	struct wl_event_source *settle, *land;
 	struct zt_server *server;
-} bl = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, -1, -1 };
+} bl = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, BL_NONE, -1, -1, -1, 100, 100, -1, -1, "", -1 };
 
 static void *bl_thread(void *data) {
 	for (;;) {
 		pthread_mutex_lock(&bl.lock);
-		while (bl.want < 0) {
+		while (bl.want_raw < 0 && bl.want < 0) {
 			pthread_cond_wait(&bl.wake, &bl.lock);
 		}
-		int percent = bl.want;
+		int raw = bl.want_raw, percent = bl.want;
+		bl.want_raw = -1;
 		bl.want = -1;
 		pthread_mutex_unlock(&bl.lock);
-		char arg[16];
-		snprintf(arg, sizeof(arg), "%d%%", percent);
-		pid_t child = fork();
-		if (child == 0) {
-			int null = open("/dev/null", O_RDWR);
-			if (null >= 0) {
-				dup2(null, 1);
-				dup2(null, 2);
+		if (raw >= 0) {	/* S9: write the panel ourselves */
+			int fd = open(bl.path, O_WRONLY | O_CLOEXEC);
+			if (fd >= 0) {
+				char text[16];
+				int n = snprintf(text, sizeof(text), "%d\n", raw);
+				if (write(fd, text, n) != n) {}
+				close(fd);
 			}
-			execlp("brightnessctl", "brightnessctl", "-c", "backlight", "set", arg, (char *)NULL);
-			_exit(127);
-		}
-		if (child > 0) {
-			/* SIGCHLD is ignored, so this blocks until brightnessctl is
-			 * done and then returns ECHILD: exactly the serialising we want */
-			while (waitpid(child, NULL, 0) >= 0) {}
+			pthread_mutex_lock(&bl.lock);
+			bl.done_raw = raw;
+			pthread_mutex_unlock(&bl.lock);
+			uint64_t one = 1;
+			if (write(bl.fd, &one, sizeof(one)) < 0) {}
+		} else if (percent >= 0) {	/* brightnessctl */
+			char arg[16];
+			snprintf(arg, sizeof(arg), "%d%%", percent);
+			pid_t child = fork();
+			if (child == 0) {
+				int null = open("/dev/null", O_RDWR);
+				if (null >= 0) {
+					dup2(null, 1);
+					dup2(null, 2);
+				}
+				execlp("brightnessctl", "brightnessctl", "-c", "backlight", "set", arg, (char *)NULL);
+				_exit(127);
+			}
+			if (child > 0) {
+				/* SIGCHLD is ignored, so this blocks until brightnessctl is
+				 * done and then returns ECHILD: exactly the serialising wanted */
+				while (waitpid(child, NULL, 0) >= 0) {}
+			}
 		}
 	}
 	return NULL;
+}
+
+/* The S9's four levels: each the ceiling of its band, so the darkening only
+ * ever makes the panel dimmer (it cannot brighten). */
+static int bl_band(int percent) {
+	if (percent > 70) return 100;
+	if (percent > 40) return 70;
+	if (percent > 20) return 40;
+	return 20;
+}
+
+static void bl_request(int percent) {
+	int raw = (int)lround((double)bl_band(percent) * bl.max / 100.0);
+	pthread_mutex_lock(&bl.lock);
+	bl.want_raw = raw < 1 ? 1 : raw;
+	pthread_cond_signal(&bl.wake);
+	pthread_mutex_unlock(&bl.lock);
+}
+
+/* the panel has had a frame to take the level: the darkening can go */
+static int bl_landed(void *data) {
+	pthread_mutex_lock(&bl.lock);
+	int raw = bl.done_raw;
+	pthread_mutex_unlock(&bl.lock);
+	bl.hw = (int)lround((double)raw * 100 / bl.max);
+	damage(bl.server);
+	return 0;
+}
+
+static int bl_written(int fd, uint32_t mask, void *data) {
+	uint64_t n;
+	if (read(fd, &n, sizeof(n)) < 0) {}
+	wl_event_source_timer_update(bl.land, BL_LAND_MS);
+	return 0;
+}
+
+static int bl_settled(void *data) {
+	if (bl_band(bl.target) != bl.hw) {
+		bl_request(bl.target);
+	}
+	return 0;
 }
 
 static bool backlight_usable(void) {
 	return bl.usable == 1;
 }
 
+static void backlight_start_thread(void) {
+	/* the thread takes no signals: SIGHUP (settings changed) is read by the
+	 * event loop through a signalfd, blocked only in the main thread; delivered
+	 * to this thread it would end the shell */
+	sigset_t all, old;
+	sigfillset(&all);
+	pthread_sigmask(SIG_BLOCK, &all, &old);
+	pthread_t thread;
+	if (pthread_create(&thread, NULL, bl_thread, NULL) == 0) {
+		pthread_detach(thread);
+		bl.usable = 1;
+	}
+	pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
 static void backlight_init(struct zt_server *server) {
 	glob_t g;
 	bl.usable = 0;
+	bl.mode = BL_NONE;
 	bl.server = server;
-	bool has_device = glob("/sys/class/backlight/*/brightness", 0, NULL, &g) == 0 && g.gl_pathc > 0;
+	bool has_device = false, is_s9 = false;
+	if (glob("/sys/class/backlight/*/brightness", 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+		has_device = true;
+		snprintf(bl.path, sizeof(bl.path), "%s", g.gl_pathv[0]);
+		is_s9 = strstr(bl.path, "s9p-panel") != NULL;
+	}
 	globfree(&g);
 	bool has_tool = access("/usr/bin/brightnessctl", X_OK) == 0 || access("/bin/brightnessctl", X_OK) == 0;
-	if (has_device && has_tool) {
-		/* the thread takes no signals: SIGHUP (settings changed) is read by
-		 * the event loop through a signalfd, blocked only in the main thread;
-		 * delivered to this thread it would end the shell */
-		sigset_t all, old;
-		sigfillset(&all);
-		pthread_sigmask(SIG_BLOCK, &all, &old);
-		pthread_t thread;
-		if (pthread_create(&thread, NULL, bl_thread, NULL) == 0) {
-			pthread_detach(thread);
-			bl.usable = 1;
+
+	if (is_s9) {
+		/* our own tuning: bands plus software darkening */
+		char max_path[160], text[16] = "", now[16] = "";
+		snprintf(max_path, sizeof(max_path), "%.*s/max_brightness",
+			(int)(strrchr(bl.path, '/') - bl.path), bl.path);
+		int fd = open(max_path, O_RDONLY | O_CLOEXEC);
+		if (fd >= 0) { if (read(fd, text, sizeof(text) - 1) < 0) {} close(fd); }
+		fd = open(bl.path, O_RDONLY | O_CLOEXEC);
+		if (fd >= 0) { if (read(fd, now, sizeof(now) - 1) < 0) {} close(fd); }
+		bl.max = atoi(text);
+		bl.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		if (access(bl.path, W_OK) != 0) {
+			wlr_log(WLR_ERROR, "%s is not writable by the shell (udev rule "
+				"90-zrn-backlight.rules?): dimming in software instead", bl.path);
+		} else if (bl.max > 0 && bl.fd >= 0) {
+			backlight_start_thread();
 		}
-		pthread_sigmask(SIG_SETMASK, &old, NULL);
+		if (bl.usable) {
+			bl.mode = BL_S9;
+			bl.hw = bl.target = (int)lround(atof(now) * 100 / bl.max);
+			wl_event_loop_add_fd(server->loop, bl.fd, WL_EVENT_READABLE, bl_written, NULL);
+			bl.settle = wl_event_loop_add_timer(server->loop, bl_settled, NULL);
+			bl.land = wl_event_loop_add_timer(server->loop, bl_landed, NULL);
+		}
+	} else if (has_device && has_tool) {
+		/* any other panel: brightnessctl sets the exact level */
+		backlight_start_thread();
+		if (bl.usable) {
+			bl.mode = BL_CTL;
+		}
 	}
 	if (!bl.usable) {
 		wlr_log(WLR_ERROR, "no usable backlight (%s%s): dimming the pixels instead, which "
 			"saves no power. Is the kernel built with kernel/s9p-decon-backlight.patch, "
-			"and is brightnessctl installed?",
+			"and (on other devices) is brightnessctl installed?",
 			has_device ? "" : "no device", has_tool ? "" : "no brightnessctl");
 	}
 }
 
-/* 1..100 %: set straight on the panel through brightnessctl. */
+/* 1..100 %. */
 static void backlight_set(int percent) {
 	if (!backlight_usable()) {
 		return;
 	}
 	if (percent < 1) percent = 1;
 	if (percent > 100) percent = 100;
-	pthread_mutex_lock(&bl.lock);
-	bl.want = percent;
-	pthread_cond_signal(&bl.wake);
-	pthread_mutex_unlock(&bl.lock);
+	bl.target = percent;
+	if (bl.mode == BL_S9) {
+		if (bl_band(percent) > bl.hw) {
+			bl_request(percent);	/* a higher band: only the panel can brighten */
+			wl_event_source_timer_update(bl.settle, 0);
+		} else if (bl_band(percent) < bl.hw) {
+			wl_event_source_timer_update(bl.settle, BL_SETTLE_MS);
+		}
+		/* same band: the darkening alone, no hardware write at all */
+	} else {	/* BL_CTL */
+		pthread_mutex_lock(&bl.lock);
+		bl.want = percent;
+		pthread_cond_signal(&bl.wake);
+		pthread_mutex_unlock(&bl.lock);
+	}
+	damage(bl.server);
 }
 
-/* With a backlight the panel does all the dimming, so nothing is taken from
- * the picture. Without one, the pixels are darkened (this saves no power). */
+/* How much of the picture to take away for the brightness wanted: all of it
+ * without a backlight; on the S9 what the panel's level is above the target
+ * (pixel values darkened by m give m^2.2 of the light); nothing with
+ * brightnessctl, which the panel itself has set to the exact level. */
 static float backlight_darkening(int percent) {
 	if (!backlight_usable()) {
 		return percent < 100 ? 0.85f * (100 - percent) / 100.0f : 0.0f;
+	}
+	if (bl.mode == BL_S9) {
+		if (bl.target >= bl.hw || bl.hw <= 0) {
+			return 0.0f;
+		}
+		return 1.0f - powf((float)bl.target / bl.hw, 1.0f / 2.2f);
 	}
 	return 0.0f;
 }
