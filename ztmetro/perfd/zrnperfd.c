@@ -19,8 +19,8 @@
  *				eco, its load never steps boost up (work it does
  *				not mind doing slowly: the efficiency cores are
  *				enough); big, the big cores stay open to it (a
- *				game, say), at no more than BIG_SHARE of their
- *				speed until it pins them too; normal, as any app.
+ *				game, say), at the big rung's ~2.3 GHz until it
+ *				pins them too; normal, as any app.
  *				Forgotten when that process ends.
  *	tickle battery|charging|saver none|nominal|moderate|high
  *				the tickle mode for each condition (see tickle.c):
@@ -38,22 +38,27 @@
  * on the app in front asks:
  *
  *	idle0	the resting state, only on the Start screen (nothing in front):
- *		only the first two efficiency cores online (the rest of that
- *		cluster offline), held near 1.3 GHz, the big cluster parked.
- *		Screen on or off. No light.
- *	nominal	an app is in front (idle0 is left as soon as one opens), or the
- *		front app (eco apps too) has used more than 25 % of a core: all
- *		the efficiency cores, at their full little speed. The floor while
- *		an app is in front. No light.
- *	idle2	more than 75 % (eco apps too): the efficiency cores to their top
- *		clock (performance), the big cluster still parked -- as fast as
- *		the little cores go before any big core is woken. No light.
- *	big	more than 95 % (not an eco app): the big cores open to it, at no
- *		more than 65 % of their top speed
- *	rapid	and still more than 95 %: both clusters at their fastest clock
+ *		cpu0-1 online, near 1.15 GHz; the big cluster's first core at
+ *		its lowest. Screen on or off. No light.
+ *	nominal	an app is in front: all four efficiency cores up to 1.5 GHz
+ *		(their efficient top), and the first big core up to ~1.07 GHz so a
+ *		thread that leans on it is not starved. The floor with an app in
+ *		front. No light.
+ *	interactive  the front app (not eco) above 50 % of a core for 1 s: a
+ *		second big core, the big cluster up to ~1.8 GHz -- the Mongoose
+ *		cores' efficient band. No light.
+ *	big	above 85 % for 1.5 s: all four big cores, up to ~2.3 GHz
+ *	rapid	above 95 % for 2 s (or an app that asks): everything at its top
+ *		clock, in bursts. The front light blinks.
  *
- * It steps down again when the load has been low for a while. In nominal,
- * and with the screen off, three of the four big cores are taken offline,
+ * Little cores beyond cpu1 are only parked on the Start screen: with an app
+ * open they stay online and the idle states take care of them, since a
+ * hotplug cycle costs more than it saves. A touch on the screen lifts the
+ * little cores' floor for 120 ms (touch boost), so a swipe never waits for
+ * the governor to notice it.
+ *
+ * It steps down again when the load has been under 40 % for 3 s (2 s from
+ * rapid). With the screen off, three of the four big cores are taken offline,
  * which powers them down, and brought back for big and rapid (about 90 ms
  * for the three). That needs zrn-hotplug.ko (power/hotplug): without it a
  * core taken offline on this kernel does not come back, so then none is
@@ -80,6 +85,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
+#include <linux/input.h>
+#include <sys/ioctl.h>
 #include <linux/netlink.h>
 #include <poll.h>
 #include <signal.h>
@@ -123,10 +130,15 @@ static int read_cpu_list(const char *path, int *out, int max) {
 	if (f && fgets(buf, sizeof(buf), f)) {
 		char *p = buf;
 		while (*p && n < max - 1) {
+			char *start = p;
 			int a = strtol(p, &p, 10), b = a;
+			if (p == start) {
+				break;	/* the newline (or anything not a number) ends it: it
+					 * used to loop on it and pad the list with cpu0s */
+			}
 			if (*p == '-') { b = strtol(p + 1, &p, 10); }
 			for (int c = a; c <= b && n < max - 1; c++) { out[n++] = c; }
-			while (*p == ',' || *p == ' ') { p++; }
+			while (*p == ',' || *p == ' ' || *p == '\t') { p++; }
 		}
 	}
 	if (f) { fclose(f); }
@@ -263,7 +275,8 @@ static int condition(void) {
 
 #define SHELL_NICE	-15	/* the compositor above everything but the kernel */
 #define FRONT_NICE	-8	/* the app in front, just under the shell */
-#define UI_UCLAMP	512	/* of 1024: half a big core */
+#define UI_UCLAMP	512	/* of 1024: half a big core (the shell) */
+#define FRONT_UCLAMP	384	/* the app in front: fast little cores first, big only if it needs */
 
 struct sched_attr_v1 {
 	uint32_t size, sched_policy;
@@ -396,19 +409,31 @@ static long capped(const long *table, int n, double share) {
 
 /* ---- dynamic boost ----------------------------------------------------------- */
 
-enum boost { IDLE0, NOMINAL, IDLE2, BIG, RAPID };
-static const char *const boost_names[] = { "idle0", "nominal", "idle2", "big", "rapid" };
+enum boost { IDLE0, NOMINAL, INTERACTIVE, BIG, RAPID };
+static const char *const boost_names[] = { "idle0", "nominal", "interactive", "big", "rapid" };
 static enum boost boost = IDLE0;	/* the resting state: two cores near 1.3 GHz */
 static bool boost_extreme;	/* rapid, and still pinned for a second */
 static bool led_lit;
 static long led_next;		/* when the light next changes; 0: not blinking */
 #define LED_WHITE	40	/* of 255, each of the three colours */
 #define BOOST_SAMPLE_MS	250
-#define IDLE_UP		0.25	/* idle0 -> idle1 (nominal): the front app, eco apps too */
-#define IDLE2_UP	0.75	/* idle1 (nominal) -> idle2: eco apps too, still eff-only */
-#define BOOST_UP	0.95	/* idle2 -> big -> rapid: of one core, not eco apps */
-#define BOOST_DOWN	0.55
-#define BIG_SHARE	0.65
+/* up a rung: above this share of one core, held this long (eco apps only
+ * ever reach nominal); down a rung: under BOOST_DOWN for 3 s (2 s from rapid) */
+#define IDLE_UP		0.25	/* idle0 -> nominal, at once (eco apps too) */
+#define INTERACTIVE_UP	0.50	/* nominal -> interactive */
+#define INTERACTIVE_MS	1000
+#define BIG_UP		0.85	/* interactive -> big */
+#define BIG_MS		1500
+#define RAPID_UP	0.95	/* big -> rapid */
+#define RAPID_MS	2000
+#define BOOST_DOWN	0.40
+/* the clocks of each rung (kHz; the nearest step of the table is used) */
+#define LITTLE_KHZ	1500000	/* the A55s' efficient top; rapid goes to their real top */
+#define BIG_NOMINAL_KHZ	1066000
+#define BIG_INTERACTIVE_KHZ 1794000	/* the Mongoose cores' efficient band ends here */
+#define BIG_BIG_KHZ	2327000
+#define TOUCH_BOOST_MS	120
+#define TOUCH_BOOST_KHZ	1500000
 
 /* Which cores ordinary programs may run on: every slice of the system, through
  * the cpuset controller. The kernel's own threads stay where they are. */
@@ -436,6 +461,32 @@ static void big_cores(bool on) {
 	const int *big = cluster_cpus[n_clusters - 1];
 	for (int i = 1; big[i] >= 0; i++) {
 		core_online(big[i], on);
+	}
+}
+
+/* How many of the big cluster's cores a rung wants (the first always stays) */
+static int big_count(void) {
+	if (n_clusters < 2) {
+		return 0;
+	}
+	int all = 0;
+	while (cluster_cpus[n_clusters - 1][all] >= 0) { all++; }
+	if (profile == PERFORMANCE && screen_on) { return all; }
+	switch (boost) {
+	case INTERACTIVE: return all < 2 ? all : 2;
+	case BIG: case RAPID: return all;
+	default: return 1;
+	}
+}
+
+/* the first `k` big cores online, the rest offline */
+static void big_online(int k) {
+	if (n_clusters < 2) {
+		return;
+	}
+	const int *big = cluster_cpus[n_clusters - 1];
+	for (int i = 1; big[i] >= 0; i++) {
+		core_online(big[i], i < k);
 	}
 }
 
@@ -490,6 +541,61 @@ static void led_white(bool on) {
 		put_long(path, on ? LED_WHITE : 0);
 	}
 	led_lit = on;
+}
+
+static long little_floor, little_ceiling;	/* policy0's lowest step and current max */
+static long touch_until;			/* touch boost on until then; 0: off */
+static long boost_ms(void);
+
+/* the touchscreen: the input device that reports multi-touch positions. Only
+ * read (never grabbed), so the compositor still gets every event. */
+static int touch_open(void) {
+	glob_t g;
+	int fd = -1;
+	if (glob("/dev/input/event*", 0, NULL, &g) == 0) {
+		for (size_t i = 0; i < g.gl_pathc && fd < 0; i++) {
+			int f = open(g.gl_pathv[i], O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+			if (f < 0) {
+				continue;
+			}
+			unsigned long abs[(ABS_MAX + 1) / (8 * sizeof(long)) + 1] = { 0 };
+			if (ioctl(f, EVIOCGBIT(EV_ABS, sizeof(abs)), abs) >= 0 &&
+					(abs[ABS_MT_POSITION_X / (8 * sizeof(long))] >> (ABS_MT_POSITION_X % (8 * sizeof(long)))) & 1) {
+				fd = f;
+				fprintf(stderr, "zrnperfd: touch boost from %s\n", g.gl_pathv[i]);
+			} else {
+				close(f);
+			}
+		}
+	}
+	globfree(&g);
+	return fd;
+}
+
+/* A finger came down: lift the little cores' floor for a moment, so the first
+ * frames of a swipe never wait for schedutil to notice the work. Only the
+ * floor moves (one write per touch-down), and never above the rung's ceiling. */
+static void touch_boost(void) {
+	if (!screen_on || profile == POWERSAVE || n_clusters < 1) {
+		return;
+	}
+	if (!touch_until) {
+		long want = TOUCH_BOOST_KHZ;
+		if (little_ceiling && want > little_ceiling) {
+			want = little_ceiling;
+		}
+		char path[96];
+		snprintf(path, sizeof(path), CPUFREQ "/policy%d/scaling_min_freq", clusters[0]);
+		put_long(path, want);
+	}
+	touch_until = boost_ms() + TOUCH_BOOST_MS;
+}
+
+static void touch_release(void) {
+	char path[96];
+	snprintf(path, sizeof(path), CPUFREQ "/policy%d/scaling_min_freq", clusters[0]);
+	put_long(path, little_floor);
+	touch_until = 0;
 }
 
 static void apply(void);
@@ -556,26 +662,34 @@ static bool boost_sample(void) {
 	 * front the floor is nominal (idle1). */
 	enum boost floor = front_pid > 0 ? NOMINAL : IDLE0;
 	static int pinned_looks;
-	/* up a rung: idle0 -> nominal at IDLE_UP, nominal -> idle2 at IDLE2_UP (both
-	 * the front app with eco apps too, still efficiency-only); idle2 -> big ->
-	 * rapid at BOOST_UP (not eco apps). */
-	bool step_up = boost <= NOMINAL
-		? used_any > (boost == IDLE0 ? IDLE_UP : IDLE2_UP)
-		: used > BOOST_UP;
+	static long above_since;
+	/* up a rung once the load has stayed over that rung's mark long enough:
+	 * idle0 -> nominal at once (eco apps too); then not eco apps only */
+	static const double up_at[] = { IDLE_UP, INTERACTIVE_UP, BIG_UP, RAPID_UP };
+	static const long up_hold[] = { 0, INTERACTIVE_MS, BIG_MS, RAPID_MS };
+	double u_up = boost == IDLE0 ? used_any : used;
+	bool step_up = boost < RAPID ? u_up > up_at[boost] : used > RAPID_UP;
 	if (step_up) {
 		calm_since = 0;
+		if (!above_since) {
+			above_since = now;
+		}
 		if (boost < top) {
-			boost++;
-			pinned_looks = 0;
+			if (now - above_since >= up_hold[boost]) {
+				boost++;
+				above_since = 0;
+				pinned_looks = 0;
+			}
 		} else if (boost == RAPID && ++pinned_looks >= 1000 / BOOST_SAMPLE_MS) {
 			boost_extreme = true;	/* flat out for a second and still not enough */
 		}
 	} else {
+		above_since = 0;
 		pinned_looks = 0;
 		boost_extreme = false;
 		/* down a rung when it has been easy a while (the floor is idle0 on the
 		 * Start screen, nominal with an app in front) */
-		double u = boost <= IDLE2 ? used_any : used;
+		double u = boost <= NOMINAL ? used_any : used;
 		if (u < BOOST_DOWN) {
 			if (!calm_since) {
 				calm_since = now;
@@ -608,28 +722,36 @@ static void apply(void) {
 		if (n == 0) {
 			continue;
 		}
-		long max = profile == POWERSAVE ? capped(table, n, 0.65) : table[n - 1];
-		/* idle2 runs the efficiency cores flat out (performance); the big
-		 * cluster stays parked there, so only its cores are held back */
-		bool eff_flat = boost == IDLE2 && !big;
-		bool flat_out = (profile == PERFORMANCE || boost == RAPID || eff_flat) && !idle0;
-		if (idle0) {
-			/* the two live efficiency cores near 1.3 GHz; the big cluster, its
-			 * one parked core, at its lowest (race to idle) */
+		/* each rung's ceiling: little cores at their efficient top until
+		 * rapid; the big cluster climbing 1.07 -> 1.8 -> 2.3 GHz -> top */
+		bool top_speed = (profile == PERFORMANCE && screen_on) || boost == RAPID;
+		long max;
+		if (top_speed) {
+			max = table[n - 1];
+		} else if (idle0) {
 			max = big ? table[0] : nearest(table, n, IDLE_KHZ_TARGET);
-		} else if (big && (boost == NOMINAL || boost == IDLE2)) {
-			max = table[0];		/* the big cluster: nothing runs there, and slowly */
-		} else if (big && boost == BIG) {
-			max = capped(table, n, BIG_SHARE);
+		} else if (!big) {
+			max = nearest(table, n, LITTLE_KHZ);
+		} else {
+			max = nearest(table, n, boost == BIG ? BIG_BIG_KHZ :
+				boost == INTERACTIVE ? BIG_INTERACTIVE_KHZ : BIG_NOMINAL_KHZ);
+		}
+		if (profile == POWERSAVE) {
+			long cap = capped(table, n, 0.65);
+			max = max > cap ? cap : max;
+		}
+		if (c == 0) {
+			little_floor = table[0];
+			little_ceiling = max;
 		}
 		snprintf(path, sizeof(path), CPUFREQ "/policy%d/scaling_governor", clusters[c]);
-		put(path, flat_out ? "performance" : "schedutil");
+		put(path, top_speed && !idle0 ? "performance" : "schedutil");
 		snprintf(path, sizeof(path), CPUFREQ "/policy%d/scaling_max_freq", clusters[c]);
 		put_long(path, max);
 	}
 	/* Every change of frequency stalls this SoC for about 3 ms while the PLL
-	 * relocks, so the governor is made to change its mind less often. */
-	put_long(CPUFREQ "/schedutil/rate_limit_us", profile == POWERSAVE ? 40000 : 20000);
+	 * relocks; 8 ms still lets the clock follow a swipe instead of trailing it */
+	put_long(CPUFREQ "/schedutil/rate_limit_us", profile == POWERSAVE ? 40000 : 8000);
 	int n = points(GPU "/available_frequencies", table, 32);
 	if (n > 0) {
 		long top = table[n - 1];
@@ -645,25 +767,25 @@ static void apply(void) {
 	/* Programs on the efficiency cores only, and the spare big cores off,
 	 * until something needs more; coming up, the cores first and then the
 	 * leave to use them. idle 0 goes further: only cpu0 and cpu1 stay online. */
-	bool few = boost <= IDLE2;	/* idle0, nominal (idle1) and idle2 are efficiency-only */
-	char eff_set[24], all_set[24];
+	/* which cores: coming up, the cores first and then the leave to use them;
+	 * going down, the leave first and then the cores */
+	int k = big_count();
+	char set[48];
 	int eff_last = cluster_cpus[0][0];
 	for (int i = 0; cluster_cpus[0][i] >= 0; i++) { eff_last = cluster_cpus[0][i]; }
-	snprintf(eff_set, sizeof(eff_set), "%d-%d", cluster_cpus[0][0], eff_last);
-	snprintf(all_set, sizeof(all_set), "0-%d", cpu_count - 1);
-	if (!few) {
-		big_cores(true);
-		idle_two_cores(false);
-	}
 	if (idle0) {
-		cores_allowed("0-1");
+		snprintf(set, sizeof(set), "%d-%d", cluster_cpus[0][0], cluster_cpus[0][1] >= 0 ?
+			cluster_cpus[0][1] : cluster_cpus[0][0]);
+	} else if (n_clusters > 1 && k > 0) {
+		const int *b = cluster_cpus[n_clusters - 1];
+		snprintf(set, sizeof(set), "%d-%d,%d-%d", cluster_cpus[0][0], eff_last, b[0], b[0] + k - 1);
 	} else {
-		cores_allowed(few ? eff_set : all_set);
+		snprintf(set, sizeof(set), "%d-%d", cluster_cpus[0][0], eff_last);
 	}
-	if (few) {
-		big_cores(false);
-		idle_two_cores(idle0);	/* only idle 0 parks cpu2+ of the efficiency cluster */
-	}
+	idle_two_cores(false);		/* bring up whatever the new rung needs */
+	big_online(k > 0 ? k : 1);
+	cores_allowed(set);
+	idle_two_cores(idle0);		/* only idle0 parks cpu2+ of the efficiency cluster */
 	/* the light: blinking while rapid boost is on (the loop does the blinking) */
 	bool blink = boost == RAPID && !low && profile != PERFORMANCE;
 	if (blink && !led_next) {
@@ -727,7 +849,7 @@ static int command(char *line, bool persist) {
 		}
 		front_pid = pid;
 		if (pid > 0 && pid != shell_pid) {
-			prioritise(pid, FRONT_NICE, UI_UCLAMP);
+			prioritise(pid, FRONT_NICE, FRONT_UCLAMP);
 		}
 		tickle_focus(pid, extra[0] ? extra : "?");
 		return 1;
@@ -872,11 +994,13 @@ int main(void) {
 		return 1;
 	}
 	int uev = uevents();
+	int touch = touch_open();
 	char pending[1024];
 	size_t pending_len = 0;
 	while (!stopping) {
-		struct pollfd fds[4] = { { .fd = ctl, .events = POLLIN }, { .fd = uev, .events = POLLIN } };
-		int n = 2 + tickle_pollfds(fds + 2, 2);
+		struct pollfd fds[5] = { { .fd = ctl, .events = POLLIN }, { .fd = uev, .events = POLLIN },
+			{ .fd = touch, .events = POLLIN } };
+		int n = 3 + tickle_pollfds(fds + 3, 2);
 		/* while the boost is watching, a look four times a second; asleep
 		 * and in the performance profile nothing wakes for it */
 		int wait = tickle_timeout();
@@ -905,10 +1029,36 @@ int main(void) {
 				wait = left < 1 ? 1 : (int)left;
 			}
 		}
+		if (touch_until) {
+			long left = touch_until - boost_ms();
+			if (wait < 0 || wait > left) {
+				wait = left < 1 ? 1 : (int)left;
+			}
+		}
 		if (poll(fds, n, wait) < 0 && errno != EINTR) {
 			break;
 		}
 		int changed = 0;
+		/* a finger came down: touch boost; its time up: the floor back down */
+		if (touch >= 0 && (fds[2].revents & POLLIN)) {
+			struct input_event ev[32];
+			ssize_t got;
+			bool down = false;
+			while ((got = read(touch, ev, sizeof(ev))) > 0) {
+				for (size_t i = 0; i < (size_t)got / sizeof(ev[0]); i++) {
+					if ((ev[i].type == EV_KEY && ev[i].code == BTN_TOUCH && ev[i].value == 1) ||
+							(ev[i].type == EV_ABS && ev[i].code == ABS_MT_TRACKING_ID && ev[i].value >= 0)) {
+						down = true;
+					}
+				}
+			}
+			if (down) {
+				touch_boost();
+			}
+		}
+		if (touch_until && boost_ms() >= touch_until) {
+			touch_release();
+		}
 		/* (the light wakes this loop more often than the load is looked at) */
 		static long sampled_at;
 		if (!led_next || boost_ms() - sampled_at >= BOOST_SAMPLE_MS) {
@@ -966,7 +1116,7 @@ int main(void) {
 				}
 			}
 		}
-		tickle_ready(fds + 2, n - 2);
+		tickle_ready(fds + 3, n - 3);
 		if (tickle_run() && !changed) {
 			changed = 1;	/* an app paused, resumed, or started playing */
 		}
@@ -981,6 +1131,9 @@ int main(void) {
 	led_white(false);
 	if (wifi_asleep) {
 		wifi_radio(true);	/* nothing is left switched off behind us */
+	}
+	if (touch_until) {
+		touch_release();
 	}
 	big_cores(true);	/* nothing is left switched off behind us */
 	cores_allowed("0-7");
