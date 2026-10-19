@@ -2357,7 +2357,11 @@ static void load_config(struct zt_server *server) {
 	const char *home = getenv("HOME");
 	snprintf(path, sizeof(path), "%s/.config/ztmetro/config", home ? home : "");
 	server->accent = 0x0050ef;	/* cobalt */
-	server->start_wall_path[0] = server->lock_wall_path[0] = 0;
+	/* the Lumia Cyan photos, until a choice is saved (an empty one is "none") */
+	snprintf(server->start_wall_path, sizeof(server->start_wall_path),
+		"%s", "/usr/local/share/backgrounds/ztos/Lumia Cyan/Background_01.jpg");
+	snprintf(server->lock_wall_path, sizeof(server->lock_wall_path),
+		"%s", "/usr/local/share/backgrounds/ztos/Lumia Cyan lock screens/Wallpaper_01.jpg");
 	server->haptics_enabled = true;
 	server->haptic_strength = 80;
 	for (int i = 0; i < 8; i++) {

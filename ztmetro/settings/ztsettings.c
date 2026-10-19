@@ -61,6 +61,7 @@ enum page {
 	PAGE_DATE,
 	PAGE_BLUETOOTH,
 	PAGE_ACCENTS,	/* the accent picker, full screen */
+	PAGE_WALLS,	/* the background photo picker: categories, then one */
 };
 
 enum action {
@@ -71,6 +72,7 @@ enum action {
 	ACT_ACCENT,
 	ACT_WALL,		/* arg: 0 none, else the photo walls[arg - 1] */
 	ACT_WALL_TARGET,	/* arg: 0 start and lock, 1 start, 2 lock */
+	ACT_WALL_CAT,		/* arg: the category to open (a folder of photos) */
 	ACT_BT_POWER,
 	ACT_BT_DEVICE,		/* arg: which device: pair, connect or disconnect it */
 	ACT_BT_FORGET,		/* arg: which device */
@@ -225,6 +227,10 @@ static struct {
 	int haptic_group[N_HAPTIC_GROUPS];	/* percent of the strength; 0 off */
 	int quick[8];		/* indexes into QUICK_IDS */
 } app = {
+	/* the Lumia Cyan photos, until a choice is saved (an empty choice is
+	 * "none" and is saved as such) */
+	.start_wall = "/usr/local/share/backgrounds/ztos/Lumia Cyan/Background_01.jpg",
+	.lock_wall = "/usr/local/share/backgrounds/ztos/Lumia Cyan lock screens/Wallpaper_01.jpg",
 	.haptic_strength = 80,
 	.haptic_group = { 100, 100, 100, 100, 100, 100 },
 	.quick = { 0, 1, 2, 3, 4, 5, 7, 8 },
@@ -882,10 +888,23 @@ static double draw_apps(cairo_t *cr) {
 
 /* ---- wallpapers: the photos to choose from ---------------------------------- */
 
-#define MAX_WALLS 30
-static char walls[MAX_WALLS][256];
+/* The photos ship in /usr/local/share/backgrounds/ztos, one folder per
+ * series (Lumia 1020, Lumia 1520, ..., "Your photos" is ~/Pictures). Each
+ * shipped photo has a small cover-cropped copy in .thumbs/<folder>/ made
+ * when the set is installed, so the picker never decodes a full photo to
+ * draw a tile. */
+#define WALL_ROOT	"/usr/local/share/backgrounds/ztos"
+#define MAX_WALLS	400
+#define MAX_CATS	16
+static char walls[MAX_WALLS][256];	/* every photo, grouped by category */
+static char wall_thumb_path[MAX_WALLS][256];	/* its shipped thumb, or "" */
+static int wall_cat[MAX_WALLS];		/* its category index */
 static cairo_surface_t *wall_thumbs[MAX_WALLS];
+static char cat_name[MAX_CATS][64];
+static int cat_first[MAX_CATS], cat_count[MAX_CATS];	/* walls[cat_first..+count) */
 static int n_walls = -1;	/* -1: not looked for yet */
+static int n_cats;
+static int wall_cat_open = -1;	/* the category on the picker's page; -1: the categories */
 
 /* A photo scaled to cover pw x ph pixels, cropped about its middle. */
 static cairo_surface_t *thumb_cover(const char *path, int pw, int ph) {
@@ -919,33 +938,124 @@ static cairo_surface_t *thumb_cover(const char *path, int pw, int ph) {
 	return out;
 }
 
-/* Photos in ~/Pictures, ~/Pictures/Wallpapers and the system's backgrounds. */
+static int cmp_name(const void *a, const void *b) {
+	return strcasecmp(a, b);
+}
+
+/* the image files in dir, sorted, into names; how many */
+static int list_photos(const char *dir, char names[][256], int max) {
+	DIR *d = opendir(dir);
+	struct dirent *e;
+	int n = 0;
+	while (d && (e = readdir(d)) && n < max) {
+		const char *dot = strrchr(e->d_name, '.');
+		if (!dot || (strcasecmp(dot, ".jpg") && strcasecmp(dot, ".jpeg") &&
+				strcasecmp(dot, ".png") && strcasecmp(dot, ".webp"))) continue;
+		snprintf(names[n++], 256, "%s", e->d_name);
+	}
+	if (d) closedir(d);
+	qsort(names, n, 256, cmp_name);
+	return n;
+}
+
+static void walls_add(int cat, const char *dir, const char *file, const char *thumb_dir) {
+	if (n_walls >= MAX_WALLS) return;
+	int k = n_walls++;
+	snprintf(walls[k], sizeof(walls[k]), "%s/%s", dir, file);
+	wall_cat[k] = cat;
+	wall_thumb_path[k][0] = 0;
+	if (thumb_dir) {
+		char thumb[300];
+		snprintf(thumb, sizeof(thumb), "%s/%s.jpg", thumb_dir, file);	/* the whole name */
+		if (access(thumb, R_OK) == 0) snprintf(wall_thumb_path[k], sizeof(wall_thumb_path[k]), "%s", thumb);
+	}
+	cat_count[cat]++;
+}
+
 static void walls_scan(void) {
-	char dirs[3][300];
+	static char folders[MAX_CATS][256], photos[MAX_WALLS][256];
 	const char *home = getenv("HOME");
-	snprintf(dirs[0], sizeof(dirs[0]), "%s/Pictures", home ? home : "");
-	snprintf(dirs[1], sizeof(dirs[1]), "%s/Pictures/Wallpapers", home ? home : "");
-	snprintf(dirs[2], sizeof(dirs[2]), "/usr/local/share/backgrounds/ztos");
-	n_walls = 0;
-	for (int d = 0; d < 3; d++) {
-		DIR *dir = opendir(dirs[d]);
-		struct dirent *e;
-		while (dir && (e = readdir(dir)) && n_walls < MAX_WALLS) {
-			const char *dot = strrchr(e->d_name, '.');
-			if (!dot || (strcasecmp(dot, ".jpg") && strcasecmp(dot, ".jpeg") &&
-					strcasecmp(dot, ".png") && strcasecmp(dot, ".webp"))) continue;
-			snprintf(walls[n_walls++], sizeof(walls[0]), "%s/%s", dirs[d], e->d_name);
+	n_walls = n_cats = 0;
+	/* the shipped series: one category per folder, in name order */
+	DIR *top = opendir(WALL_ROOT);
+	struct dirent *e;
+	int nd = 0;
+	while (top && (e = readdir(top)) && nd < MAX_CATS) {
+		if (e->d_name[0] == '.') continue;
+		char path[300];
+		snprintf(path, sizeof(path), "%s/%s", WALL_ROOT, e->d_name);
+		struct stat st;
+		if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) snprintf(folders[nd++], 256, "%s", e->d_name);
+	}
+	if (top) closedir(top);
+	qsort(folders, nd, 256, cmp_name);
+	for (int c = 0; c < nd; c++) {
+		char dir[300], thumbs[300];
+		snprintf(dir, sizeof(dir), "%s/%s", WALL_ROOT, folders[c]);
+		snprintf(thumbs, sizeof(thumbs), "%s/.thumbs/%s", WALL_ROOT, folders[c]);
+		int np = list_photos(dir, photos, MAX_WALLS);
+		if (np == 0) continue;
+		int cat = n_cats++;
+		snprintf(cat_name[cat], sizeof(cat_name[cat]), "%s", folders[c]);
+		cat_first[cat] = n_walls;
+		cat_count[cat] = 0;
+		for (int j = 0; j < np; j++) walls_add(cat, dir, photos[j], thumbs);
+	}
+	/* the user's own photos, last */
+	if (n_cats < MAX_CATS) {
+		char pics[300], wallsdir[300];
+		snprintf(pics, sizeof(pics), "%s/Pictures", home ? home : "");
+		snprintf(wallsdir, sizeof(wallsdir), "%s/Pictures/Wallpapers", home ? home : "");
+		static char mine[MAX_WALLS][256];
+		int cat = n_cats, total = 0;
+		cat_first[cat] = n_walls;
+		cat_count[cat] = 0;
+		for (int d = 0; d < 2; d++) {
+			const char *dir = d ? wallsdir : pics;
+			int np = list_photos(dir, mine, MAX_WALLS - total);
+			for (int j = 0; j < np && n_walls < MAX_WALLS; j++) {
+				walls_add(cat, dir, mine[j], NULL);
+				total++;
+			}
 		}
-		if (dir) closedir(dir);
+		if (cat_count[cat] > 0) {
+			snprintf(cat_name[cat], sizeof(cat_name[cat]), "Your photos");
+			n_cats++;
+		}
 	}
 }
 
-static double draw_walls(cairo_t *cr, double y) {
+/* a photo's picker thumbnail, made once: the shipped thumb if it has one */
+static cairo_surface_t *wall_thumb(int k, int pw, int ph) {
+	if (!wall_thumbs[k]) {
+		const char *path = wall_thumb_path[k][0] ? wall_thumb_path[k] : walls[k];
+		wall_thumbs[k] = thumb_cover(path, pw, ph);
+	}
+	return wall_thumbs[k];
+}
+
+/* a thumbnail covering a w x h box at (x, y), its image as drawn */
+static void draw_wall_tile(cairo_t *cr, cairo_surface_t *img, double x, double y, double w, double h) {
+	if (!img) {
+		cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
+		cairo_rectangle(cr, x, y, w, h);
+		cairo_fill(cr);
+		return;
+	}
+	cairo_save(cr);
+	cairo_rectangle(cr, x, y, w, h);
+	cairo_clip(cr);
+	cairo_translate(cr, x, y);
+	cairo_scale(cr, w / cairo_image_surface_get_width(img), h / cairo_image_surface_get_height(img));
+	cairo_set_source_surface(cr, img, 0, 0);
+	cairo_paint(cr);
+	cairo_restore(cr);
+}
+
+/* the picker's first row: what Start and the lock screen take the photo for */
+static double draw_wall_targets(cairo_t *cr, double y) {
 	static const char *targets[] = { "start + lock", "start", "lock screen" };
 	double gap = 8;
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, "Background photo", FONT_REGULAR, 13.5, MARGIN, y, 0);
-	y += 24;
 	double btn_w = (zmc.width - 2 * MARGIN - 2 * gap) / 3.0;
 	for (int i = 0; i < 3; i++) {
 		double bx = MARGIN + i * (btn_w + gap);
@@ -957,12 +1067,38 @@ static double draw_walls(cairo_t *cr, double y) {
 		zmc_text(cr, targets[i], FONT_REGULAR, 13, bx + 10, y + 9, 0);
 		zmc_add_hit(bx, y, btn_w, 36, ACT_WALL_TARGET, i);
 	}
-	y += 36 + 12;
-	if (n_walls < 0) walls_scan();
+	return y + 36 + 16;
+}
+
+/* the categories, two across, each with its first photo and how many */
+static double draw_wall_categories(cairo_t *cr, double y) {
+	double gap = 10;
+	double tw = (zmc.width - 2 * MARGIN - gap) / 2.0, th = tw * 0.62;
+	for (int c = 0; c < n_cats; c++) {
+		double x = MARGIN + (c % 2) * (tw + gap), ty = y + (c / 2) * (th + gap);
+		int first = cat_first[c];
+		draw_wall_tile(cr, wall_thumb(first, (int)(tw * 2), (int)(th * 2)), x, ty, tw, th);
+		cairo_set_source_rgba(cr, 0, 0, 0, 0.45);
+		cairo_rectangle(cr, x, ty + th - 46, tw, 46);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, cat_name[c], FONT_SEMILIGHT, 15, x + 8, ty + th - 40, tw - 16);
+		char n[24];
+		snprintf(n, sizeof(n), "%d", cat_count[c]);
+		zmc_text(cr, n, FONT_REGULAR, 12, x + 8, ty + th - 20, tw - 16);
+		zmc_add_hit(x, ty, tw, th, ACT_WALL_CAT, c);
+	}
+	return y + ((n_cats + 1) / 2) * (th + gap);
+}
+
+/* one category's photos, three across, "none" first */
+static double draw_wall_grid(cairo_t *cr, double y) {
+	double gap = 8;
 	const char *current = app.wall_target == 2 ? app.lock_wall : app.start_wall;
-	/* three across, the screen's own shape; "none" first */
 	double tw = (zmc.width - 2 * MARGIN - 2 * gap) / 3.0, th = tw * 16.0 / 9.0;
-	for (int i = 0; i <= n_walls; i++) {
+	int c = wall_cat_open;
+	int count = cat_count[c];
+	for (int i = 0; i <= count; i++) {
 		double x = MARGIN + (i % 3) * (tw + gap), ty = y + (i / 3) * (th + gap);
 		bool chosen;
 		if (i == 0) {
@@ -972,24 +1108,12 @@ static double draw_walls(cairo_t *cr, double y) {
 			cairo_set_source_rgb(cr, 0.75, 0.75, 0.75);
 			zmc_text(cr, "none", FONT_SEMILIGHT, 18, x + 10, ty + th - 32, 0);
 			chosen = !current[0];
+			zmc_add_hit(x, ty, tw, th, ACT_WALL, 0);
 		} else {
-			int k = i - 1;
-			if (!wall_thumbs[k]) wall_thumbs[k] = thumb_cover(walls[k], (int)(tw * 2), (int)(th * 2));
-			if (wall_thumbs[k]) {
-				cairo_save(cr);
-				cairo_rectangle(cr, x, ty, tw, th);
-				cairo_clip(cr);
-				cairo_translate(cr, x, ty);
-				cairo_scale(cr, 0.5, 0.5);
-				cairo_set_source_surface(cr, wall_thumbs[k], 0, 0);
-				cairo_paint(cr);
-				cairo_restore(cr);
-			} else {
-				cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
-				cairo_rectangle(cr, x, ty, tw, th);
-				cairo_fill(cr);
-			}
+			int k = cat_first[c] + i - 1;
+			draw_wall_tile(cr, wall_thumb(k, (int)(tw * 2), (int)(th * 2)), x, ty, tw, th);
 			chosen = strcmp(current, walls[k]) == 0;
+			zmc_add_hit(x, ty, tw, th, ACT_WALL, k + 1);
 		}
 		if (chosen) {
 			zmc_set_rgb(cr, ACCENTS[app.accent].color);
@@ -997,15 +1121,36 @@ static double draw_walls(cairo_t *cr, double y) {
 			cairo_rectangle(cr, x + 2, ty + 2, tw - 4, th - 4);
 			cairo_stroke(cr);
 		}
-		zmc_add_hit(x, ty, tw, th, ACT_WALL, i);
 	}
-	y += ((n_walls + 1 + 2) / 3) * (th + gap);
-	if (n_walls == 0) {
-		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		zmc_text(cr, "No photos in Pictures.", FONT_REGULAR, 13, MARGIN, y, 0);
-		y += 24;
+	return y + ((count + 1 + 2) / 3) * (th + gap);
+}
+
+/* the whole picker page: targets, then the categories or one of them */
+static double draw_wallpapers(cairo_t *cr) {
+	if (n_walls < 0) walls_scan();
+	double y = zmc_header(cr, wall_cat_open >= 0 ? cat_name[wall_cat_open] : "background");
+	y = draw_wall_targets(cr, y);
+	if (wall_cat_open < 0) {
+		y = draw_wall_categories(cr, y);
+		if (n_cats == 0) {
+			cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+			zmc_text(cr, "No photos found.", FONT_REGULAR, 13, MARGIN, y, 0);
+			y += 24;
+		}
+	} else {
+		y = draw_wall_grid(cr, y);
 	}
-	return y;
+	return y + 24;
+}
+
+/* the theme page's row: the photo it has now, opening the picker */
+static double draw_wall_row(cairo_t *cr, double y) {
+	if (n_walls < 0) walls_scan();
+	const char *current = app.start_wall[0] ? app.start_wall : "none";
+	const char *slash = strrchr(current, '/');
+	char detail[96];
+	snprintf(detail, sizeof(detail), "%s", slash ? slash + 1 : current);
+	return zmc_entry(cr, y, "background photo", detail, ACT_OPEN_PAGE, PAGE_WALLS) + 24;
 }
 
 /* The accent picker, as the phone's: four swatches a row, each row a strip
@@ -1078,7 +1223,7 @@ static double draw_theme(cairo_t *cr) {
 		zmc_text(cr, label, FONT_REGULAR, 13, bx + 10, y + 9, 0);
 		zmc_add_hit(bx, y, btn_w, 36, ACT_COLUMNS, c);
 	}
-	return draw_walls(cr, y + 60) + 24;
+	return draw_wall_row(cr, y + 60);	/* under the columns row (36 high, 24 below) */
 }
 
 /* The brightness as it is now, in percent (the shell or sensord may have
@@ -2094,6 +2239,7 @@ static double render_page_content(cairo_t *cr, int p) {
 	case PAGE_APPS: return draw_apps(cr);
 	case PAGE_THEME: return draw_theme(cr);
 	case PAGE_ACCENTS: return draw_accents(cr);
+	case PAGE_WALLS: return draw_wallpapers(cr);
 	case PAGE_DISPLAY: return draw_display(cr);
 	case PAGE_WIFI: return draw_wifi(cr);
 	case PAGE_BLUETOOTH: return draw_bluetooth(cr);
@@ -2194,6 +2340,9 @@ static void activate(int action, int arg) {
 		if (arg == PAGE_MAIN || arg == PAGE_APPS) {
 			hub_tab = arg;	/* where back returns to from a page under it */
 		}
+		if (arg == PAGE_WALLS) {
+			wall_cat_open = -1;	/* opens on the categories */
+		}
 		zmc_go(arg, 1);
 		break;
 	case ACT_ACCENT:
@@ -2205,6 +2354,10 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_WALL_TARGET:
 		app.wall_target = arg;
+		break;
+	case ACT_WALL_CAT:
+		wall_cat_open = arg;
+		zmc_redraw();
 		break;
 	case ACT_WALL: {
 		const char *path = arg > 0 && arg <= n_walls ? walls[arg - 1] : "";
@@ -2743,6 +2896,15 @@ static bool back(void) {
 		zmc_go(PAGE_THEME, -1);	/* the picker is under the theme page */
 		return true;
 	}
+	if (zmc.page == PAGE_WALLS) {
+		if (wall_cat_open >= 0) {	/* a category: back to the categories */
+			wall_cat_open = -1;
+			zmc_redraw();
+			return true;
+		}
+		zmc_go(PAGE_THEME, -1);
+		return true;
+	}
 	if (zmc.page == PAGE_DATE) { date_focus = -1; zmc_keyboard(false); }
 	if (zmc.page == PAGE_APN) {
 		apn_focus = -1;
@@ -2810,7 +2972,7 @@ static const struct zmc_app settings = {
  * That is how the look is checked without opening the app on the phone. */
 /* Pages by name: --render PAGE, and `ztsettings PAGE` (Hyperscan opens one). */
 static const struct { const char *name; enum page page; } pages[] = {
-	{ "date", PAGE_DATE }, { "main", PAGE_MAIN }, { "apps", PAGE_APPS }, { "theme", PAGE_THEME }, { "accents", PAGE_ACCENTS }, { "display", PAGE_DISPLAY },
+	{ "date", PAGE_DATE }, { "main", PAGE_MAIN }, { "apps", PAGE_APPS }, { "theme", PAGE_THEME }, { "accents", PAGE_ACCENTS }, { "wallpapers", PAGE_WALLS }, { "display", PAGE_DISPLAY },
 	{ "wifi", PAGE_WIFI }, { "bluetooth", PAGE_BLUETOOTH }, { "mobile", PAGE_MOBILE }, { "audio", PAGE_AUDIO },
 	{ "battery", PAGE_BATTERY }, { "cpu", PAGE_CPU }, { "vm", PAGE_VM },
 	{ "gpu", PAGE_GPU }, { "keyboard", PAGE_KEYBOARD }, { "about", PAGE_ABOUT },
