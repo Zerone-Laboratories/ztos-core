@@ -1309,8 +1309,6 @@ static void present_gpu(uint32_t ms) {
 		double from = HEADER_H + (off > 0 ? off : 0);
 		gpu_surface_rect(zmc.cache, 0, from*s, zmc.width*s, (from+zmc.height-top)*s,
 			0, top, zmc.width, zmc.height, 1);
-		gpu_surface_rect(zmc.cache, 0, 0, zmc.width*s, HEADER_H*s,
-			0, 0, zmc.width, HEADER_H, 1);
 		draw_press(NULL, zmc.scale);
 		if (slider_live >= 0 && zmc.sliding) {
 			draw_slider_live(s);
@@ -1318,6 +1316,9 @@ static void present_gpu(uint32_t ms) {
 		if (zmc.app->overlay && !zmc.slide_active && !zmc.swiping && !zmc.spring) {
 			zmc.app->overlay(zmc.page);
 		}
+		/* the title last: an overlay scrolling under it goes under it */
+		gpu_surface_rect(zmc.cache, 0, 0, zmc.width*s, HEADER_H*s,
+			0, 0, zmc.width, HEADER_H, 1);
 	}
 	if (zmc.busy && !zmc.anim_active) {
 		uint32_t t = (now_ms() - zmc.busy_since) % 2600;

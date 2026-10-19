@@ -1045,6 +1045,7 @@ static bool wall_ticking;
 static uint32_t wall_busy_until;		/* a photo still swivelling in */
 static uint32_t wall_leave_at;			/* 0: not leaving */
 static double wall_grid_top;			/* the page y of the grid's first row */
+static uint32_t wall_open_at;			/* when the category's cells start to swivel in */
 
 static void wall_tick(void);
 
@@ -1127,36 +1128,53 @@ static void wall_card(cairo_surface_t *img, unsigned rev, double x, double y, do
 	zmc_gpu_quad(img, rev, c, alpha);
 }
 
-/* the grid's photos, on the GPU over the page: each swivels in when it has
- * arrived, and all swivel out when the category is leaving */
+/* the grid's cells and photos, on the GPU over the page. A cell is a grey
+ * quad that swivels in when the category opens (in order, from the first);
+ * its photo swivels in over it when made. Leaving, the photos and the cells
+ * swivel out together, then the page turns back. */
+static cairo_surface_t *wall_grey;
+
 static void wall_overlay(int page) {
 	if (page != PAGE_WALLS || wall_cat_open < 0 || n_walls < 0) return;
+	if (!wall_grey) {
+		wall_grey = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+		*(uint32_t *)cairo_image_surface_get_data(wall_grey) = 0xff1e1e1e;
+		cairo_surface_mark_dirty(wall_grey);
+	}
 	uint32_t now = zmc_now_ms();
 	double gap = 8, tw = (zmc.width - 2 * MARGIN - 2 * gap) / 3.0, th = tw * 16.0 / 9.0;
 	int c = wall_cat_open;
 	const char *current = app.wall_target == 2 ? app.lock_wall : app.start_wall;
-	double ar = ((ACCENTS[app.accent].color >> 16) & 255) / 255.0;
-	double ag = ((ACCENTS[app.accent].color >> 8) & 255) / 255.0;
-	double ab = (ACCENTS[app.accent].color & 255) / 255.0;
+	unsigned col = ACCENTS[app.accent].color;
+	double ar = ((col >> 16) & 255) / 255.0, ag = ((col >> 8) & 255) / 255.0, ab = (col & 255) / 255.0;
 	for (int i = 1; i <= cat_count[c]; i++) {
 		int k = cat_first[c] + i - 1;
-		if (wall_state[k] != 2) continue;
 		double x = MARGIN + (i % 3) * (tw + gap), y = wall_grid_top + (i / 3) * (th + gap) - zmc.scroll;
 		if (y + th < ZMC_HEADER_H || y > zmc.height) continue;
-		double deg, alpha;
-		if (wall_leave_at) {
-			double e = wall_ease((double)(now - wall_leave_at) / WALL_SWIVEL_OUT_MS, true);
+		double stagger = ((i - 1) % 3) * 60 + fmin((i - 1) / 3, 4) * 60;	/* the rows, a few at most */
+		bool leaving = wall_leave_at != 0;
+		uint32_t t0 = leaving ? wall_leave_at : wall_open_at + (uint32_t)stagger;
+		double dur = leaving ? WALL_SWIVEL_OUT_MS : WALL_SWIVEL_IN_MS;
+		if ((int32_t)(now - t0) < 0) continue;	/* its turn has not come */
+		double e = wall_ease((double)(now - t0) / dur, leaving);
+		/* the cell: out (0 to 60) or in (-60 to 0) about X, grey */
+		double deg = leaving ? 60 * e : -60 * (1 - e);
+		double alpha = leaving ? 1 - e : e;
+		if (alpha > 0) wall_card(wall_grey, 100000 + i, x, y, tw, th, deg, alpha);
+		/* the photo, over its cell: its own swivel, from when it arrived */
+		if (wall_state[k] != 2) continue;
+		if (leaving) {
 			deg = 60 * e;
 			alpha = 1 - e;
 		} else {
-			if ((int32_t)(now - wall_arrive[k]) < 0) continue;	/* not its turn yet */
-			double e = wall_ease((double)(now - wall_arrive[k]) / WALL_SWIVEL_IN_MS, false);
+			if ((int32_t)(now - wall_arrive[k]) < 0) continue;
+			e = wall_ease((double)(now - wall_arrive[k]) / WALL_SWIVEL_IN_MS, false);
 			deg = -60 * (1 - e);
 			alpha = e;
 		}
 		if (alpha <= 0) continue;
 		wall_card(wall_thumbs[k], k + 1, x, y, tw, th, deg, alpha);
-		if (!wall_leave_at && current[0] && strcmp(current, walls[k]) == 0) {
+		if (!leaving && current[0] && strcmp(current, walls[k]) == 0) {
 			zmc_gpu_rect(x, y, tw, 4, ar, ag, ab);
 			zmc_gpu_rect(x, y + th - 4, tw, 4, ar, ag, ab);
 			zmc_gpu_rect(x, y, 4, th, ar, ag, ab);
@@ -1243,8 +1261,7 @@ static double draw_wall_grid(cairo_t *cr, double y) {
 			zmc_add_hit(x, ty, tw, th, ACT_WALL, 0);
 		} else {
 			int k = cat_first[c] + i - 1;
-			wall_thumb(k);		/* made in the background; wall_overlay draws it */
-			draw_wall_tile(cr, NULL, x, ty, tw, th);
+			wall_thumb(k);		/* made in the background; the cell and photo are wall_overlay's */
 			chosen = strcmp(current, walls[k]) == 0;
 			zmc_add_hit(x, ty, tw, th, ACT_WALL, k + 1);
 		}
@@ -2499,10 +2516,11 @@ static void activate(int action, int arg) {
 			uint32_t now = zmc_now_ms();
 			int n = cat_count[arg];
 			for (int i = 0; i < n && i < 6; i++) wall_prefetch(cat_first[arg] + i);
-			for (int i = 0; i < n && i < 6; i++) {	/* their swivel in, once the rows are in */
-				wall_arrive[cat_first[arg] + i] = now + WALL_TURN_MS + (i % 3) * 60 + (i / 3) * 60;
+			wall_open_at = now + WALL_TURN_MS;	/* the cells, once the rows are in */
+			for (int i = 0; i < n && i < 6; i++) {	/* their photos come in with them */
+				wall_arrive[cat_first[arg] + i] = wall_open_at + (i % 3) * 60 + (i / 3) * 60;
 			}
-			wall_busy_until = now + WALL_TURN_MS + 200 + 120;
+			wall_busy_until = now + WALL_TURN_MS + 240 + 300;	/* the cells' last swivel */
 			wall_kick();
 			zmc_turn(1);
 			wall_cat_open = arg;
