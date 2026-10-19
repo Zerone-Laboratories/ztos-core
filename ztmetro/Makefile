@@ -87,21 +87,23 @@ store/ztstore: $(STORE) $(wildcard store/*.h) $(CORE_DEPS)
 	$(APP_BUILD) -DHAVE_RSVG $(shell pkg-config --cflags $(STORE_PKGS)) -o $@ $(STORE) $(CORE) $(APP_LIBS) \
 		$(shell pkg-config --libs $(STORE_PKGS)) -lpthread
 
-# ztBrowser: WPE WebKit on a Wayland subsurface, in the WP8.1 IE look
-# (see browser/README.md). Needs wpewebkit + wpebackend-fdo on the phone.
-BROWSER = browser/ztbrowser.c browser/webview.c
+# Superscan, the web browser: WPE WebKit in the WP8.1 IE look (see
+# browser/README.md). Needs wpewebkit on the phone.
+BROWSER = browser/superscan.c browser/webview.c
 BROWSER_PKGS = wpe-webkit-2.0 wpe-platform-2.0 wpe-platform-headless-2.0 glib-2.0 gobject-2.0 libdrm
-browser/ztbrowser: $(BROWSER) browser/webview.h $(CORE_DEPS)
+browser/superscan: $(BROWSER) browser/webview.h $(CORE_DEPS)
 	$(APP_BUILD) $(shell pkg-config --cflags $(BROWSER_PKGS)) -o $@ $(BROWSER) $(CORE) $(APP_LIBS) \
 		$(shell pkg-config --libs $(BROWSER_PKGS))
 
 # kept out of `all`/`install` until WPE is confirmed on the phone, so a missing
 # package cannot break the main build
 .PHONY: install-browser
-install-browser: browser/ztbrowser
-	install -Dm755 browser/ztbrowser /usr/local/bin/ztbrowser
-	install -Dm644 browser/ztbrowser.desktop /usr/local/share/applications/ztbrowser.desktop
-	install -Dm644 browser/ztbrowser.svg /usr/local/share/icons/hicolor/scalable/apps/ztbrowser.svg
+install-browser: browser/superscan
+	install -Dm755 browser/superscan /usr/local/bin/superscan
+	install -Dm644 browser/superscan.desktop /usr/local/share/applications/superscan.desktop
+	install -Dm644 browser/superscan.svg /usr/local/share/icons/hicolor/scalable/apps/superscan.svg
+	rm -f /usr/local/bin/ztbrowser /usr/local/share/applications/ztbrowser.desktop \
+		/usr/local/share/icons/hicolor/scalable/apps/ztbrowser.svg	# its old name
 
 # the App Store's parsers against a made-up pacman layout (no root, no network)
 .PHONY: check-store

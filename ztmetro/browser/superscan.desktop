@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Superscan
+Comment=Browse the web
+Exec=superscan
+Terminal=false
+Type=Application
+Icon=superscan
+Categories=Network;WebBrowser;

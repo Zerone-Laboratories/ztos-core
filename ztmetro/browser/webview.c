@@ -83,7 +83,7 @@ static void wait_rendered(WPEBuffer *buffer) {
 		if (ms > stats.worst_ms) stats.worst_ms = ms;
 		if (!stats.since) stats.since = t0;
 		if (t0 - stats.since > 1000000) {
-			fprintf(stderr, "ztbrowser: %d frames/s, fence wait %.2f ms avg (worst %.2f), fence=%s\n",
+			fprintf(stderr, "superscan: %d frames/s, fence wait %.2f ms avg (worst %.2f), fence=%s\n",
 				stats.frames, stats.fence_ms / stats.frames, stats.worst_ms, fd >= 0 ? "yes" : "none");
 			stats.frames = 0; stats.fence_ms = stats.worst_ms = 0; stats.since = t0;
 		}
@@ -98,7 +98,7 @@ static void wait_rendered(WPEBuffer *buffer) {
 static bool take_frame(struct webview *wv, WPEBuffer *buffer) {
 	if (!wv->logged) {
 		wv->logged = true;
-		fprintf(stderr, "ztbrowser: frames %dx%d, %s (view %dx%d points at scale %d)\n",
+		fprintf(stderr, "superscan: frames %dx%d, %s (view %dx%d points at scale %d)\n",
 			wpe_buffer_get_width(buffer), wpe_buffer_get_height(buffer),
 			WPE_IS_BUFFER_DMA_BUF(buffer) ? "DMA-BUF, imported" : "not DMA-BUF, copied",
 			wv->w, wv->h, wv->scale);
@@ -243,7 +243,7 @@ static ZtSync *sync_new(void) {
 		if (drmWaitVBlank(fd, &vb) == 0) {
 			ZtSync *s = g_object_new(zt_sync_get_type(), NULL);
 			s->fd = fd;
-			fprintf(stderr, "ztbrowser: WebKit's clock is %s vblank\n", path);
+			fprintf(stderr, "superscan: WebKit's clock is %s vblank\n", path);
 			return s;
 		}
 		close(fd);
@@ -398,7 +398,7 @@ static WPEDisplay *paced_display_new(void) {
 	ZtDisplay *z = g_object_new(zt_display_get_type(), NULL);
 	GError *err = NULL;
 	if (!z->inner || !wpe_display_connect(WPE_DISPLAY(z), &err)) {
-		fprintf(stderr, "ztbrowser: paced display failed (%s), using headless\n",
+		fprintf(stderr, "superscan: paced display failed (%s), using headless\n",
 			err ? err->message : "no display");
 		g_clear_error(&err);
 		g_object_unref(z);
@@ -474,7 +474,7 @@ static void tune(WebKitSettings *s) {
 	/* a phone user agent, so sites send their mobile pages */
 	webkit_settings_set_user_agent(s,
 		"Mozilla/5.0 (Linux; Android 14; ztOS) AppleWebKit/605.1.15 "
-		"(KHTML, like Gecko) Version/18.0 Mobile Safari/605.1.15 ztBrowser/1.0");
+		"(KHTML, like Gecko) Version/18.0 Mobile Safari/605.1.15 Superscan/1.0");
 }
 
 /* ---- the interface -------------------------------------------------------- */
@@ -576,7 +576,7 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 		} else {
 			g_signal_connect(wv->view, "buffer-rendered", G_CALLBACK(on_buffer), wv);
 		}
-		fprintf(stderr, "ztbrowser: %s\n", G_TYPE_CHECK_INSTANCE_TYPE(wv->view, zt_view_get_type())
+		fprintf(stderr, "superscan: %s\n", G_TYPE_CHECK_INSTANCE_TYPE(wv->view, zt_view_get_type())
 			? "frames paced by our display" : "headless frames (timer paced)");
 		wpe_view_map(wv->view);
 		wpe_view_set_visible(wv->view, TRUE);
@@ -615,7 +615,7 @@ void webview_place(struct webview *wv, int x, int y, int w, int h, int scale) {
 			wpe_toplevel_scale_changed(top, scale);
 		}
 		wpe_view_resized(wv->view, w, h);
-		fprintf(stderr, "ztbrowser: view %dx%d at scale %.1f (toplevel %s)\n", w, h,
+		fprintf(stderr, "superscan: view %dx%d at scale %.1f (toplevel %s)\n", w, h,
 			wpe_view_get_scale(wv->view), top ? "yes" : "none");
 	}
 }
@@ -647,7 +647,7 @@ static void send(struct webview *wv, WPEEvent *ev) {
 
 static void touch(struct webview *wv, WPEEventType type, int id, double x, double y, unsigned time) {
 	if (!wv || !wv->view) return;
-	if (getenv("ZTB_DEBUG")) fprintf(stderr, "ztbrowser: touch %d id %d at %.0f,%.0f\n", type, id, x, y);
+	if (getenv("ZTB_DEBUG")) fprintf(stderr, "superscan: touch %d id %d at %.0f,%.0f\n", type, id, x, y);
 	send(wv, wpe_event_touch_new(type, wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0, (guint32)id, x, y));
 }
 

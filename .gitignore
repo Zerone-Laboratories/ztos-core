@@ -46,6 +46,7 @@ sdk/native/prebuilt/
 ztmetro/auth/ztos-polkit-agent
 ztmetro/sounds/ztos-sounds
 ztmetro/devices/ztdevices
+ztmetro/browser/superscan
 
 # Windows Phone UI sounds (from the OS Sound Kit): Microsoft's audio, not ours to
 # redistribute; copied onto the phone locally, kept out of the public repository

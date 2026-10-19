@@ -1,4 +1,4 @@
-# ztBrowser
+# Superscan
 
 A web browser for ztOS, in the look and motion of the Windows Phone 8.1
 Internet Explorer. Built on the **C** ZrnMetroCore SDK (not the Python one),
@@ -48,7 +48,7 @@ shell's own transitions were.
 
 ## Persistence (local storage, cookies, …)
 
-One `WebKitWebsiteDataManager` rooted at `~/.local/share/ztbrowser`:
+One `WebKitWebsiteDataManager` rooted at `~/.local/share/superscan`:
 
 - cookies: `WebKitCookieManager`, persistent SQLite, accept-policy no-third-party
 - localStorage, IndexedDB, the disk cache, service workers, offline app cache —
@@ -64,7 +64,7 @@ One `WebKitWebsiteDataManager` rooted at `~/.local/share/ztbrowser`:
 
 ## Build and run
 
-    make browser/ztbrowser     # on the phone, with the rest of ztmetro
+    make browser/superscan     # on the phone, with the rest of ztmetro
 
 Needs the WPE packages above on the phone. See the Makefile for the exact
 pkg-config modules; the WebKit API is version-sensitive, so the first build on

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * webview: a WPE WebKit page on a Wayland subsurface under the app's main
- * surface. The chrome (ztbrowser.c) talks only to this interface, so the
+ * surface. The chrome (superscan.c) talks only to this interface, so the
  * engine stays in one place.
  */
 #ifndef ZTBROWSER_WEBVIEW_H
