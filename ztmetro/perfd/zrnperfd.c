@@ -432,7 +432,8 @@ static long led_next;		/* when the light next changes; 0: not blinking */
 #define BIG_NOMINAL_KHZ	1066000
 #define BIG_INTERACTIVE_KHZ 1794000	/* the Mongoose cores' efficient band ends here */
 #define BIG_BIG_KHZ	2327000
-#define TOUCH_BOOST_MS	120
+#define TOUCH_BOOST_MS	600	/* from the last touch event: past the finger's lift and
+				 * the page settling (a Start/apps swipe settles in ~0.6 s) */
 #define TOUCH_BOOST_KHZ	1500000
 
 /* Which cores ordinary programs may run on: every slice of the system, through
@@ -852,7 +853,12 @@ static void apply(void) {
 	char set[48];
 	int eff_last = cluster_cpus[0][0];
 	for (int i = 0; cluster_cpus[0][i] >= 0; i++) { eff_last = cluster_cpus[0][i]; }
-	if (idle0) {
+	/* idle0 parks cpu2+ only with the screen off. With it on, a swipe on Start
+	 * ran on two cores, and bringing the others back (a hotplug stops every
+	 * core for a moment) dropped a frame now and then: in a Start/apps swipe
+	 * test, 19 late frames in 17 animations, none with the cores kept up. */
+	bool park = idle0 && !screen_on;
+	if (park) {
 		snprintf(set, sizeof(set), "%d-%d", cluster_cpus[0][0], cluster_cpus[0][1] >= 0 ?
 			cluster_cpus[0][1] : cluster_cpus[0][0]);
 	} else if (n_clusters > 1 && k > 0) {
@@ -864,7 +870,7 @@ static void apply(void) {
 	idle_two_cores(false);		/* bring up whatever the new rung needs */
 	big_online(k > 0 ? k : 1);
 	cores_allowed(set);
-	idle_two_cores(idle0);		/* only idle0 parks cpu2+ of the efficiency cluster */
+	idle_two_cores(park);		/* only idle0, screen off, parks cpu2+ of the efficiency cluster */
 	/* the light: blinking while rapid boost is on (the loop does the blinking) */
 	bool blink = boost == RAPID && !low && profile != PERFORMANCE;
 	if (blink && !led_next) {
@@ -1123,17 +1129,22 @@ int main(void) {
 		if (touch >= 0 && (fds[2].revents & POLLIN)) {
 			struct input_event ev[32];
 			ssize_t got;
-			bool down = false;
+			bool down = false, any = false;
 			while ((got = read(touch, ev, sizeof(ev))) > 0) {
 				for (size_t i = 0; i < (size_t)got / sizeof(ev[0]); i++) {
+					any = true;
 					if ((ev[i].type == EV_KEY && ev[i].code == BTN_TOUCH && ev[i].value == 1) ||
 							(ev[i].type == EV_ABS && ev[i].code == ABS_MT_TRACKING_ID && ev[i].value >= 0)) {
 						down = true;
 					}
 				}
 			}
-			if (down) {
+			/* every event keeps the boost (a drag, its lift): it ran out
+			 * 120 ms after touch-down, before the page had settled */
+			if (any) {
 				touch_boost();
+			}
+			if (down) {
 				/* input boost: a finger on an app means frames are about to be
 				 * wanted; open the second big core now rather than after a
 				 * second of load (the first frames of a scroll were janky).
