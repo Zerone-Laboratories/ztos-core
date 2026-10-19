@@ -457,6 +457,23 @@ static void job_run(int item, const char *what, const char *cmd) {
 	zmc_busy(true);
 }
 
+/* Services that refuse to come back after a boot that froze while they were
+ * new (a mark they leave on disk), and the unit that clears the mark and
+ * starts them again: restart (or start) in this app goes through it, so the
+ * person holding the phone can always bring them back with one tap. */
+static const struct { const char *unit, *reset; } guarded[] = {
+	{ "zrn-cpuidle.service", "zrn-cpuidle-reset.service" },
+};
+
+static const char *reset_unit_of(const struct item *it) {
+	for (size_t g = 0; g < sizeof(guarded) / sizeof(guarded[0]); g++) {
+		if (it->kind == K_SYSTEM && strcmp(it->id, guarded[g].unit) == 0) {
+			return guarded[g].reset;
+		}
+	}
+	return NULL;
+}
+
 static bool boot_switchable(const struct item *it) {
 	return strcmp(it->boot, "enabled") == 0 || strcmp(it->boot, "disabled") == 0;
 }
@@ -467,7 +484,9 @@ static void item_action(int action, int i) {
 	char cmd[256];
 	switch (action) {
 	case ACT_RESTART:
-		if (it->kind == K_SESSION) {
+		if (reset_unit_of(it)) {
+			snprintf(cmd, sizeof(cmd), "systemctl --no-ask-password start '%s'", reset_unit_of(it));
+		} else if (it->kind == K_SESSION) {
 			snprintf(cmd, sizeof(cmd), "pkill -x '%.15s'; sleep 0.5; exec '%s' >/dev/null 2>&1 &", it->id, it->id);
 		} else {
 			snprintf(cmd, sizeof(cmd), "systemctl %s--no-ask-password restart '%s'", user, it->id);
@@ -481,6 +500,8 @@ static void item_action(int action, int i) {
 			} else {
 				snprintf(cmd, sizeof(cmd), "'%s' >/dev/null 2>&1 &", it->id);
 			}
+		} else if (!it->active && reset_unit_of(it)) {
+			snprintf(cmd, sizeof(cmd), "systemctl --no-ask-password start '%s'", reset_unit_of(it));
 		} else {
 			snprintf(cmd, sizeof(cmd), "systemctl %s--no-ask-password %s '%s'", user,
 				it->active ? "stop" : "start", it->id);
