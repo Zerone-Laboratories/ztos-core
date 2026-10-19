@@ -520,6 +520,8 @@ struct zt_server {
 	float toast_y;			/* 1 fully in, 0 out of sight (swivel progress) */
 	struct zt_layer toast_layer;
 	struct wl_event_source *toast_timer;
+	struct wl_event_source *home_flip_timer;	/* see home_flip_arm */
+	int home_flip_tile;				/* -1: none waiting */
 	float page_rest;		/* the page last come to rest on */
 	/* the status bar held down a little: the SIM, the battery, the date */
 	float peek;			/* 0 away, 1 shown */
@@ -3071,6 +3073,21 @@ static void live_read(struct zt_server *server) {
 	}
 }
 
+/* a live tile turns to its back (or its front) */
+static void tile_flip_to(struct zt_server *server, struct tile *t, bool to_back) {
+	uint32_t now = now_ms();
+	if (to_back) {
+		t->sweep_since = now;	/* its long lines start again from their beginnings */
+	}
+	/* the Windows Phone live-tile notify flip: the face turns in and rocks
+	 * back a little (NotificationCycleShow overshoots -180 -> 35 -> -6 -> 0) */
+	animate_spring(server, &t->flip, to_back ? 180.0f : 0.0f, 520, 0.08f);
+	/* the back stays up a while to be read; the front a random while */
+	t->next_flip_ms = now + (to_back ? 5000 + (uint32_t)(rand() % 3000) :
+		4000 + (uint32_t)(rand() % 6000));
+	damage(server);
+}
+
 /* Once a second: the files again every third, and at most one tile turns. */
 static void live_tick(struct zt_server *server) {
 	static int ticks;
@@ -3086,19 +3103,50 @@ static void live_tick(struct zt_server *server) {
 		if (!t->live || !t->back_layer.tex || now < t->next_flip_ms) {
 			continue;
 		}
-		bool to_back = t->flip < 90.0f;
-		if (to_back) {
-			t->sweep_since = now;	/* its long lines start again from their beginnings */
-		}
-		/* the Windows Phone live-tile notify flip: the face turns in and rocks
-		 * back a little (NotificationCycleShow overshoots -180 -> 35 -> -6 -> 0) */
-		animate_spring(server, &t->flip, to_back ? 180.0f : 0.0f, 520, 0.08f);
-		/* the back stays up a while to be read; the front a random while */
-		t->next_flip_ms = now + (to_back ? 5000 + (uint32_t)(rand() % 3000) :
-			4000 + (uint32_t)(rand() % 6000));
-		damage(server);
+		tile_flip_to(server, t, t->flip < 90.0f);
 		break;
 	}
+}
+
+/* Back on Start from an app with a live tile: 1 s after the tiles have come
+ * back in, its tile turns to what the app has to say. */
+#define HOME_FLIP_MS	1000
+static int tile_of(struct zt_server *server, const char *command);
+
+static int home_flip_fired(void *data) {
+	struct zt_server *server = data;
+	int i = server->home_flip_tile;
+	server->home_flip_tile = -1;
+	if (i < 0 || i >= server->n_tiles || server->shown || !server->screen_on ||
+			server->locked || server->editing) {
+		return 0;
+	}
+	struct tile *t = &server->tiles[i];
+	if (t->live && t->back_layer.tex && t->flip < 90.0f) {
+		wlr_log(WLR_INFO, "back from %s: its live tile turns", t->label);
+		tile_flip_to(server, t, true);
+	}
+	return 0;
+}
+
+/* `app` has just left for Start, which arrives in `in_ms` */
+static void home_flip_arm(struct zt_server *server, struct zt_toplevel *app, uint32_t in_ms) {
+	int i = app->launch_command[0] ? tile_of(server, app->launch_command) : -1;
+	const char *app_id = app->xdg_toplevel ? app->xdg_toplevel->app_id : NULL;
+	for (int k = 0; i < 0 && app_id && k < server->n_tiles; k++) {
+		char key[128];
+		tile_key(&server->tiles[k], key, sizeof(key));
+		if (strcmp(key, app_id) == 0) {
+			i = k;
+		}
+	}
+	if (i < 0 || !server->tiles[i].live || server->tiles[i].flip >= 90.0f) {
+		return;
+	}
+	/* no random turn of its own before this one */
+	server->tiles[i].next_flip_ms = now_ms() + in_ms + HOME_FLIP_MS + 3000;
+	server->home_flip_tile = i;
+	wl_event_source_timer_update(server->home_flip_timer, in_ms + HOME_FLIP_MS);
 }
 
 /* A long line on a live tile's back sweeps across, the way Windows Phone
@@ -5395,6 +5443,8 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 			animate(server, &server->app_angle, TURN_OUT_DEG, APP_OUT_MS, 0, false);
 			animate(server, &server->app_alpha, 0.0f, APP_OUT_MS, 0, false);
 			start_turn(server, false, APP_OUT_MS + BACK_GAP_MS);	/* animate() stretches it */
+			home_flip_arm(server, previous,
+				APP_OUT_MS + BACK_GAP_MS + (uint32_t)server->return_ms);
 		} else {
 			/* it closed by itself: a moment of black, then Start */
 			server->leaving = NULL;
@@ -10380,6 +10430,8 @@ int main(int argc, char *argv[]) {
 	server.st_plug = 1.0f;
 	server.charging = on_charger();
 	server.toast_timer = wl_event_loop_add_timer(server.loop, toast_hide, &server);
+	server.home_flip_timer = wl_event_loop_add_timer(server.loop, home_flip_fired, &server);
+	server.home_flip_tile = -1;
 	modem_read(&server);
 	server.idle_notifier = wlr_idle_notifier_v1_create(server.wl_display);
 
