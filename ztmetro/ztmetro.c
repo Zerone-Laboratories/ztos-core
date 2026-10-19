@@ -2126,6 +2126,12 @@ static void *bl_thread(void *data) {
 			pthread_mutex_unlock(&bl.lock);
 			uint64_t one = 1;
 			if (write(bl.fd, &one, sizeof(one)) < 0) {}
+			if (bl.mode == BL_TABLE) {
+				/* each level is twenty panel packets sent between frames:
+				 * a dragged slider gets the latest level every 60 ms, not a
+				 * write for every pixel it moved */
+				usleep(60000);
+			}
 		} else if (percent >= 0) {	/* brightnessctl */
 			char arg[16];
 			snprintf(arg, sizeof(arg), "%d%%", percent);
