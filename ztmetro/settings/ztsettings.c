@@ -1025,13 +1025,58 @@ static void walls_scan(void) {
 	}
 }
 
-/* a photo's picker thumbnail, made once: the shipped thumb if it has one */
-static cairo_surface_t *wall_thumb(int k, int pw, int ph) {
-	if (!wall_thumbs[k]) {
-		const char *path = wall_thumb_path[k][0] ? wall_thumb_path[k] : walls[k];
-		wall_thumbs[k] = thumb_cover(path, pw, ph);
+/* A photo's picker thumbnail, made once: the shipped thumb if it has one, at
+ * the shipped size. Drawing never decodes: a photo asked for is queued and one
+ * is made per tick (wall_tick) until none is left, so the page stays smooth.
+ * A tile not made yet is grey; the rows of the page swivel in with what is. */
+#define WALL_PW		216
+#define WALL_PH		384
+#define WALL_TICK_MS	100
+#define WALL_PER_TICK	6
+static unsigned char wall_state[MAX_WALLS];	/* 0 not made, 1 queued, 2 made, 3 failed */
+static int wall_queue[MAX_WALLS], wall_q_n, wall_q_head;
+static bool wall_ticking;
+
+static void wall_make(int k) {
+	const char *path = wall_thumb_path[k][0] ? wall_thumb_path[k] : walls[k];
+	wall_thumbs[k] = thumb_cover(path, WALL_PW, WALL_PH);
+	wall_state[k] = wall_thumbs[k] ? 2 : 3;
+}
+
+/* A few photos a tick, then the page is drawn once: a redraw is the page's
+ * whole raster, so one per photo cost the page's time over and over. */
+static void wall_tick(void) {
+	int made = 0;
+	while (wall_q_head < wall_q_n && made < WALL_PER_TICK) {
+		int k = wall_queue[wall_q_head++];
+		if (wall_state[k] != 1) continue;
+		wall_make(k);
+		made++;
 	}
-	return wall_thumbs[k];
+	if (made) zmc_redraw();
+	if (wall_q_head >= wall_q_n) {
+		wall_q_n = wall_q_head = 0;
+		wall_ticking = false;
+		zmc_every(0, NULL);
+	}
+}
+
+/* the thumbnail if it is made; otherwise it is queued (NULL, a grey tile) */
+static cairo_surface_t *wall_thumb(int k) {
+	if (wall_state[k] == 0) {
+		wall_state[k] = 1;
+		wall_queue[wall_q_n++] = k;
+		if (!wall_ticking) {
+			wall_ticking = true;
+			zmc_every(WALL_TICK_MS, wall_tick);
+		}
+	}
+	return wall_state[k] == 2 ? wall_thumbs[k] : NULL;
+}
+
+/* made now, for the photos a page is about to show, before it turns in */
+static void wall_prefetch(int k) {
+	if (wall_state[k] == 0 || wall_state[k] == 1) wall_make(k);
 }
 
 /* a thumbnail covering a w x h box at (x, y), its image as drawn */
@@ -1077,7 +1122,7 @@ static double draw_wall_categories(cairo_t *cr, double y) {
 	for (int c = 0; c < n_cats; c++) {
 		double x = MARGIN + (c % 2) * (tw + gap), ty = y + (c / 2) * (th + gap);
 		int first = cat_first[c];
-		draw_wall_tile(cr, wall_thumb(first, (int)(tw * 2), (int)(th * 2)), x, ty, tw, th);
+		draw_wall_tile(cr, wall_thumb(first), x, ty, tw, th);
 		cairo_set_source_rgba(cr, 0, 0, 0, 0.45);
 		cairo_rectangle(cr, x, ty + th - 46, tw, 46);
 		cairo_fill(cr);
@@ -1111,7 +1156,7 @@ static double draw_wall_grid(cairo_t *cr, double y) {
 			zmc_add_hit(x, ty, tw, th, ACT_WALL, 0);
 		} else {
 			int k = cat_first[c] + i - 1;
-			draw_wall_tile(cr, wall_thumb(k, (int)(tw * 2), (int)(th * 2)), x, ty, tw, th);
+			draw_wall_tile(cr, wall_thumb(k), x, ty, tw, th);
 			chosen = strcmp(current, walls[k]) == 0;
 			zmc_add_hit(x, ty, tw, th, ACT_WALL, k + 1);
 		}
@@ -2342,6 +2387,8 @@ static void activate(int action, int arg) {
 		}
 		if (arg == PAGE_WALLS) {
 			wall_cat_open = -1;	/* opens on the categories */
+			if (n_walls < 0) walls_scan();
+			for (int c = 0; c < n_cats; c++) wall_prefetch(cat_first[c]);	/* their first photos */
 		}
 		zmc_go(arg, 1);
 		break;
@@ -2356,8 +2403,11 @@ static void activate(int action, int arg) {
 		app.wall_target = arg;
 		break;
 	case ACT_WALL_CAT:
+		/* the first screen of photos made, then the rows swivel out and the
+		 * category's rows swivel in, the photos on them */
+		for (int i = 0; i < cat_count[arg] && i < 6; i++) wall_prefetch(cat_first[arg] + i);
+		zmc_turn(1);
 		wall_cat_open = arg;
-		zmc_redraw();
 		break;
 	case ACT_WALL: {
 		const char *path = arg > 0 && arg <= n_walls ? walls[arg - 1] : "";
@@ -2897,9 +2947,9 @@ static bool back(void) {
 		return true;
 	}
 	if (zmc.page == PAGE_WALLS) {
-		if (wall_cat_open >= 0) {	/* a category: back to the categories */
+		if (wall_cat_open >= 0) {	/* a category: back to the categories, swivelling away */
+			zmc_turn(-1);
 			wall_cat_open = -1;
-			zmc_redraw();
 			return true;
 		}
 		zmc_go(PAGE_THEME, -1);

@@ -1662,6 +1662,17 @@ void zmc_go(int target, int dir) {
 	begin_animation(true, true, target, dir > 0 ? page_y(zmc.down_y) : -1, 0);
 }
 
+/* The same page, its content changed: the rows swivel out as they are, then
+ * the page is drawn again, its rows swivel in. The app changes its state
+ * after this call (the outgoing rows are the ones on screen now); the new
+ * content is drawn when they have turned away. dir < 0 turns back. */
+void zmc_turn(int dir) {
+	if (zmc.anim_active) return;
+	back_forget();			/* a pre-drawn page is this page's old content */
+	zmc.anim_dir = dir;
+	begin_animation(true, true, zmc.page, dir > 0 ? page_y(zmc.down_y) : -1, 0);
+}
+
 static double scroll_max(void) {
 	return zmc.content_h > zmc.height ? zmc.content_h - zmc.height : 0;
 }
