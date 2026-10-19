@@ -631,18 +631,13 @@ bool webview_can_go_forward(struct webview *wv) { return webkit_web_view_can_go_
 void webview_back(struct webview *wv) { webkit_web_view_go_back(wv->web); }
 void webview_forward(struct webview *wv) { webkit_web_view_go_forward(wv->web); }
 
-/* Input. WebKit only pans from raw touch when the view has a gesture
- * controller, so the gesture is decided here: once the finger has moved past
- * a few points it is a drag and turns into precise scroll deltas (lifted with
- * an is_stop, from which WebKit coasts on); a lift that never moved is a tap
- * and becomes a click at that point. Coordinates are CSS pixels (points). */
-#define TAP_SLOP 8.0
-
-static struct {
-	double down_x, down_y, last_x, last_y;
-	bool moved, active;
-} finger;
-
+/* Input. A finger goes to WebKit as touch events only. WebKit gives them to
+ * the page first; whatever the page does not take (no listener, or one that
+ * did not preventDefault) goes to the view's gesture controller (WPE's own,
+ * made on first use), which says tap or drag, and WebKit turns that into one
+ * click or a scroll (with begin/end phases, so it coasts). Sending a click of our own as well
+ * made every tap land twice on pages that listen to touches (YouTube).
+ * Coordinates are CSS pixels (points). */
 static void send(struct webview *wv, WPEEvent *ev) {
 	if (ev) {
 		wpe_view_event(wv->view, ev);
@@ -650,73 +645,40 @@ static void send(struct webview *wv, WPEEvent *ev) {
 	}
 }
 
-void webview_touch_down(struct webview *wv, int id, double x, double y, unsigned time) {
-	(void)id;
+static void touch(struct webview *wv, WPEEventType type, int id, double x, double y, unsigned time) {
 	if (!wv || !wv->view) return;
-	finger.down_x = finger.last_x = x;
-	finger.down_y = finger.last_y = y;
-	finger.moved = false;
+	if (getenv("ZTB_DEBUG")) fprintf(stderr, "ztbrowser: touch %d id %d at %.0f,%.0f\n", type, id, x, y);
+	send(wv, wpe_event_touch_new(type, wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0, (guint32)id, x, y));
+}
+
+static struct { int id; double x, y; bool active; } finger;
+
+void webview_touch_down(struct webview *wv, int id, double x, double y, unsigned time) {
+	finger.id = id;
+	finger.x = x;
+	finger.y = y;
 	finger.active = true;
-	if (getenv("ZTB_DEBUG")) fprintf(stderr, "ztbrowser: touch down %.0f,%.0f\n", x, y);
-	/* the pointer to where the finger is, so :hover and the click land there */
-	send(wv, wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, wv->view,
-		WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0, x, y, 0, 0));
+	touch(wv, WPE_EVENT_TOUCH_DOWN, id, x, y, time);
 }
 
 void webview_touch_motion(struct webview *wv, int id, double x, double y, unsigned time) {
-	(void)id;
-	if (!wv || !wv->view || !finger.active) return;
-	if (!finger.moved && hypot(x - finger.down_x, y - finger.down_y) > TAP_SLOP) {
-		finger.moved = true;
-		finger.last_x = x;	/* scroll from here: no jump at the start */
-		finger.last_y = y;
-		return;
-	}
-	if (finger.moved) {
-		double dx = x - finger.last_x, dy = y - finger.last_y;
-		send(wv, wpe_event_scroll_new(wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0,
-			dx, dy, TRUE, FALSE, x, y));
-		finger.last_x = x;
-		finger.last_y = y;
-	}
+	if (!finger.active || id != finger.id) return;
+	finger.x = x;
+	finger.y = y;
+	touch(wv, WPE_EVENT_TOUCH_MOVE, id, x, y, time);
 }
 
 void webview_touch_up(struct webview *wv, int id, unsigned time) {
-	(void)id;
-	if (!wv || !wv->view || !finger.active) return;
+	if (!finger.active || id != finger.id) return;
 	finger.active = false;
-	double x = finger.last_x, y = finger.last_y;
-	if (getenv("ZTB_DEBUG")) fprintf(stderr, "ztbrowser: touch up %.0f,%.0f moved=%d focus=%d\n", x, y,
-		finger.moved, wpe_view_get_has_focus(wv->view));
-	if (finger.moved) {
-		send(wv, wpe_event_scroll_new(wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN, time, 0,
-			0, 0, TRUE, TRUE, x, y));
-		return;
-	}
-	/* a tap: a real touch (touchstart/touchend, so touch-driven pages like
-	 * YouTube react) and a mouse click at the same point (WebKit only turns
-	 * pointer presses into clicks when they come from a mouse; from the
-	 * touchscreen source it ignored them, which is why nothing clicked) */
-	if (!wpe_view_get_has_focus(wv->view)) {
-		wpe_view_focus_in(wv->view);
-	}
-	send(wv, wpe_event_touch_new(WPE_EVENT_TOUCH_DOWN, wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN,
-		time, 0, 0, x, y));
-	send(wv, wpe_event_touch_new(WPE_EVENT_TOUCH_UP, wv->view, WPE_INPUT_SOURCE_TOUCHSCREEN,
-		time, 0, 0, x, y));
-	send(wv, wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, wv->view,
-		WPE_INPUT_SOURCE_MOUSE, time, 0, x, y, 0, 0));
-	send(wv, wpe_event_pointer_button_new(WPE_EVENT_POINTER_DOWN, wv->view,
-		WPE_INPUT_SOURCE_MOUSE, time, 0, WPE_BUTTON_PRIMARY, x, y, 1));
-	send(wv, wpe_event_pointer_button_new(WPE_EVENT_POINTER_UP, wv->view,
-		WPE_INPUT_SOURCE_MOUSE, time, WPE_MODIFIER_POINTER_BUTTON1, WPE_BUTTON_PRIMARY, x, y, 0));
-	/* (a release carries press count 0: WPE refuses to build one with 1, so
-	 * the release used to be dropped and no click ever completed) */
+	touch(wv, WPE_EVENT_TOUCH_UP, id, finger.x, finger.y, time);	/* (zmc gives no position on lift) */
 }
 
 void webview_touch_cancel(struct webview *wv) {
-	(void)wv;
+	if (!finger.active) return;
 	finger.active = false;
+	touch(wv, WPE_EVENT_TOUCH_CANCEL, finger.id, finger.x, finger.y,
+	      (unsigned)(g_get_monotonic_time() / 1000));
 }
 /* one key press and release; keycodes are evdev + 8, as XKB counts them */
 static void key_tap(struct webview *wv, guint keycode, guint keyval) {
