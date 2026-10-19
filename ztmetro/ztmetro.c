@@ -2080,7 +2080,11 @@ static void config_keep(const char *key, int value) {
  */
 #define BL_SETTLE_MS	300
 #define BL_LAND_MS	20	/* the panel takes a level at its next frame */
-enum bl_mode { BL_NONE, BL_S9, BL_CTL };
+/* BL_TABLE: the S9 with its full brightness table loaded (ztos-panel-bl,
+ * kernel/s9p-bl-table.py): every level the panel's own, exact and smooth.
+ * BL_S9: the S9 without it, four AOR levels and the rest darkened. */
+enum bl_mode { BL_NONE, BL_S9, BL_CTL, BL_TABLE };
+#define BL_TABLE_MARK	"/run/ztos-panel-bl"	/* written once the table is in */
 
 static struct {
 	pthread_mutex_t lock;
@@ -2236,7 +2240,11 @@ static void backlight_init(struct zt_server *server) {
 		} else if (bl.max > 0 && bl.fd >= 0) {
 			backlight_start_thread();
 		}
-		if (bl.usable) {
+		if (bl.usable && access(BL_TABLE_MARK, F_OK) == 0) {
+			bl.mode = BL_TABLE;
+			bl.hw = bl.target = (int)lround(atof(now) * 100 / bl.max);
+			wlr_log(WLR_INFO, "backlight: the panel's own %d levels", bl.max + 1);
+		} else if (bl.usable) {
 			bl.mode = BL_S9;
 			bl.hw = bl.target = (int)lround(atof(now) * 100 / bl.max);
 			wl_event_loop_add_fd(server->loop, bl.fd, WL_EVENT_READABLE, bl_written, NULL);
@@ -2285,6 +2293,16 @@ static void backlight_set(int percent) {
 				unlink(tmp);
 			}
 		}
+	}
+	if (bl.mode == BL_TABLE) {
+		/* the exact level; the thread keeps only the latest, and nothing
+		 * on the screen has to be drawn again */
+		int raw = (int)lround((double)percent * bl.max / 100.0);
+		pthread_mutex_lock(&bl.lock);
+		bl.want_raw = raw;
+		pthread_cond_signal(&bl.wake);
+		pthread_mutex_unlock(&bl.lock);
+		return;
 	}
 	if (bl.mode == BL_S9) {
 		if (bl_band(percent) > bl.hw) {
@@ -8912,7 +8930,11 @@ static void ctl_command(struct zt_server *server, char *line) {
 		/* from an ambient light program or settings: 1..100 */
 		server->shade_brightness = id < 1 ? 1 : id > 100 ? 100 : id;
 		backlight_set(server->shade_brightness);
-		damage(server);
+		/* the panel does the dimming itself: only the shade's slider, if
+		 * it is showing, has anything to draw */
+		if (bl.mode != BL_TABLE || server->shade_open || server->shade_h > 0) {
+			damage(server);
+		}
 	} else if (sscanf(line, "tone %d", &id) == 1) {
 		/* colour temperature in Kelvin; 6500 is none */
 		server->tone_k = id;
