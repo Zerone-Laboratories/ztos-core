@@ -9,6 +9,8 @@
  */
 #define _GNU_SOURCE
 #include <math.h>
+#include <signal.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -52,7 +54,7 @@ struct tab {
 	char url[1024];
 	char title[256];
 	double progress;
-	bool loading, secure;
+	bool loading, secure, playing;
 };
 
 static struct {
@@ -72,11 +74,84 @@ static struct {
 
 static struct tab *tab(void) { return &B.tabs[B.cur]; }
 
+/* ---- the live tile --------------------------------------------------------
+ * Start shows the back of Superscan's tile from $XDG_RUNTIME_DIR/ztos-live/
+ * superscan (see the shell's live tiles): what is playing, if a page is
+ * playing sound, and the open tabs. Lines too long for the tile sweep
+ * across it. Written only when it changes; gone when Superscan closes. */
+static char live_path[600];
+
+static const char *tab_name(const struct tab *t) {
+	if (t->title[0]) return t->title;
+	if (t->url[0] && strcmp(t->url, "about:blank") != 0) {
+		const char *u = strstr(t->url, "://");
+		return u ? u + 3 : t->url;
+	}
+	return "New tab";
+}
+
+static void live_write(void) {
+	if (!live_path[0]) {
+		const char *rt = getenv("XDG_RUNTIME_DIR");
+		char dir[512];
+		snprintf(dir, sizeof(dir), "%s/ztos-live", rt ? rt : "/tmp");
+		mkdir(dir, 0700);
+		snprintf(live_path, sizeof(live_path), "%s/superscan", dir);
+	}
+	char text[1024];
+	int n = 0, playing = -1;
+	for (int k = 0; k < B.n_tabs && playing < 0; k++) {
+		if (B.tabs[k].playing) playing = k;
+	}
+	char tabs[32];
+	snprintf(tabs, sizeof(tabs), B.n_tabs == 1 ? "1 tab" : "%d tabs", B.n_tabs);
+	n += snprintf(text + n, sizeof(text) - n, "title=Superscan\n");
+	if (playing >= 0) {
+		n += snprintf(text + n, sizeof(text) - n, "line=Now playing\nline=%.120s\nline=%s\n",
+			tab_name(&B.tabs[playing]), tabs);
+	} else {
+		n += snprintf(text + n, sizeof(text) - n, "line=%s\n", tabs);
+		/* the tab in front first, then the next one */
+		for (int k = 0, shown = 0; k < B.n_tabs && shown < 2; k++, shown++) {
+			int i = (B.cur + k) % B.n_tabs;
+			n += snprintf(text + n, sizeof(text) - n, "line=%.120s\n", tab_name(&B.tabs[i]));
+		}
+	}
+	for (char *c = text; *c; c++) {
+		if (*c == '\r') *c = ' ';
+	}
+	static char last[1024];
+	if (strcmp(text, last) == 0) {
+		return;
+	}
+	snprintf(last, sizeof(last), "%s", text);
+	char tmp[620];
+	snprintf(tmp, sizeof(tmp), "%s.new", live_path);
+	FILE *f = fopen(tmp, "w");
+	if (!f) return;
+	fputs(text, f);
+	fclose(f);
+	rename(tmp, live_path);	/* whole, never half-written */
+}
+
+static void live_remove(void) {
+	if (live_path[0]) unlink(live_path);
+}
+static void live_on_signal(int sig) {
+	live_remove();
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
 /* ---- the engine's word back to us ---------------------------------------- */
 
 static void on_title(void *user, const char *title) {
 	struct tab *t = user;
 	snprintf(t->title, sizeof(t->title), "%s", title ? title : "");
+	for (char *c = t->title; *c; c++) {
+		if (*c == '\n') *c = ' ';	/* one line on the tile */
+	}
+	live_write();
 	zmc_redraw();
 }
 static void on_uri(void *user, const char *uri) {
@@ -99,6 +174,11 @@ static void on_load(void *user, enum wv_load state) {
 		zmc_busy(t->loading);	/* the Windows Phone loading dots */
 	}
 	zmc_redraw();
+}
+static void on_playing(void *user, bool playing) {
+	struct tab *t = user;
+	t->playing = playing;
+	live_write();
 }
 static void on_secure(void *user, bool ok) {
 	struct tab *t = user;
@@ -131,7 +211,7 @@ static void on_ime(void *user, bool active, int caret_bottom) {
 
 static const struct wv_delegate DELEGATE_PROTO = {
 	.title = on_title, .uri = on_uri, .progress = on_progress,
-	.load = on_load, .secure = on_secure, .ime = on_ime,
+	.load = on_load, .secure = on_secure, .ime = on_ime, .playing = on_playing,
 };
 
 /* ---- tabs ---------------------------------------------------------------- */
@@ -163,6 +243,7 @@ static bool tab_open(const char *url) {
 	if (url && *url) {
 		webview_load(t->view, url);
 	}
+	live_write();
 	return true;
 }
 
@@ -175,6 +256,7 @@ static void tab_select(int i) {
 	}
 	B.cur = i;
 	zmc_busy(B.tabs[i].loading);
+	live_write();
 }
 
 static void tab_close(int i) {
@@ -184,6 +266,7 @@ static void tab_close(int i) {
 	webview_destroy(B.tabs[i].view);
 	for (int k = i; k < B.n_tabs - 1; k++) {
 		B.tabs[k] = B.tabs[k + 1];
+		webview_set_user(B.tabs[k].view, &B.tabs[k]);	/* it moved: its callbacks follow */
 	}
 	B.n_tabs--;
 	if (B.n_tabs == 0) {
@@ -662,5 +745,10 @@ int main(int argc, char **argv) {
 	if (argc > 1 && argv[1][0]) {
 		snprintf(home_url, sizeof(home_url), "%s", argv[1]);
 	}
-	return zmc_run(&app, P_WEB);
+	signal(SIGTERM, live_on_signal);
+	signal(SIGINT, live_on_signal);
+	signal(SIGHUP, live_on_signal);
+	int ret = zmc_run(&app, P_WEB);
+	live_remove();
+	return ret;
 }

@@ -250,9 +250,14 @@ struct tile {
 	/* live: a back face, as a Windows Phone Flip tile has, from
 	 * $XDG_RUNTIME_DIR/ztos-live/<its command's name> (see live_read) */
 	bool live;
-	char live_title[48], live_lines[3][64];
+	char live_title[48], live_lines[3][128];
 	int live_count;
-	time_t live_mtime;
+	/* back lines too long for the tile, each drawn on its own to sweep
+	 * across (see draw_tile_back and the tile loop) */
+	struct zt_layer sweep_layer[3];
+	double sweep_w[3];		/* the whole line, points; 0: it fits */
+	uint32_t sweep_since;		/* when the back last came round */
+	int64_t live_mtime;	/* ns: an app may write twice in a second */
 	struct zt_layer back_layer;
 	float flip;		/* degrees about its horizontal axis: 0 front, 180 back */
 	uint32_t next_flip_ms;
@@ -448,6 +453,7 @@ struct zt_server {
 	uint32_t anim_frames, anim_last_ms, anim_worst_ms, anim_first_ms;
 	double anim_draw_ms, anim_finish_ms, anim_commit_ms;	/* where the frame time goes */
 	float uv_off[2];		/* where in its texture the next quad starts (0, 0 but for a cropped surface) */
+	bool sweeping;			/* a live tile's long line is moving: keep drawing */
 
 	struct zt_layer osk_layer, nav_layer, status_layer, shade_layer;
 	struct zt_layer lock_layer, keypop_layer;
@@ -2938,6 +2944,12 @@ static void tile_key(const struct tile *t, char *out, size_t size) {
 	snprintf(out, size, "%s", base ? base + 1 : word);
 }
 
+static double text_width(const char *text, const char *font, double size);
+
+/* where back line k sits on a tile, points */
+#define BACK_LINE_SIZE(t)	((t)->size == TILE_WIDE ? 17.0 : 15.0)
+#define BACK_LINE_Y(t, k)	(8 + (k) * (BACK_LINE_SIZE(t) + 5))
+
 static void draw_tile_back(struct zt_server *server, int i) {
 	struct tile *t = &server->tiles[i];
 	cairo_t *cr;
@@ -2949,12 +2961,27 @@ static void draw_tile_back(struct zt_server *server, int i) {
 	}
 	cairo_paint(cr);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	double size = t->size == TILE_WIDE ? 17 : 15;
+	double size = BACK_LINE_SIZE(t);
 	for (int k = 0; k < 3; k++) {
-		if (t->live_lines[k][0]) {
-			draw_text(cr, t->live_lines[k], k == 0 ? FONT_SEMIBOLD : FONT_REGULAR, size, 8,
-				8 + k * (size + 5), t->w - 16, 0, false);
+		t->sweep_w[k] = 0;
+		if (!t->live_lines[k][0]) {
+			continue;
 		}
+		const char *font = k == 0 ? FONT_SEMIBOLD : FONT_REGULAR;
+		double whole = ceil(text_width(t->live_lines[k], font, size)) + 1;
+		if (whole <= t->w - 16) {
+			draw_text(cr, t->live_lines[k], font, size, 8, BACK_LINE_Y(t, k), t->w - 16, 0, false);
+			continue;
+		}
+		/* too long: on a strip of its own, which the tile loop slides
+		 * along under a window the width of the tile */
+		cairo_t *lc;
+		struct zt_buffer *strip = zt_buffer_create(server, whole, size * 1.6, &lc);
+		cairo_set_source_rgb(lc, 1, 1, 1);
+		draw_text(lc, t->live_lines[k], font, size, 0, 0, 0, 0, false);
+		g_dump_name = "tile-back-line";
+		zt_buffer_show(server, &t->sweep_layer[k], strip, lc, whole, size * 1.6);
+		t->sweep_w[k] = whole;
 	}
 	draw_text(cr, t->live_title[0] ? t->live_title : t->label, FONT_REGULAR, 13, 8, t->h - 23,
 		t->w - 16, 0, false);
@@ -2980,7 +3007,8 @@ static void live_read(struct zt_server *server) {
 			}
 			continue;
 		}
-		if (t->live && st.st_mtime == t->live_mtime) {
+		int64_t mtime = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+		if (t->live && mtime == t->live_mtime) {
 			continue;
 		}
 		FILE *f = fopen(path, "r");
@@ -3007,7 +3035,7 @@ static void live_read(struct zt_server *server) {
 			t->next_flip_ms = now_ms() + 2000 + (uint32_t)(rand() % 4000);
 		}
 		t->live = true;
-		t->live_mtime = st.st_mtime;
+		t->live_mtime = mtime;
 		if (server->width > 0) {
 			draw_tile_back(server, i);
 			draw_tile(server, i);	/* its count, on the front */
@@ -3031,6 +3059,9 @@ static void live_tick(struct zt_server *server) {
 			continue;
 		}
 		bool to_back = t->flip < 90.0f;
+		if (to_back) {
+			t->sweep_since = now;	/* its long lines start again from their beginnings */
+		}
 		/* the Windows Phone live-tile notify flip: the face turns in and rocks
 		 * back a little (NotificationCycleShow overshoots -180 -> 35 -> -6 -> 0) */
 		animate_spring(server, &t->flip, to_back ? 180.0f : 0.0f, 520, 0.08f);
@@ -3039,6 +3070,42 @@ static void live_tick(struct zt_server *server) {
 			4000 + (uint32_t)(rand() % 6000));
 		damage(server);
 		break;
+	}
+}
+
+/* A long line on a live tile's back sweeps across, the way Windows Phone
+ * marquees what does not fit: it rests at its start, slides until its end
+ * shows, rests there, and starts again. `m` maps the unit square onto the
+ * tile's face as it is drawn now (turning or not); each line is a quad over
+ * its own box on that face, sampling a window of its strip. */
+#define SWEEP_REST_MS	1200
+#define SWEEP_SPEED	30.0	/* points a second */
+
+static void tile_back_sweep(struct zt_server *server, struct tile *t, const float m[16], float alpha) {
+	uint32_t now = now_ms();
+	for (int k = 0; k < 3; k++) {
+		struct zt_layer *strip = &t->sweep_layer[k];
+		if (t->sweep_w[k] <= 0 || !strip->tex) {
+			continue;
+		}
+		double box_w = t->w - 16, box_h = strip->h;
+		double travel = t->sweep_w[k] - box_w;
+		double slide_ms = travel / SWEEP_SPEED * 1000.0;
+		double cycle = 2 * SWEEP_REST_MS + slide_ms;
+		double at = fmod((double)(now - t->sweep_since), cycle);
+		double off = at < SWEEP_REST_MS ? 0 :
+			at < SWEEP_REST_MS + slide_ms ? (at - SWEEP_REST_MS) * SWEEP_SPEED / 1000.0 : travel;
+		float lm[16];
+		memcpy(lm, m, sizeof(lm));
+		mat_translate(lm, (float)(8 / t->w), (float)(BACK_LINE_Y(t, k) / t->h));
+		mat_scale(lm, (float)(box_w / t->w), (float)(box_h / t->h));
+		float u_per_pt = (float)strip->pw / strip->tw / (float)t->sweep_w[k];
+		server->uv_off[0] = (float)off * u_per_pt;
+		server->uv_off[1] = 0;
+		quad(server, GL_TEXTURE_2D, strip->tex, lm, alpha, true, false,
+			(float)box_w * u_per_pt, (float)strip->ph / strip->th);
+		server->uv_off[0] = 0;
+		server->sweeping = true;
 	}
 }
 
@@ -9422,6 +9489,9 @@ static void render_frame(struct zt_server *server) {
 			wall_under(server, m, t->x, t->y, t->w, t->h, alpha * dim);
 			quad(server, GL_TEXTURE_2D, face->tex, m, alpha * dim, true, false,
 				(float)face->pw / face->tw, (float)face->ph / face->th);
+			if (face == &t->back_layer) {
+				tile_back_sweep(server, t, m, alpha * dim);
+			}
 		}
 		if (server->edit_t > 0.3f && server->edit >= 0 && server->edit < n && server->badge_unpin.tex) {
 			/* its two buttons, on its right-hand corners */
@@ -9770,6 +9840,10 @@ static void render_frame(struct zt_server *server) {
 	}
 	wlr_output_state_finish(&state);
 	server->dirty = false;
+	if (server->sweeping) {
+		server->sweeping = false;	/* set again by the next frame's tiles if still so */
+		damage(server);
+	}
 	clock_gettime(CLOCK_MONOTONIC, &t3);
 	running = running || loading_active(server);
 	if (running) {
@@ -9989,6 +10063,11 @@ static int reload(int signal_number, void *data) {
 			}
 			if (server->tiles[i].back_layer.tex) {
 				glDeleteTextures(1, &server->tiles[i].back_layer.tex);
+			}
+			for (int k = 0; k < 3; k++) {
+				if (server->tiles[i].sweep_layer[k].tex) {
+					glDeleteTextures(1, &server->tiles[i].sweep_layer[k].tex);
+				}
 			}
 		}
 		gl_end(server);

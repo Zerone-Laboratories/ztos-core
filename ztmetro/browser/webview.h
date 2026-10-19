@@ -26,6 +26,8 @@ struct wv_delegate {
 	/* a text field in the page took or lost focus; caret_bottom: where its
 	 * caret ends, in points from the top of the view (-1: not known) */
 	void (*ime)(void *user, bool active, int caret_bottom);
+	/* the page started or stopped playing sound */
+	void (*playing)(void *user, bool playing);
 	void *user;
 };
 
@@ -39,6 +41,8 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 			       const struct wv_delegate *delegate);
 
 void webview_place(struct webview *wv, int x, int y, int w, int h, int scale);
+/* the `user` the delegate's callbacks get from now on (a tab that moved) */
+void webview_set_user(struct webview *wv, void *user);
 void webview_show(struct webview *wv, bool on);
 
 void webview_load(struct webview *wv, const char *url);

@@ -435,6 +435,10 @@ static void notify_progress(WebKitWebView *web, GParamSpec *p, gpointer u) {
 	struct webview *wv = u;
 	if (wv->d.progress) wv->d.progress(wv->d.user, webkit_web_view_get_estimated_load_progress(web));
 }
+static void notify_playing(WebKitWebView *web, GParamSpec *p, gpointer u) {
+	struct webview *wv = u;
+	if (wv->d.playing) wv->d.playing(wv->d.user, webkit_web_view_is_playing_audio(web));
+}
 static void load_changed(WebKitWebView *web, WebKitLoadEvent ev, gpointer u) {
 	struct webview *wv = u;
 	enum wv_load s = WV_STARTED;
@@ -593,6 +597,7 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 	g_signal_connect(wv->web, "notify::uri", G_CALLBACK(notify_uri), wv);
 	g_signal_connect(wv->web, "notify::estimated-load-progress", G_CALLBACK(notify_progress), wv);
 	g_signal_connect(wv->web, "load-changed", G_CALLBACK(load_changed), wv);
+	g_signal_connect(wv->web, "notify::is-playing-audio", G_CALLBACK(notify_playing), wv);
 	return wv;
 }
 
@@ -621,6 +626,7 @@ void webview_place(struct webview *wv, int x, int y, int w, int h, int scale) {
 }
 
 void webview_show(struct webview *wv, bool on) { wv->shown = on; }
+void webview_set_user(struct webview *wv, void *user) { wv->d.user = user; }
 void webview_load(struct webview *wv, const char *url) { webkit_web_view_load_uri(wv->web, url); }
 void webview_reload(struct webview *wv, bool bypass) {
 	if (bypass) webkit_web_view_reload_bypass_cache(wv->web); else webkit_web_view_reload(wv->web);
