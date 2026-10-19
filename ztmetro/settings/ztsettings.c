@@ -1025,27 +1025,48 @@ static void walls_scan(void) {
 	}
 }
 
-/* A photo's picker thumbnail, made once: the shipped thumb if it has one, at
- * the shipped size. Drawing never decodes: a photo asked for is queued and one
- * is made per tick (wall_tick) until none is left, so the page stays smooth.
- * A tile not made yet is grey; the rows of the page swivel in with what is. */
-#define WALL_PW		216
-#define WALL_PH		384
-#define WALL_TICK_MS	100
-#define WALL_PER_TICK	6
+/* A photo's picker thumbnail: the shipped thumb (a small compressed copy;
+ * a photo without one is decoded at a reduced size, never at full size). Made
+ * a few a tick on the timer, never while drawing. A grid photo is drawn by
+ * wall_overlay on the GPU, swivelling in when it arrives and out when the
+ * category goes; the page itself keeps only the grey tile under it. */
+#define WALL_PW			216
+#define WALL_PH			384
+#define WALL_FRAME_MS		16
+#define WALL_PER_TICK		2
+#define WALL_SWIVEL_IN_MS	300	/* "swivel in": -60 to 0 about X, Log 200 */
+#define WALL_SWIVEL_OUT_MS	199	/* "swivel out": 0 to 60 about X, Exp 60 */
+#define WALL_TURN_MS		480	/* the page's rows turning in, before the photos */
+#define WALL_LEAVE_MS		220	/* a category leaving: its photos swivel out, then the page turns */
 static unsigned char wall_state[MAX_WALLS];	/* 0 not made, 1 queued, 2 made, 3 failed */
+static uint32_t wall_arrive[MAX_WALLS];		/* when a made photo swivels in */
 static int wall_queue[MAX_WALLS], wall_q_n, wall_q_head;
 static bool wall_ticking;
+static uint32_t wall_busy_until;		/* a photo still swivelling in */
+static uint32_t wall_leave_at;			/* 0: not leaving */
+static double wall_grid_top;			/* the page y of the grid's first row */
+
+static void wall_tick(void);
+
+static void wall_kick(void) {
+	if (!wall_ticking) {
+		wall_ticking = true;
+		zmc_every(WALL_FRAME_MS, wall_tick);
+	}
+}
 
 static void wall_make(int k) {
 	const char *path = wall_thumb_path[k][0] ? wall_thumb_path[k] : walls[k];
 	wall_thumbs[k] = thumb_cover(path, WALL_PW, WALL_PH);
 	wall_state[k] = wall_thumbs[k] ? 2 : 3;
+	wall_arrive[k] = zmc_now_ms();
+	wall_busy_until = wall_arrive[k] + WALL_SWIVEL_IN_MS;
 }
 
-/* A few photos a tick, then the page is drawn once: a redraw is the page's
- * whole raster, so one per photo cost the page's time over and over. */
+/* the frame timer: a couple of photos made, the category sent away when its
+ * time is up, and frames while anything is swivelling */
 static void wall_tick(void) {
+	uint32_t now = zmc_now_ms();
 	int made = 0;
 	while (wall_q_head < wall_q_n && made < WALL_PER_TICK) {
 		int k = wall_queue[wall_q_head++];
@@ -1053,23 +1074,28 @@ static void wall_tick(void) {
 		wall_make(k);
 		made++;
 	}
-	if (made) zmc_redraw();
-	if (wall_q_head >= wall_q_n) {
-		wall_q_n = wall_q_head = 0;
-		wall_ticking = false;
-		zmc_every(0, NULL);
+	if (wall_leave_at && (int32_t)(now - wall_leave_at) >= WALL_LEAVE_MS) {
+		wall_leave_at = 0;
+		zmc_turn(-1);			/* the page turns back to the categories */
+		wall_cat_open = -1;
 	}
+	if (made && wall_cat_open < 0) zmc_redraw();	/* the categories' photos are in their page */
+	bool busy = wall_leave_at || wall_q_head < wall_q_n || (int32_t)(wall_busy_until - now) > 0;
+	if (busy) {
+		zmc_present();
+		return;
+	}
+	wall_q_n = wall_q_head = 0;
+	wall_ticking = false;
+	zmc_every(0, NULL);
 }
 
-/* the thumbnail if it is made; otherwise it is queued (NULL, a grey tile) */
+/* the thumbnail if it is made; otherwise it is queued (NULL until then) */
 static cairo_surface_t *wall_thumb(int k) {
 	if (wall_state[k] == 0) {
 		wall_state[k] = 1;
 		wall_queue[wall_q_n++] = k;
-		if (!wall_ticking) {
-			wall_ticking = true;
-			zmc_every(WALL_TICK_MS, wall_tick);
-		}
+		wall_kick();
 	}
 	return wall_state[k] == 2 ? wall_thumbs[k] : NULL;
 }
@@ -1077,6 +1103,66 @@ static cairo_surface_t *wall_thumb(int k) {
 /* made now, for the photos a page is about to show, before it turns in */
 static void wall_prefetch(int k) {
 	if (wall_state[k] == 0 || wall_state[k] == 1) wall_make(k);
+}
+
+/* the curves of DevTest's animations (Iris's Exp and Log, weights as there) */
+static double wall_ease(double t, bool out) {
+	double a = out ? 2.0 : 200.0 / 30.0;
+	t = fmin(1, fmax(0, t));
+	if (out) return (exp(a * t) - 1) / (exp(a) - 1);
+	return 1 - (exp(a * (1 - t)) - 1) / (exp(a) - 1);
+}
+
+/* a photo turned `deg` about its horizontal middle line, drawn on the GPU */
+static void wall_card(cairo_surface_t *img, unsigned rev, double x, double y, double w, double h,
+		double deg, double alpha) {
+	double a = deg * M_PI / 180, c[4][3];
+	for (int i = 0; i < 4; i++) {
+		double lx = (i & 1) ? w : 0, ly = (i & 2) ? h : 0;
+		double u = ly - h / 2;
+		c[i][0] = x + lx;
+		c[i][1] = y + h / 2 + u * cos(a);
+		c[i][2] = u * sin(a);
+	}
+	zmc_gpu_quad(img, rev, c, alpha);
+}
+
+/* the grid's photos, on the GPU over the page: each swivels in when it has
+ * arrived, and all swivel out when the category is leaving */
+static void wall_overlay(int page) {
+	if (page != PAGE_WALLS || wall_cat_open < 0 || n_walls < 0) return;
+	uint32_t now = zmc_now_ms();
+	double gap = 8, tw = (zmc.width - 2 * MARGIN - 2 * gap) / 3.0, th = tw * 16.0 / 9.0;
+	int c = wall_cat_open;
+	const char *current = app.wall_target == 2 ? app.lock_wall : app.start_wall;
+	double ar = ((ACCENTS[app.accent].color >> 16) & 255) / 255.0;
+	double ag = ((ACCENTS[app.accent].color >> 8) & 255) / 255.0;
+	double ab = (ACCENTS[app.accent].color & 255) / 255.0;
+	for (int i = 1; i <= cat_count[c]; i++) {
+		int k = cat_first[c] + i - 1;
+		if (wall_state[k] != 2) continue;
+		double x = MARGIN + (i % 3) * (tw + gap), y = wall_grid_top + (i / 3) * (th + gap) - zmc.scroll;
+		if (y + th < ZMC_HEADER_H || y > zmc.height) continue;
+		double deg, alpha;
+		if (wall_leave_at) {
+			double e = wall_ease((double)(now - wall_leave_at) / WALL_SWIVEL_OUT_MS, true);
+			deg = 60 * e;
+			alpha = 1 - e;
+		} else {
+			if ((int32_t)(now - wall_arrive[k]) < 0) continue;	/* not its turn yet */
+			double e = wall_ease((double)(now - wall_arrive[k]) / WALL_SWIVEL_IN_MS, false);
+			deg = -60 * (1 - e);
+			alpha = e;
+		}
+		if (alpha <= 0) continue;
+		wall_card(wall_thumbs[k], k + 1, x, y, tw, th, deg, alpha);
+		if (!wall_leave_at && current[0] && strcmp(current, walls[k]) == 0) {
+			zmc_gpu_rect(x, y, tw, 4, ar, ag, ab);
+			zmc_gpu_rect(x, y + th - 4, tw, 4, ar, ag, ab);
+			zmc_gpu_rect(x, y, 4, th, ar, ag, ab);
+			zmc_gpu_rect(x + tw - 4, y, 4, th, ar, ag, ab);
+		}
+	}
 }
 
 /* a thumbnail covering a w x h box at (x, y), its image as drawn */
@@ -1143,6 +1229,7 @@ static double draw_wall_grid(cairo_t *cr, double y) {
 	double tw = (zmc.width - 2 * MARGIN - 2 * gap) / 3.0, th = tw * 16.0 / 9.0;
 	int c = wall_cat_open;
 	int count = cat_count[c];
+	wall_grid_top = y;
 	for (int i = 0; i <= count; i++) {
 		double x = MARGIN + (i % 3) * (tw + gap), ty = y + (i / 3) * (th + gap);
 		bool chosen;
@@ -1156,7 +1243,8 @@ static double draw_wall_grid(cairo_t *cr, double y) {
 			zmc_add_hit(x, ty, tw, th, ACT_WALL, 0);
 		} else {
 			int k = cat_first[c] + i - 1;
-			draw_wall_tile(cr, wall_thumb(k), x, ty, tw, th);
+			wall_thumb(k);		/* made in the background; wall_overlay draws it */
+			draw_wall_tile(cr, NULL, x, ty, tw, th);
 			chosen = strcmp(current, walls[k]) == 0;
 			zmc_add_hit(x, ty, tw, th, ACT_WALL, k + 1);
 		}
@@ -2387,8 +2475,10 @@ static void activate(int action, int arg) {
 		}
 		if (arg == PAGE_WALLS) {
 			wall_cat_open = -1;	/* opens on the categories */
+			wall_leave_at = 0;
 			if (n_walls < 0) walls_scan();
 			for (int c = 0; c < n_cats; c++) wall_prefetch(cat_first[c]);	/* their first photos */
+			wall_kick();
 		}
 		zmc_go(arg, 1);
 		break;
@@ -2405,9 +2495,18 @@ static void activate(int action, int arg) {
 	case ACT_WALL_CAT:
 		/* the first screen of photos made, then the rows swivel out and the
 		 * category's rows swivel in, the photos on them */
-		for (int i = 0; i < cat_count[arg] && i < 6; i++) wall_prefetch(cat_first[arg] + i);
-		zmc_turn(1);
-		wall_cat_open = arg;
+		{
+			uint32_t now = zmc_now_ms();
+			int n = cat_count[arg];
+			for (int i = 0; i < n && i < 6; i++) wall_prefetch(cat_first[arg] + i);
+			for (int i = 0; i < n && i < 6; i++) {	/* their swivel in, once the rows are in */
+				wall_arrive[cat_first[arg] + i] = now + WALL_TURN_MS + (i % 3) * 60 + (i / 3) * 60;
+			}
+			wall_busy_until = now + WALL_TURN_MS + 200 + 120;
+			wall_kick();
+			zmc_turn(1);
+			wall_cat_open = arg;
+		}
 		break;
 	case ACT_WALL: {
 		const char *path = arg > 0 && arg <= n_walls ? walls[arg - 1] : "";
@@ -2947,9 +3046,11 @@ static bool back(void) {
 		return true;
 	}
 	if (zmc.page == PAGE_WALLS) {
-		if (wall_cat_open >= 0) {	/* a category: back to the categories, swivelling away */
-			zmc_turn(-1);
-			wall_cat_open = -1;
+		if (wall_cat_open >= 0) {	/* a category: its photos swivel out, then back to the categories */
+			if (!wall_leave_at) {
+				wall_leave_at = zmc_now_ms();
+				wall_kick();
+			}
 			return true;
 		}
 		zmc_go(PAGE_THEME, -1);
@@ -3015,7 +3116,7 @@ static bool held(int action, int arg) {
 static const struct zmc_app settings = {
 	.app_id = "ztsettings", .title = "Settings", .caps = "SETTINGS",
 	.render = render_page_content, .activate = activate, .slide = slide,
-	.back = back, .arrived = arrived, .text = typed, .hold = held,
+	.back = back, .arrived = arrived, .text = typed, .hold = held, .overlay = wall_overlay,
 };
 
 /* --render PAGE FILE: draw one page into a PNG and leave, touching no display.
