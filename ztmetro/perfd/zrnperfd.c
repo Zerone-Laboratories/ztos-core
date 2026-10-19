@@ -1080,18 +1080,28 @@ int main(void) {
 		return 1;
 	}
 	int uev = uevents();
+	/* the touchscreen may not be there yet at boot: look again every 2 s until
+	 * it is (perfd once gave up for the whole boot, and no swipe boosted) */
 	int touch = touch_open();
+	long touch_next_try = boost_ms() + 2000;
 	char pending[1024];
 	size_t pending_len = 0;
 	while (!stopping) {
 		struct pollfd fds[5] = { { .fd = ctl, .events = POLLIN }, { .fd = uev, .events = POLLIN },
 			{ .fd = touch, .events = POLLIN } };
 		int n = 3 + tickle_pollfds(fds + 3, 2);
+		if (touch < 0 && boost_ms() >= touch_next_try) {
+			touch = touch_open();
+			touch_next_try = boost_ms() + 2000;
+		}
 		/* while the boost is watching, a look four times a second; asleep
 		 * and in the performance profile nothing wakes for it */
 		int wait = tickle_timeout();
 		if (boost_live() && (wait < 0 || wait > BOOST_SAMPLE_MS)) {
 			wait = BOOST_SAMPLE_MS;
+		}
+		if (touch < 0 && (wait < 0 || wait > 2000)) {
+			wait = 2000;	/* the touchscreen's retry */
 		}
 		/* A screen-off loop may otherwise poll forever with no events. */
 		if (wifi_sleep_at && !wifi_asleep && !screen_on && !plugged) {
