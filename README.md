@@ -7,7 +7,7 @@ look and motion) on Arch Linux ARM and mainline Linux, with its own apps, an
 updater and an SDK for apps in Python and Qt. The ztMETRO Shell and its components are written in C, and accelerated with OpenGL. Currently its ported for a Samsung Galaxy
 S9 (starlte), and I am hoping to expand supports for more devices in the future :).
 
-> This ROM is in very much Alpha, The installer is not tested on real hardware, open a issue in this github repo if you have any issues with it
+> This ROM is in Beta, The installer is not tested on real hardware, open a issue in this github repo if you have any issues with it
 
 >Your warranty is now void. I am not responsible for bricked devices, dead SD cards, thermonuclear war, or you getting fired because the alarm app failed. Please do some research if you have any concerns about features included in this ROM before flashing it! YOU are choosing to make these modifications, and if you point the finger at me for messing up your device, I will laugh at you.
 
@@ -18,6 +18,22 @@ The installer lets you choose between:
 3. **Build image in this PC and store** (builds and exports the image without flashing)
 
 **Jump to:** [Screenshots](#screenshots) · [Status: what works](#status) · [**Known quirks**](#known-quirks) (read before flashing) · [What is where](#what-is-where) · [The SDK](sdk/README.md) · [License](#license)
+
+## Repositories
+
+Since BETA-1 ztOS is a generic system image (GSI) plus one device layer per
+phone, meeting at ztOSIAL ([design/ztOSIAL.md](design/ztOSIAL.md)). Each part
+has its own repository in the organisation; this one keeps everything in one
+tree, and `scripts/split/split.py` cuts it into them.
+
+| Repository | What it holds |
+|---|---|
+| [ztos-core](https://github.com/Zerone-Laboratories/ztos-core) | ztMETRO, the apps, the SDK, Android support and the system files in the GSI |
+| [ztos-ial](https://github.com/Zerone-Laboratories/ztos-ial) | ztOSIAL: the interfaces, `ztos-iald`, the CLI, the C and Python clients, the porting guide (LGPL-2.1-or-later) |
+| [ztos-build](https://github.com/Zerone-Laboratories/ztos-build) | the installer and `ztos build --target gsi` |
+| [ztos-device-samsung-starlte](https://github.com/Zerone-Laboratories/ztos-device-samsung-starlte) | the Galaxy S9's device layer: kernel, firmware, drivers, ztOSIAL backends |
+| [ztos-devices](https://github.com/Zerone-Laboratories/ztos-devices) | ztConflo's registry of phones |
+| [ztconflo](https://github.com/Zerone-Laboratories/ztconflo) | builds ztOS for other phones, from the GSI (`--gsi`) |
 
 ## Screenshots
 
@@ -37,6 +53,8 @@ From a Galaxy S9 running ztOS (taken from the live display with `scripts/phone-g
 
 | | |
 |---|---|
+| `ial/` | ztOSIAL: the hardware interfaces between the GSI and a phone ([ial/README.md](ial/README.md)) |
+| `devices/` | device layers: `samsung-starlte` (the S9) and `qemu-virt` |
 | `installer/` | `ztos`, the installer: builds ztOS and installs it in QEMU or on the phone |
 | `os/` | what makes the system ztOS: its packages, files (identity, session, updater, default tiles, fonts) and apps (Welcome, Updates) |
 | `ztmetro/` | the shell, its toolkit (ZrnMetroCore), the apps written with it (Settings, ZrnDevTest, Phone, Messaging, People) and the system daemons |

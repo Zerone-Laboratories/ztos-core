@@ -237,6 +237,7 @@
       <li><a href="#apps">Apps</a></li>
       <li><a href="#sdk">The SDK</a></li>
       <li><a href="#services">System services</a></li>
+      <li><a href="#structure">GSI and ztOSIAL</a></li>
       <li>
         <a href="#s9">The Galaxy S9 port</a>
         <ul class="sub-nav">
@@ -268,7 +269,7 @@
         <h1>ztOS</h1>
         <p class="lead">A phone operating system with Windows Phone 8.1's look and motion, on Arch Linux ARM and mainline Linux.</p>
         <p>ztOS is the ztMETRO shell, its own apps, an updater and an SDK for apps in Python and Qt, on an ordinary Arch Linux ARM system. It runs on the Samsung Galaxy S9 (SM-G960N, starlte) and in the QEMU emulator. Everything that moves is drawn by the GPU.</p>
-        <p>It is alpha software. The S9 port runs a mainline 7.1 kernel with the phone's GPU, display, touch, Wi-Fi, 4G data, sound and sensors working. ztConflo, its image builder, is how it reaches other phones.</p>
+        <p>It is beta software. Since BETA-1 ztOS is a generic system image (GSI) plus a small layer per phone, the two meeting at ztOSIAL, its hardware interface layer. The S9 port runs a mainline 7.1 kernel with the phone's GPU, display, touch, Wi-Fi, 4G data, sound and sensors working. ztConflo, its image builder, is how it reaches other phones.</p>
         <div class="actions">
           <a class="btn" href="#installing">Install it</a>
           <a class="btn ghost" href="https://github.com/Zerone-Laboratories/ztOS">View the source</a>
@@ -284,8 +285,9 @@
           <dt>Devices</dt><dd>Galaxy S9 (starlte), QEMU; others through <a href="#ztconflo">ztConflo</a></dd>
           <dt>Graphics</dt><dd>Mesa Panfrost, OpenGL ES 3.1 on the S9's Mali-G72</dd>
           <dt>Apps</dt><dd>Native C apps, and Python and Qt through the SDK</dd>
+          <dt>Structure</dt><dd>A <a href="#structure">GSI and a device layer</a>, joined by ztOSIAL</dd>
           <dt>Written in</dt><dd>C, Python, shell</dd>
-          <dt>Licence</dt><dd>GPL 3</dd>
+          <dt>Licence</dt><dd>GPL 3; ztOSIAL LGPL 2.1 or later</dd>
         </dl>
       </aside>
     </div>
@@ -377,7 +379,38 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
               <tr><td>ztOSCoreNetworking</td><td>The modem, calls, messages and mobile data, and joining Wi-Fi</td></tr>
               <tr><td>ztOSCirrusAudio</td><td>Sound: the audio DSP and the Cirrus speaker amplifiers</td></tr>
               <tr><td>zrnperfd</td><td>Power: dynamic boost from the efficiency cores up, and core power-down</td></tr>
+              <tr><td>ztos-iald</td><td>ztOSIAL: serves the phone's hardware to the rest of ztOS over D-Bus, the same on every phone</td></tr>
+              <tr><td>Waydroid</td><td>Android apps, in a stripped-down Android 13 fetched and set up on first boot</td></tr>
               <tr><td>ztos-update</td><td>The updater: a daily check, a notification, and the Updates app</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="structure">
+    <div class="wrap">
+      <div><h2>GSI and ztOSIAL</h2><p class="sub">How ztOS is put together since BETA-1.</p></div>
+      <div class="body">
+        <p>ztOS is built as one generic system image (GSI) for every aarch64 phone: the shell, the apps, the services and Waydroid, with no kernel, no user and nothing specific to a phone. Each phone adds a device layer: its kernel, firmware, drivers, and a manifest saying how its hardware is reached. The two meet at ztOSIAL, a set of D-Bus interfaces (<code>org.ztos.ial</code>) served by <code>ztos-iald</code>.</p>
+        <dl class="rules">
+          <div><dt>Interfaces</dt><dd>13: device, power, performance, display, sleep, sensors, haptics, lights, modem, call audio, audio devices, acceleration and Android.</dd></div>
+          <div><dt>Backends</dt><dd>Each interface is served by a generic backend (enough on a phone with full mainline support), the generic one with parameters, a Python backend in the device layer, or a separate service.</dd></div>
+          <div><dt>Device layer</dt><dd><code>/vendor/ztos/manifest.toml</code> and what it names. Porting a phone means writing this, not changing ztOS.</dd></div>
+          <div><dt>Kernel contract</dt><dd>The GSI lists the kernel options it needs; ztConflo checks a phone's kernel against it before building.</dd></div>
+          <div><dt>Checking a port</dt><dd><code>ztos-ial status</code> and <code>ztos-ial test</code> on the phone show what works.</dd></div>
+        </dl>
+        <div class="table-scroll" style="margin-top:1.25rem">
+          <table>
+            <thead><tr><th>Repository</th><th>What it holds</th></tr></thead>
+            <tbody>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztos-core">ztos-core</a></td><td>ztMETRO, the apps, the SDK, Android support and the system files in the GSI</td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztos-ial">ztos-ial</a></td><td>The interfaces, <code>ztos-iald</code>, the command line and the C and Python clients; the porting guide</td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztos-build">ztos-build</a></td><td>The installer: <code>ztos build --target gsi</code> builds the GSI</td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztos-device-samsung-starlte">ztos-device-samsung-starlte</a></td><td>The Galaxy S9's device layer, and the example for new ones</td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztos-devices">ztos-devices</a></td><td>ztConflo's registry of phones</td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztOS">ztOS</a></td><td>Everything in one tree, as before the split</td></tr>
             </tbody>
           </table>
         </div>
@@ -448,7 +481,7 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
     <div class="wrap">
       <div><h2>ztConflo: other phones</h2><p class="sub">How ztOS leaves the S9.</p></div>
       <div class="body">
-        <p>ztConflo takes a phone's codename and builds a flashable ztOS image for it: Arch Linux ARM with ztMETRO, on a kernel and boot setup that postmarketOS already boots. It looks in the ztOS device registry first and falls back to postmarketOS for phones nobody has ported ztOS to yet. It never ports new hardware.</p>
+        <p>ztConflo takes a phone's codename and builds a flashable ztOS image for it: Arch Linux ARM with ztMETRO, on a kernel and boot setup that postmarketOS already boots. Given the GSI (<code>--gsi</code>), it adds a device layer generated for the phone and checks the phone's kernel against the GSI's kernel contract. It looks in the ztOS device registry first and falls back to postmarketOS for phones nobody has ported ztOS to yet. It never ports new hardware.</p>
         <dl class="rules">
           <div><dt>Eligible phones</dt><dd>135 today, with a mainline aarch64 kernel; 71 of them archived by postmarketOS, and flagged.</dd></div>
           <div><dt>GPU check</dt><dd>Phones without a Mesa GPU driver still build, with a warning that ztMETRO won't start.</dd></div>
@@ -468,11 +501,12 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
       <div><h2>Status and next</h2><p class="sub">Where ztOS is today.</p></div>
       <div class="body">
         <div class="alert" role="note">
-          <b>Alpha</b>
-          ztOS 0.2.0 beta 1 runs daily on one Galaxy S9. The installer's phone path is implemented but not yet validated end to end on a fresh install, and no ztConflo image has booted on another phone yet.
+          <b>Beta</b>
+          ztOS 0.2.0 beta 1 runs daily on one Galaxy S9, as the GSI and the S9's device layer. The installer's phone path is implemented but not yet validated end to end on a fresh install, and no ztConflo image has booted on another phone yet.
         </div>
         <ul class="prose" style="margin-top:1.25rem">
-          <li>The first phone besides the S9 booting a ztConflo build.</li>
+          <li>The first phone besides the S9 booting a ztConflo build from the GSI.</li>
+          <li>Calls, messages and sensors in the apps through ztOSIAL, rather than the S9's own services.</li>
           <li>The sound of calls, and receiving SMS.</li>
           <li>Suspend on the S9, for idle battery life closer to Android's.</li>
           <li>Native apps drawing with OpenGL ES the way the shell does, and a ztOS package repository for updates.</li>
@@ -486,7 +520,7 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
       <div><h2>See also</h2></div>
       <div class="body">
         <ul class="prose">
-          <li><a href="https://github.com/Zerone-Laboratories/ztOS">ztOS source</a>, with the full status page and the SDK guide</li>
+          <li><a href="https://github.com/Zerone-Laboratories/ztOS">ztOS source</a>, with the full status page and the SDK guide, and its parts: <a href="https://github.com/Zerone-Laboratories/ztos-core">ztos-core</a>, <a href="https://github.com/Zerone-Laboratories/ztos-ial">ztos-ial</a>, <a href="https://github.com/Zerone-Laboratories/ztos-build">ztos-build</a> and <a href="https://github.com/Zerone-Laboratories/ztos-device-samsung-starlte">ztos-device-samsung-starlte</a></li>
           <li><a href="https://zerone-laboratories.web.app/ztconflo/">ztConflo</a>, the image builder, and <a href="https://github.com/Zerone-Laboratories/ztos-devices">ztos-devices</a>, its registry</li>
           <li><a href="https://github.com/SheroAbi/galaxy-s9plus-mainline-linux">galaxy-s9plus-mainline-linux</a>, the Exynos 9810 mainline drivers ztOS builds on</li>
           <li><a href="https://postmarketos.org">postmarketOS</a>, whose kernels ztConflo reuses</li>
