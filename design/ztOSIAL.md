@@ -30,7 +30,7 @@ pacman repository lives is still open.
 
 ztOS splits into a **generic system** that is the same on every phone and a
 **device layer** that is different on each one. The two meet only at
-**ztOSIAL**, the ztOS Interface Abstraction Layer: a set of small, versioned
+**ztOSIAL**, the Zerone Technologies Operating System Interface Abstraction Layer: a set of small, versioned
 interfaces for the hardware that standard Linux does not already cover.
 
 - The generic system is built once per release for all aarch64 phones: the

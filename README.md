@@ -22,7 +22,7 @@ The installer lets you choose between:
 ## Repositories
 
 Since BETA-1 ztOS is a generic system image (GSI) plus one device layer per
-phone, meeting at ztOSIAL ([design/ztOSIAL.md](design/ztOSIAL.md)). Each part
+phone, meeting at ztOSIAL, the Zerone Technologies Operating System Interface Abstraction Layer ([design/ztOSIAL.md](design/ztOSIAL.md)). Each part
 has its own repository in the organisation; this one keeps everything in one
 tree, and `scripts/split/split.py` cuts it into them.
 
