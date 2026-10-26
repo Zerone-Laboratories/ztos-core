@@ -85,6 +85,8 @@ struct zmc_app {
 	bool (*touch)(int phase, int id, double x, double y, uint32_t time);
 	/* the page never scrolls or rubber-bands under a drag */
 	bool fixed;
+	/* the overlay may cover the header: draw the cached header before overlay */
+	bool overlay_above_header;
 };
 
 struct zmc_buffer {
@@ -117,6 +119,7 @@ struct zmc_state {
 	int scale;
 	int width, height;	/* points */
 	bool configured, running, dirty;
+	bool active;		/* the shell has this app in front (XDG activated) */
 	uint32_t accent;	/* 0xRRGGBB */
 
 	int page;
@@ -244,6 +247,9 @@ void zmc_text_centred(cairo_t *cr, const char *s, const char *font, double size,
 /* For an overlay: a Cairo surface (in pixels) as a quad whose corners, top
  * left, top right, bottom left, bottom right, are points with z toward the
  * viewer (the shell's own perspective); a solid rectangle; another frame. */
+/* A pixel region of an atlas, mapped to the same projected quad. */
+void zmc_gpu_quad_region(cairo_surface_t *source, unsigned revision, double x, double y,
+		double w, double h, const double corners[4][3], double alpha);
 void zmc_gpu_quad(cairo_surface_t *source, unsigned revision, const double corners[4][3], double alpha);
 void zmc_gpu_rect(double x, double y, double w, double h, double r, double g, double b);
 /* A GPU buffer from elsewhere (a DMA-BUF: a video frame, a web page) drawn with

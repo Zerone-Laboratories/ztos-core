@@ -22,6 +22,9 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include "ztos-hw.h"
+#include "zrnvibe.h"
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
 #include <sys/sysinfo.h>
@@ -35,6 +38,16 @@
 #include <wayland-client.h>
 
 #include "zrnmetrocore.h"
+#include "../background-apps.h"
+
+/* A file in the session's runtime directory: $XDG_RUNTIME_DIR, or
+ * /run/user/<our UID> when whatever started us did not set it. */
+static const char *runtime_file(char *out, size_t size, const char *name) {
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	if (runtime) snprintf(out, size, "%s/%s", runtime, name);
+	else snprintf(out, size, "/run/user/%u/%s", (unsigned)getuid(), name);
+	return out;
+}
 
 #define MAX_NETWORKS	24
 enum page {
@@ -53,6 +66,8 @@ enum page {
 	PAGE_PERF,
 	PAGE_DEV,
 	PAGE_APPS,	/* the second tab of the hub */
+	PAGE_INSTALLED_APPS,
+	PAGE_APP_DETAIL,
 	PAGE_HAPTICS,
 	PAGE_QUICK,
 	PAGE_APN,
@@ -62,9 +77,13 @@ enum page {
 	PAGE_BLUETOOTH,
 	PAGE_ACCENTS,	/* the accent picker, full screen */
 	PAGE_WALLS,	/* the background photo picker: categories, then one */
+	PAGE_NAVIGATION,
+	PAGE_BOOST,	/* Dynamic Boost System: RapidBoost and IntelligentBoost */
 };
 
 enum action {
+	ACT_RINGTONE = 700,
+	ACT_APP_SELECT = 600, ACT_APP_BACKGROUND, ACT_APP_BATCH,
 	ACT_DATE_AUTO = 500, ACT_DATE_FIELD, ACT_DATE_REGION, ACT_DATE_SAVE, ACT_DATE_SYNC, ACT_DATE_LANG,
 	ACT_NONE = 0,
 	ACT_OPEN_PAGE,
@@ -100,6 +119,7 @@ enum action {
 	ACT_TIMEOUT_CYCLE,
 	ACT_SCALE_CYCLE,
 	ACT_NAV_SIZE_CYCLE,
+	ACT_NAV_ICON,
 	ACT_KEY_HEIGHT,
 	ACT_KEY_SOUND,
 	ACT_MOBILE_DATA,
@@ -109,6 +129,9 @@ enum action {
 	ACT_RING_VOL_STEP,
 	ACT_VIBRATE_RING,
 	ACT_VIBRATE_SILENT,
+	ACT_VIBE_PATTERN,
+	ACT_VIBE_PREVIEW,
+	ACT_OPEN_SOUND,
 	ACT_BATTERY_SAVER,
 	ACT_CPU_GOVERNOR,
 	ACT_ZRAM_TOGGLE,
@@ -125,6 +148,8 @@ enum action {
 	ACT_DEV_MENU_SPEED,
 	ACT_DEV_TOUCHES,
 	ACT_DEV_LOCK,
+	ACT_DEV_DEMOLOOP,
+	ACT_DEV_DEMOLOOP_STOP,
 	ACT_DEV_OPEN_TEST,
 	ACT_HAPTIC_STRENGTH,
 	ACT_HAPTIC_GROUP,	/* a slider each: this + 1000 * its index into HAPTIC_GROUPS */
@@ -133,6 +158,8 @@ enum action {
 	ACT_APN_AUTH,
 	ACT_APN_SAVE,
 	ACT_ABOUT_REPO,
+	ACT_IB_MODE,		/* arg: 0 off, 1 shadow, 2 on */
+	ACT_IB_ENGINE,		/* arg: 0 the processor, 1 SCORE */
 	ACT_QUICK_SLOT,		/* then one for each of the eight places */
 	ACT_QUICK_LAST = ACT_QUICK_SLOT + 7,
 };
@@ -190,6 +217,7 @@ static struct {
 	bool opentone;
 	int timeout_idx;
 	int nav_size_idx;
+	int nav_icon_idx;
 	int scale_idx;
 
 	bool wifi_on, wifi_loading;
@@ -315,6 +343,8 @@ static void config_load(void) {
 			snprintf(app.start_wall, sizeof(app.start_wall), "%s", val);
 		} else if (strcmp(key, "lock_wallpaper") == 0) {
 			snprintf(app.lock_wall, sizeof(app.lock_wall), "%s", val);
+		} else if (strcmp(key, "nav_center_icon") == 0) {
+			int n = atoi(val); app.nav_icon_idx = n < 0 ? 0 : n > 4 ? 4 : n;
 		} else if (strcmp(key, "accent") == 0) {
 			for (int i = 0; i < N_ACCENTS; i++) {
 				if (strcmp(ACCENTS[i].name, val) == 0) {
@@ -391,7 +421,7 @@ static void config_load(void) {
 	if (buf[0]) snprintf(app.cpu_gov, sizeof(app.cpu_gov), "%s", buf);
 	else snprintf(app.cpu_gov, sizeof(app.cpu_gov), "schedutil");
 
-	read_sys_file("/sys/class/devfreq/17500000.gpu/governor", buf, sizeof(buf));
+	read_sys_file(hw_file(hw_gpu(), "governor"), buf, sizeof(buf));
 	if (buf[0]) snprintf(app.gpu_gov, sizeof(app.gpu_gov), "%s", buf);
 	else snprintf(app.gpu_gov, sizeof(app.gpu_gov), "simple_ondemand");
 
@@ -484,6 +514,8 @@ static void perf_tell(const char *command) {
 	pipe_tell("/run/zrnperfd.ctl", command);
 }
 
+#include "boostpage.h"
+
 /* Auto brightness is sensord's: it has the light sensor. */
 static void auto_load(void) {
 	char line[64];
@@ -502,7 +534,7 @@ static void auto_load(void) {
 
 static void config_save(void) {
 	static const int timeouts[] = { 30, 60, 180, 300, 0 };
-	enum { N_KEYS = 19 + N_HAPTIC_GROUPS };
+	enum { N_KEYS = 20 + N_HAPTIC_GROUPS };
 	struct { const char *key; char value[300]; bool written; } keys[N_KEYS] = {
 		{ .key = "accent" }, { .key = "columns" }, { .key = "haptics" },
 		{ .key = "brightness" }, { .key = "timeout" }, { .key = "demo_tiles" },
@@ -510,7 +542,7 @@ static void config_save(void) {
 		{ .key = "menu_speed" }, { .key = "haptic_strength" }, { .key = "quick" },
 		{ .key = "wifi_suspend" },
 		{ .key = "key_height" }, { .key = "key_sound" },
-		{ .key = "ring_volume" }, { .key = "media_volume" },
+		{ .key = "ring_volume" }, { .key = "media_volume" }, { .key = "nav_center_icon" },
 	};
 	snprintf(keys[13].value, 32, "%d", app.key_height);
     snprintf(keys[14].value, 32, "%s", app.key_sound ? "on" : "off");
@@ -530,6 +562,8 @@ static void config_save(void) {
 	snprintf(keys[17 + N_HAPTIC_GROUPS].value, sizeof(keys[0].value), "%s", app.start_wall);
 	keys[18 + N_HAPTIC_GROUPS].key = "lock_wallpaper";
 	snprintf(keys[18 + N_HAPTIC_GROUPS].value, sizeof(keys[0].value), "%s", app.lock_wall);
+	keys[19 + N_HAPTIC_GROUPS].key = "nav_center_icon";
+	snprintf(keys[19 + N_HAPTIC_GROUPS].value, 32, "%d", app.nav_icon_idx);
 	snprintf(keys[0].value, 32, "%s", ACCENTS[app.accent].name);
 	snprintf(keys[1].value, 32, "%d", app.columns);
 	snprintf(keys[2].value, 32, "%s", app.haptics ? "on" : "off");
@@ -812,6 +846,7 @@ static double draw_main(cairo_t *cr) {
 	snprintf(detail, sizeof(detail), "accent: %s, %d columns",
 		ACCENTS[app.accent].name, app.columns);
 	y = zmc_entry(cr, y, "theme", detail, ACT_OPEN_PAGE, PAGE_THEME);
+	y = zmc_entry(cr, y, "navigation bar", "choose the centre icon", ACT_OPEN_PAGE, PAGE_NAVIGATION);
 
 	snprintf(detail, sizeof(detail), "%d%% brightness, %s timeout",
 		app.brightness, app.timeout_idx == 4 ? "Never" : "1 min");
@@ -847,7 +882,7 @@ static double draw_main(cairo_t *cr) {
 	y = zmc_entry(cr, y, "notifications + actions", detail, ACT_OPEN_PAGE, PAGE_QUICK);
 
 	char bat_buf[32];
-	read_sys_file("/sys/class/power_supply/max170xx_battery/capacity", bat_buf, sizeof(bat_buf));
+	read_sys_file(hw_file(hw_battery(), "capacity"), bat_buf, sizeof(bat_buf));
 	int bat = bat_buf[0] ? atoi(bat_buf) : 51;
 	snprintf(detail, sizeof(detail), "%d%%, %s", bat, app.battery_saver ? "battery saver on" : "discharging");
 	y = zmc_entry(cr, y, "battery saver", detail, ACT_OPEN_PAGE, PAGE_BATTERY);
@@ -868,10 +903,153 @@ static double draw_main(cairo_t *cr) {
 	return y + 20;
 }
 
+/* Read ztapps' already sorted and deduplicated list and its cached glyphs.
+ * Keep each list page below the core's hit and texture limits. */
+#define SETTINGS_MAX_APPS 1024
+#define SETTINGS_APPS_BATCH 64
+static struct settings_app {
+	char name[256], id[256], key[128];
+	cairo_surface_t *icon;
+	bool icon_loaded;
+} installed_apps[SETTINGS_MAX_APPS];
+static int installed_count, installed_selected, installed_batch;
+static char background_error[160];
+
+static void settings_cache_path(char *path, size_t size, const char *below) {
+	const char *cache = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
+	if (cache && *cache) snprintf(path, size, "%s/ztmetro/%s", cache, below);
+	else snprintf(path, size, "%s/.cache/ztmetro/%s", home ? home : "", below);
+}
+
+static void installed_load(void) {
+	for (int i = 0; i < installed_count; i++)
+		if (installed_apps[i].icon) cairo_surface_destroy(installed_apps[i].icon);
+	memset(installed_apps, 0, sizeof(installed_apps));
+	installed_count = installed_batch = 0;
+	bg_reload();
+	char path[768], line[2048];
+	settings_cache_path(path, sizeof(path), "apps");
+	FILE *f = fopen(path, "r");
+	if (!f) return;
+	while (fgets(line, sizeof(line), f) && installed_count < SETTINGS_MAX_APPS) {
+		line[strcspn(line, "\r\n")] = 0;
+		char *key = strchr(line, '|'), *command = key ? strchr(key + 1, '|') : NULL;
+		if (!command || !line[0]) continue;
+		*key++ = 0;
+		*command++ = 0;
+		char *desktop = strrchr(command, '|');
+		if (!desktop || !desktop[1]) continue;
+		*desktop++ = 0;
+		const char *id = strrchr(desktop, '/');
+		id = id ? id + 1 : desktop;
+		size_t len = strlen(id);
+		if (len <= 8 || strcmp(id + len - 8, ".desktop")) continue;
+		struct settings_app *a = &installed_apps[installed_count++];
+		snprintf(a->name, sizeof(a->name), "%s", line);
+		snprintf(a->key, sizeof(a->key), "%s", key);
+		snprintf(a->id, sizeof(a->id), "%.*s", (int)len - 8, id);
+	}
+	fclose(f);
+}
+
+static cairo_surface_t *installed_icon(struct settings_app *a) {
+	if (a->icon_loaded) return a->icon;
+	a->icon_loaded = true;
+	if (!a->key[0] || !strcmp(a->key, "-") || strchr(a->key, '/')) return NULL;
+	char path[768], below[160];
+	snprintf(below, sizeof(below), "icons/%s.a8", a->key);
+	settings_cache_path(path, sizeof(path), below);
+	FILE *f = fopen(path, "rb");
+	if (!f) return NULL;
+	unsigned char head[8];
+	if (fread(head, 1, 8, f) == 8 && !memcmp(head, "ZA8", 3)) {
+		int w = head[4] | head[5] << 8, h = head[6] | head[7] << 8;
+		if (w > 0 && h > 0 && w <= 512 && h <= 512) {
+			cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+			unsigned char *data = cairo_image_surface_get_data(surface);
+			int stride = cairo_image_surface_get_stride(surface);
+			bool ok = cairo_surface_status(surface) == CAIRO_STATUS_SUCCESS;
+			for (int y = 0; y < h && ok; y++) {
+				unsigned char row[512];
+				ok = fread(row, 1, w, f) == (size_t)w;
+				for (int x = 0; x < w && ok; x++)
+					((uint32_t *)(data + y * stride))[x] = (uint32_t)row[x] * 0x01010101u;
+			}
+			if (ok) { cairo_surface_mark_dirty(surface); a->icon = surface; }
+			else cairo_surface_destroy(surface);
+		}
+	}
+	fclose(f);
+	return a->icon;
+}
+
+static void installed_draw_icon(cairo_t *cr, struct settings_app *a, double y) {
+	cairo_surface_t *icon = installed_icon(a);
+	cairo_save(cr);
+	cairo_translate(cr, MARGIN, y + 5);
+	if (icon) {
+		cairo_scale(cr, 40.0 / cairo_image_surface_get_width(icon), 40.0 / cairo_image_surface_get_height(icon));
+		cairo_set_source_surface(cr, icon, 0, 0);
+		cairo_paint(cr);
+	} else {
+		zmc_accent(cr);
+		cairo_rectangle(cr, 0, 0, 40, 40);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		char letter[2] = { a->name[0], 0 };
+		zmc_text(cr, letter, FONT_SEMILIGHT, 26, 10, 1, 0);
+	}
+	cairo_restore(cr);
+}
+
+static double draw_installed_apps(cairo_t *cr) {
+	double y = zmc_header(cr, "apps");
+	if (!installed_count) {
+		cairo_set_source_rgb(cr, .6, .6, .6);
+		return y + zmc_text(cr, "No installed apps found. The app list is still being prepared.",
+			FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN);
+	}
+	int end = installed_batch + SETTINGS_APPS_BATCH;
+	if (end > installed_count) end = installed_count;
+	if (installed_batch) y = zmc_entry(cr, y, "previous apps", "", ACT_APP_BATCH, -1);
+	for (int i = installed_batch; i < end; i++) {
+		struct settings_app *a = &installed_apps[i];
+		installed_draw_icon(cr, a, y);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text_line(cr, a->name, FONT_SEMILIGHT, 22, MARGIN + 52, y, zmc.width - 2 * MARGIN - 52);
+		cairo_set_source_rgb(cr, .6, .6, .6);
+		zmc_text_line(cr, bg_contains(a->id) ? "Background app" :
+			!strncmp(a->id, "waydroid.", 9) ? "Waydroid" :
+			!strncmp(a->id, "ztos-android-", 13) ? "Android Translation Layer" : "Installed app",
+			FONT_REGULAR, 12, MARGIN + 52, y + 30, zmc.width - 2 * MARGIN - 52);
+		zmc_add_hit(0, y - 2, zmc.width, 57, ACT_APP_SELECT, i);
+		y += 59;
+	}
+	if (end < installed_count) y = zmc_entry(cr, y, "more apps", "", ACT_APP_BATCH, 1);
+	return y + 20;
+}
+
+static double draw_app_detail(cairo_t *cr) {
+	double y = zmc_header(cr, "app");
+	if (installed_selected < 0 || installed_selected >= installed_count) return y;
+	struct settings_app *a = &installed_apps[installed_selected];
+	installed_draw_icon(cr, a, y);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	y += zmc_text(cr, a->name, FONT_SEMILIGHT, 24, MARGIN + 52, y, zmc.width - 2 * MARGIN - 52) + 28;
+	y = zmc_switch(cr, y, "Background app", bg_contains(a->id), ACT_APP_BACKGROUND);
+	cairo_set_source_rgb(cr, .6, .6, .6);
+	y += zmc_text(cr, "Keeps running for notifications when closed or while the screen is off. Uses more battery.",
+		FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 20;
+	if (background_error[0]) y += zmc_text(cr, background_error, FONT_REGULAR, 14,
+		MARGIN, y, zmc.width - 2 * MARGIN) + 20;
+	return y;
+}
+
 /* The hub's second tab: what belongs to the system's own programs. */
 static double draw_apps(cairo_t *cr) {
 	double y = zmc_pivot_next(cr, "applications", "system", ACT_OPEN_PAGE, PAGE_MAIN);
 	char detail[128];
+	y = zmc_entry(cr, y, "apps", "choose apps that run in the background", ACT_OPEN_PAGE, PAGE_INSTALLED_APPS);
 	y = zmc_entry(cr, y, "keyboard", app.haptics ? "vibrate on touch: on" : "vibrate on touch: off",
 		ACT_OPEN_PAGE, PAGE_KEYBOARD);
 
@@ -879,6 +1057,8 @@ static double draw_apps(cairo_t *cr) {
 	snprintf(detail, sizeof(detail), "%s, low power when off: %s", profiles[app.perf_profile],
 		app.perf_deepsleep ? "on" : "off");
 	y = zmc_entry(cr, y, "performance", detail, ACT_OPEN_PAGE, PAGE_PERF);
+	y = zmc_entry(cr, y, "Dynamic Boost System", "RapidBoost and IntelligentBoost: what they do, live",
+		ACT_OPEN_PAGE, PAGE_BOOST);
 
 	y = zmc_entry(cr, y, "developer tests", "demo tiles, slow motion, ZrnDevTest", ACT_OPEN_PAGE, PAGE_DEV);
 
@@ -1056,32 +1236,106 @@ static void wall_kick(void) {
 	}
 }
 
+/* Only the worker touches compressed images and disk. The UI receives a
+ * finished immutable surface through the queue, then uploads it on first draw. */
+struct wall_result {
+	int k;
+	cairo_surface_t *surface;
+};
+static GAsyncQueue *wall_jobs, *wall_results;
+static int wall_pending;
+static cairo_surface_t *wall_atlas[MAX_CATS];
+static unsigned wall_atlas_revision[MAX_CATS];
+
+static gpointer wall_worker(gpointer unused) {
+	(void)unused;
+	for (;;) {
+		int k = GPOINTER_TO_INT(g_async_queue_pop(wall_jobs)) - 1;
+		const char *path = wall_thumb_path[k][0] ? wall_thumb_path[k] : walls[k];
+		struct stat st = {0};
+		stat(path, &st);
+		char *identity = g_strdup_printf("v1:%s:%ld:%ld:%ld:%d:%d", path,
+			(long)st.st_mtime, (long)st.st_mtim.tv_nsec, (long)st.st_size, WALL_PW, WALL_PH);
+		char *key = g_compute_checksum_for_string(G_CHECKSUM_SHA256, identity, -1);
+		char *dir = g_build_filename(g_get_user_cache_dir(), "ztmetro", "wallpaper-thumbs", NULL);
+		char *file = g_strdup_printf("%s/%s.png", dir, key);
+		cairo_surface_t *surface = cairo_image_surface_create_from_png(file);
+		if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS ||
+				cairo_image_surface_get_width(surface) != WALL_PW ||
+				cairo_image_surface_get_height(surface) != WALL_PH) {
+			cairo_surface_destroy(surface);
+			surface = thumb_cover(path, WALL_PW, WALL_PH);
+			if (surface && g_mkdir_with_parents(dir, 0700) == 0) {
+				char *tmp = g_strdup_printf("%s.%ld.tmp", file, (long)getpid());
+				if (cairo_surface_write_to_png(surface, tmp) == CAIRO_STATUS_SUCCESS) rename(tmp, file);
+				unlink(tmp);
+				g_free(tmp);
+			}
+		}
+		struct wall_result *result = g_new(struct wall_result, 1);
+		*result = (struct wall_result){ k, surface };
+		g_async_queue_push(wall_results, result);
+		g_free(identity); g_free(key); g_free(dir); g_free(file);
+	}
+	return NULL;
+}
+
 static void wall_make(int k) {
-	const char *path = wall_thumb_path[k][0] ? wall_thumb_path[k] : walls[k];
-	wall_thumbs[k] = thumb_cover(path, WALL_PW, WALL_PH);
-	wall_state[k] = wall_thumbs[k] ? 2 : 3;
-	wall_arrive[k] = zmc_now_ms();
-	wall_busy_until = wall_arrive[k] + WALL_SWIVEL_IN_MS;
+	if (!wall_jobs) {
+		wall_jobs = g_async_queue_new();
+		wall_results = g_async_queue_new();
+		GThread *thread = g_thread_new("wallpaper-thumbs", wall_worker, NULL);
+		g_thread_unref(thread);
+	}
+	wall_pending++;
+	g_async_queue_push(wall_jobs, GINT_TO_POINTER(k + 1));
 }
 
 /* the frame timer: a couple of photos made, the category sent away when its
  * time is up, and frames while anything is swivelling */
 static void wall_tick(void) {
 	uint32_t now = zmc_now_ms();
-	int made = 0;
-	while (wall_q_head < wall_q_n && made < WALL_PER_TICK) {
+	int made = 0, submitted = 0;
+	while (wall_q_head < wall_q_n && submitted < WALL_PER_TICK) {
 		int k = wall_queue[wall_q_head++];
 		if (wall_state[k] != 1) continue;
+		wall_state[k] = 4; /* decoding on the worker */
 		wall_make(k);
+		submitted++;
+	}
+	struct wall_result *result;
+	while (wall_results && (result = g_async_queue_try_pop(wall_results))) {
+		int k = result->k;
+		wall_thumbs[k] = result->surface;
+		wall_state[k] = result->surface ? 2 : 3;
+		wall_arrive[k] = now;
+		uint32_t until = now + WALL_SWIVEL_IN_MS;
+		/* A fast cache hit must not end the timer before the category's
+		 * delayed, staggered cards have finished coming in. */
+		if (!wall_busy_until || (int32_t)(until - wall_busy_until) > 0) wall_busy_until = until;
+		if (result->surface) {
+			int cat = wall_cat[k], cell = k - cat_first[cat];
+			if (!wall_atlas[cat]) wall_atlas[cat] = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+				3 * WALL_PW, ((cat_count[cat] + 2) / 3) * WALL_PH);
+			cairo_t *cr = cairo_create(wall_atlas[cat]);
+			cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+			cairo_set_source_surface(cr, result->surface, (cell % 3) * WALL_PW, (cell / 3) * WALL_PH);
+			cairo_rectangle(cr, (cell % 3) * WALL_PW, (cell / 3) * WALL_PH, WALL_PW, WALL_PH);
+			cairo_fill(cr);
+			cairo_destroy(cr);
+			wall_atlas_revision[cat]++;
+		}
+		wall_pending--;
 		made++;
+		g_free(result);
 	}
 	if (wall_leave_at && (int32_t)(now - wall_leave_at) >= WALL_LEAVE_MS) {
 		wall_leave_at = 0;
 		zmc_turn(-1);			/* the page turns back to the categories */
 		wall_cat_open = -1;
 	}
-	if (made && wall_cat_open < 0) zmc_redraw();	/* the categories' photos are in their page */
-	bool busy = wall_leave_at || wall_q_head < wall_q_n || (int32_t)(wall_busy_until - now) > 0;
+	if (made && wall_cat_open < 0 && !wall_pending && wall_q_head == wall_q_n) zmc_redraw();	/* the categories' photos are in their page */
+	bool busy = wall_leave_at || wall_pending || wall_q_head < wall_q_n || (int32_t)(wall_busy_until - now) > 0;
 	if (busy) {
 		zmc_present();
 		return;
@@ -1103,7 +1357,7 @@ static cairo_surface_t *wall_thumb(int k) {
 
 /* made now, for the photos a page is about to show, before it turns in */
 static void wall_prefetch(int k) {
-	if (wall_state[k] == 0 || wall_state[k] == 1) wall_make(k);
+	(void)wall_thumb(k);
 }
 
 /* the curves of DevTest's animations (Iris's Exp and Log, weights as there) */
@@ -1116,7 +1370,7 @@ static double wall_ease(double t, bool out) {
 
 /* a photo turned `deg` about its horizontal middle line, drawn on the GPU */
 static void wall_card(cairo_surface_t *img, unsigned rev, double x, double y, double w, double h,
-		double deg, double alpha) {
+		double deg, double alpha, int cell) {
 	double a = deg * M_PI / 180, c[4][3];
 	for (int i = 0; i < 4; i++) {
 		double lx = (i & 1) ? w : 0, ly = (i & 2) ? h : 0;
@@ -1125,7 +1379,9 @@ static void wall_card(cairo_surface_t *img, unsigned rev, double x, double y, do
 		c[i][1] = y + h / 2 + u * cos(a);
 		c[i][2] = u * sin(a);
 	}
-	zmc_gpu_quad(img, rev, c, alpha);
+	if (cell < 0) zmc_gpu_quad(img, rev, c, alpha);
+	else zmc_gpu_quad_region(img, rev, (cell % 3) * WALL_PW, (cell / 3) * WALL_PH,
+		WALL_PW, WALL_PH, c, alpha);
 }
 
 /* the grid's cells and photos, on the GPU over the page. A cell is a grey
@@ -1160,7 +1416,7 @@ static void wall_overlay(int page) {
 		/* the cell: out (0 to 60) or in (-60 to 0) about X, grey */
 		double deg = leaving ? 60 * e : -60 * (1 - e);
 		double alpha = leaving ? 1 - e : e;
-		if (alpha > 0) wall_card(wall_grey, 100000 + i, x, y, tw, th, deg, alpha);
+		if (alpha > 0) wall_card(wall_grey, 1, x, y, tw, th, deg, alpha, -1);
 		/* the photo, over its cell: its own swivel, from when it arrived */
 		if (wall_state[k] != 2) continue;
 		if (leaving) {
@@ -1173,7 +1429,7 @@ static void wall_overlay(int page) {
 			alpha = e;
 		}
 		if (alpha <= 0) continue;
-		wall_card(wall_thumbs[k], k + 1, x, y, tw, th, deg, alpha);
+		wall_card(wall_atlas[c], wall_atlas_revision[c], x, y, tw, th, deg, alpha, k - cat_first[c]);
 		if (!leaving && current[0] && strcmp(current, walls[k]) == 0) {
 			zmc_gpu_rect(x, y, tw, 4, ar, ag, ab);
 			zmc_gpu_rect(x, y + th - 4, tw, 4, ar, ag, ab);
@@ -1181,6 +1437,12 @@ static void wall_overlay(int page) {
 			zmc_gpu_rect(x + tw - 4, y, 4, th, ar, ag, ab);
 		}
 	}
+}
+
+/* what the GPU draws over the page each frame: the wallpaper grid, the boost network */
+static void settings_overlay(int page) {
+	wall_overlay(page);
+	ib_overlay(page);
 }
 
 /* a thumbnail covering a w x h box at (x, y), its image as drawn */
@@ -1394,8 +1656,8 @@ static int brightness_now(void) {
 		}
 	}
 	char a[16], b[16];
-	read_sys_file("/sys/class/backlight/s9p-panel/brightness", a, sizeof(a));
-	read_sys_file("/sys/class/backlight/s9p-panel/max_brightness", b, sizeof(b));
+	read_sys_file(hw_file(hw_backlight(), "brightness"), a, sizeof(a));
+	read_sys_file(hw_file(hw_backlight(), "max_brightness"), b, sizeof(b));
 	int level = atoi(a), max = atoi(b);
 	return a[0] && max > 0 ? (level * 100 + max / 2) / max : -1;
 }
@@ -2014,46 +2276,195 @@ static void typed(const char *text) {
 	}
 }
 
+/* Ringtones are local sound-pack assets, outside the public repository. */
+static char ringtone_files[64][80];
+static int n_ringtones;
+static pid_t ringtone_preview;
+
+static void ringtone_path(char *out, size_t size) {
+	snprintf(out, size, "%s/.config/ztmetro/ringtone", getenv("HOME") ?: "");
+}
+
+static pid_t vibe_preview;
+static void ringtone_stop(void) {
+	vibe_stop(&vibe_preview);
+	if (ringtone_preview > 0) {
+		if (waitpid(ringtone_preview, NULL, WNOHANG) == 0) {
+			kill(ringtone_preview, SIGTERM);
+			waitpid(ringtone_preview, NULL, 0);
+		}
+		ringtone_preview = 0;
+	}
+}
+
+/* The ring vibration is read by ztphone as it is saved, from the same file */
+static char vibe_pattern[40] = VIBE_DEFAULT;
+
+static void ring_preferences(bool save) {
+	int ring = app.vibrate_ring, silent = app.vibrate_silent;
+	if (save) {
+		vibe_config_save(ring, silent, vibe_pattern);
+	} else {
+		vibe_config_load(&ring, &silent, vibe_pattern, sizeof(vibe_pattern));
+		app.vibrate_ring = ring != 0;
+		app.vibrate_silent = silent != 0;
+	}
+}
+
+static const char *ringtone_selected(char *out, size_t size) {
+	char path[512];
+	snprintf(out, size, "Nokia-Tune.wav");
+	ringtone_path(path, sizeof(path));
+	FILE *f = fopen(path, "r");
+	if (f) {
+		if (fgets(out, (int)size, f)) out[strcspn(out, "\r\n")] = 0;
+		fclose(f);
+	}
+	return out;
+}
+
+/* the vibration alone, once through (the notes of a ringtone are felt with it) */
+static void vibe_preview_play(bool with_sound) {
+	char file[80];
+	vibe_stop(&vibe_preview);
+	ringtone_selected(file, sizeof(file));
+	bool match = !strcmp(vibe_pattern, "match");
+	if (with_sound && match) ringtone_stop();
+	vibe_preview = vibe_start(vibe_pattern, file, true);
+	if (with_sound && match) {
+		ringtone_preview = fork();
+		if (ringtone_preview == 0) {
+			char volume[24], path[512];
+			snprintf(volume, sizeof(volume), "%.2f", app.ring_vol / 100.0);
+			snprintf(path, sizeof(path), "/usr/local/share/sounds/ztos/phone/%s", file);
+			execlp("pw-play", "pw-play", "--volume", volume, path, (char *)NULL);
+			_exit(127);
+		}
+	}
+}
+
+static void ringtone_choose(int index) {
+	if (index < 0 || index >= n_ringtones) return;
+	char path[512], tmp[520];
+	ringtone_path(path, sizeof(path));
+	snprintf(tmp, sizeof(tmp), "%s.new", path);
+	FILE *f = fopen(tmp, "w");
+	if (f) {
+		fprintf(f, "%s\n", ringtone_files[index]);
+		fclose(f);
+		rename(tmp, path);
+	}
+	ringtone_stop();
+	vibe_stop(&vibe_preview);
+	ringtone_preview = fork();
+	if (ringtone_preview == 0) {
+		char volume[24];
+		snprintf(volume, sizeof(volume), "%.2f", app.ring_vol / 100.0);
+		snprintf(path, sizeof(path), "/usr/local/share/sounds/ztos/phone/%s", ringtone_files[index]);
+		execlp("pw-play", "pw-play", "--volume", volume, path, (char *)NULL);
+		_exit(127);
+	}
+	/* a pattern that follows the tune is made from the tune just chosen */
+	if (!strcmp(vibe_pattern, "match")) vibe_preview = vibe_start("match", ringtone_files[index], true);
+}
+
+static void ringtones_scan(void) {
+	n_ringtones = 0;
+	struct dirent **files = NULL;
+	int count = scandir("/usr/local/share/sounds/ztos/phone", &files, NULL, alphasort);
+	for (int i = 0; i < count; i++) {
+		const char *name = files[i]->d_name;
+		if (n_ringtones < 64 && (!strncmp(name, "Ring", 4) || !strcmp(name, "Nokia-Tune.wav")) &&
+			strlen(name) < 80 && strstr(name, ".wav"))
+			snprintf(ringtone_files[n_ringtones++], 80, "%s", name);
+		free(files[i]);
+	}
+	free(files);
+}
+
+/* a section of the page: its name in the accent colour, small, above its rows */
+static double audio_section(cairo_t *cr, double y, const char *title) {
+	zmc_accent(cr);
+	zmc_text(cr, title, FONT_SEMILIGHT, 19, MARGIN, y, 0);
+	return y + 34;
+}
+
 static double draw_audio(cairo_t *cr) {
 	double y = zmc_header(cr, "ringtones + sounds");
 
+	y = audio_section(cr, y, "volume");
 	zmc_slider(cr, MARGIN, y, zmc.width - 2 * MARGIN, app.media_vol, "Media + Apps", ACT_MEDIA_VOL_STEP);
 	y += 62;
-
 	zmc_slider(cr, MARGIN, y, zmc.width - 2 * MARGIN, app.ring_vol, "Ringer + Notifications", ACT_RING_VOL_STEP);
-	y += 62;
+	y += 74;
 
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "Vibrate on ring", FONT_SEMILIGHT, 21, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, app.vibrate_ring ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
-	zmc_toggle(cr, zmc.width - MARGIN - 54, y + 4, app.vibrate_ring);
-	zmc_add_hit(0, y - 4, zmc.width, 52, ACT_VIBRATE_RING, 0);
-	y += 66;
+	/* the equalizer and effects live in their own app */
+	y = zmc_entry(cr, y, "equalizer + effects", "presets, surround, crossfade: the Sound app", ACT_OPEN_SOUND, 0);
+	y += 10;
 
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "Vibrate on silent", FONT_SEMILIGHT, 21, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, app.vibrate_silent ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
-	zmc_toggle(cr, zmc.width - MARGIN - 54, y + 4, app.vibrate_silent);
-	zmc_add_hit(0, y - 4, zmc.width, 52, ACT_VIBRATE_SILENT, 0);
-	y += 66;
+	/* the ringtone: one box that opens into the list, not the list itself */
+	y = audio_section(cr, y, "ringtone");
+	ringtones_scan();
+	static char label[64][80];
+	const char *names[64];
+	char selected[80];
+	ringtone_selected(selected, sizeof(selected));
+	int current = 0;
+	for (int i = 0; i < n_ringtones; i++) {
+		snprintf(label[i], 80, "%s", ringtone_files[i]);
+		char *dot = strrchr(label[i], '.');
+		if (dot) *dot = 0;
+		names[i] = label[i];
+		if (!strcmp(selected, ringtone_files[i])) current = i;
+	}
+	if (n_ringtones > 0) {
+		y = picker(cr, y, "Ringtone", names, n_ringtones, current, ACT_RINGTONE);
+	} else {
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, "no ringtones installed", FONT_REGULAR, 14, MARGIN, y, 0);
+		y += 40;
+	}
+	y += 14;
 
+	/* the vibration: when, which pattern, and a way to feel it */
+	y = audio_section(cr, y, "vibration");
+	y = zmc_switch(cr, y, "Vibrate when ringing", app.vibrate_ring, ACT_VIBRATE_RING);
+	y = zmc_switch(cr, y, "Vibrate when silent", app.vibrate_silent, ACT_VIBRATE_SILENT);
+	const char *kinds[VIBE_N_KINDS];
+	char kind_label[VIBE_N_KINDS][64];
+	int kind = vibe_kind_index(vibe_pattern);
+	if (kind < 0) kind = vibe_kind_index(VIBE_DEFAULT);
+	for (int i = 0; i < VIBE_N_KINDS; i++) {
+		snprintf(kind_label[i], 64, "%s", VIBE_KINDS[i].title);
+		kinds[i] = kind_label[i];
+	}
+	y = picker(cr, y, "Pattern", kinds, VIBE_N_KINDS, kind, ACT_VIBE_PATTERN);
+	if (strcmp(vibe_pattern, "off")) {
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, VIBE_KINDS[kind].detail, FONT_REGULAR, 13, MARGIN, y - 6, zmc.width - 2 * MARGIN);
+		zmc_accent(cr);
+		zmc_text(cr, "feel it", FONT_SEMILIGHT, 21, MARGIN, y + 22, 0);
+		zmc_add_hit(0, y + 16, zmc.width, 44, ACT_VIBE_PREVIEW, 0);
+		y += 58;
+	}
+	y += 26;
+
+	y = audio_section(cr, y, "system");
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Sound engine", FONT_REGULAR, 13, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text(cr, "PipeWire 1.6.9 / PulseAudio Server", FONT_REGULAR, 15, MARGIN, y + 20, 0);
 
-	return y + 60;
+	return y + 66;
 }
 
 static double draw_battery(cairo_t *cr) {
 	double y = zmc_header(cr, "battery saver");
 
 	char cap[32], stat[32], volt[32];
-	read_sys_file("/sys/class/power_supply/max170xx_battery/capacity", cap, sizeof(cap));
-	read_sys_file("/sys/class/power_supply/max170xx_battery/status", stat, sizeof(stat));
-	read_sys_file("/sys/class/power_supply/max170xx_battery/voltage_now", volt, sizeof(volt));
+	read_sys_file(hw_file(hw_battery(), "capacity"), cap, sizeof(cap));
+	read_sys_file(hw_file(hw_battery(), "status"), stat, sizeof(stat));
+	read_sys_file(hw_file(hw_battery(), "voltage_now"), volt, sizeof(volt));
 	int pct = cap[0] ? atoi(cap) : 51;
 	double v = volt[0] ? atoi(volt) / 1000000.0 : 3.80;
 
@@ -2175,7 +2586,7 @@ static double draw_gpu(cairo_t *cr) {
 	double y = zmc_header(cr, "graphics");
 
 	char cur_f[32];
-	read_sys_file("/sys/class/devfreq/17500000.gpu/cur_freq", cur_f, sizeof(cur_f));
+	read_sys_file(hw_file(hw_gpu(), "cur_freq"), cur_f, sizeof(cur_f));
 	double mhz = cur_f[0] ? atoi(cur_f) / 1000000.0 : 260.0;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
@@ -2376,6 +2787,10 @@ static double draw_dev(cairo_t *cr) {
 	y = picker(cr, y, "Animation speed", speeds, N_MENU_SPEEDS, app.menu_speed_idx, ACT_DEV_MENU_SPEED);
 	y = zmc_switch(cr, y, "Show touches", app.dev_touches, ACT_DEV_TOUCHES);
 	y = zmc_switch(cr, y, "Lock screen on wake", app.dev_lock, ACT_DEV_LOCK);
+	char demo_flag[256];
+	bool demoloop = access(runtime_file(demo_flag, sizeof(demo_flag), "ztos-demoloop.active"), F_OK) == 0;
+	y = zmc_entry(cr, y, "DemoLoop", demoloop ? "running: tap to stop" : "start the repeating demo", ACT_DEV_DEMOLOOP, 0);
+	y = zmc_entry(cr, y, "Stop DemoLoop", demoloop ? "stop and restore normal policies" : "stop a running demo", ACT_DEV_DEMOLOOP_STOP, 0);
 	y = zmc_entry(cr, y, "ZrnDevTest", "logs, sensors and system state", ACT_DEV_OPEN_TEST, 0);
 	return y + 20;
 }
@@ -2384,12 +2799,38 @@ static double render_page_content(cairo_t *cr, int p) {
 	switch (p) {
 	case PAGE_DATE: return draw_date(cr);
 	case PAGE_PERF: return draw_perf(cr);
+	case PAGE_BOOST: return draw_boost(cr);
 	case PAGE_DEV: return draw_dev(cr);
 	case PAGE_MAIN: return draw_main(cr);
 	case PAGE_APPS: return draw_apps(cr);
+	case PAGE_INSTALLED_APPS: return draw_installed_apps(cr);
+	case PAGE_APP_DETAIL: return draw_app_detail(cr);
 	case PAGE_THEME: return draw_theme(cr);
 	case PAGE_ACCENTS: return draw_accents(cr);
 	case PAGE_WALLS: return draw_wallpapers(cr);
+	case PAGE_NAVIGATION: {
+		static const char *names[] = { "ztMETRO logo", "ZRN text", "Start square", "Four panes", "Circle" };
+		double y = zmc_header(cr, "navigation bar");
+		double gap = 12, w = (zmc.width - 2 * MARGIN - gap) / 2, h = 88;
+		for (int i = 0; i < 5; i++) {
+			double x = MARGIN + (i % 2) * (w + gap), ty = y + (i / 2) * (h + gap);
+			cairo_set_source_rgb(cr, .08, .08, .08); cairo_rectangle(cr, x, ty, w, h); cairo_fill(cr);
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			if (i == 1) zmc_text(cr, "ZRN", FONT_SEMILIGHT, 18, x + w / 2 - 20, ty + 24, 40);
+			else if (i == 2) { cairo_rectangle(cr, x + w / 2 - 9, ty + 23, 18, 18); cairo_fill(cr); }
+			else if (i == 3) { for (int q = 0; q < 4; q++) { cairo_rectangle(cr, x + w / 2 - 10 + (q % 2) * 11, ty + 22 + (q / 2) * 11, 9, 9); cairo_fill(cr); } }
+			else if (i == 4) { cairo_arc(cr, x + w / 2, ty + 32, 9, 0, 2 * M_PI); cairo_fill(cr); }
+			else {
+				cairo_save(cr); cairo_translate(cr, x + w / 2 - 9, ty + 22); cairo_scale(cr, 18.0 / 73.65, 18.0 / 73.65);
+				cairo_move_to(cr, 46.47, 10.87); cairo_line_to(cr, 0, 18.23); cairo_line_to(cr, 0, 65.35); cairo_close_path(cr); cairo_fill(cr);
+				cairo_move_to(cr, 73.65, 68.49); cairo_line_to(cr, 23.23, 61.63); cairo_line_to(cr, 73.64, 0); cairo_close_path(cr); cairo_fill(cr); cairo_restore(cr);
+			}
+			cairo_set_source_rgb(cr, .8, .8, .8); zmc_text(cr, names[i], FONT_REGULAR, 13, x + 6, ty + 58, w - 12);
+			if (app.nav_icon_idx == i) { zmc_set_rgb(cr, ACCENTS[app.accent].color); cairo_set_line_width(cr, 2); cairo_rectangle(cr, x + 1, ty + 1, w - 2, h - 2); cairo_stroke(cr); }
+			zmc_add_hit(x, ty, w, h, ACT_NAV_ICON, i);
+		}
+		return y + 3 * (h + gap);
+	}
 	case PAGE_DISPLAY: return draw_display(cr);
 	case PAGE_WIFI: return draw_wifi(cr);
 	case PAGE_BLUETOOTH: return draw_bluetooth(cr);
@@ -2413,7 +2854,8 @@ static double render_page_content(cairo_t *cr, int p) {
 static bool is_picker(int action) {
 	switch (action) {
 	case ACT_TIMEOUT_CYCLE: case ACT_SCALE_CYCLE: case ACT_NAV_SIZE_CYCLE:
-	case ACT_NETWORK_MODE: case ACT_COMP_ALGO_CYCLE: case ACT_PERF_PROFILE:
+	case ACT_NETWORK_MODE: case ACT_COMP_ALGO_CYCLE: case ACT_PERF_PROFILE: case ACT_IB_MODE: case ACT_IB_ENGINE:
+	case ACT_RINGTONE: case ACT_VIBE_PATTERN:
 	case ACT_TICKLE_BATTERY: case ACT_TICKLE_CHARGING: case ACT_TICKLE_SAVER:
 	case ACT_DEV_MENU_SPEED: case ACT_APN_AUTH: case ACT_DATE_REGION: case ACT_DATE_LANG:
 		return true;
@@ -2438,6 +2880,9 @@ static void activate(int action, int arg) {
 	}
 	switch (action) {
 	case ACT_NONE:
+		break;
+	case ACT_NAV_ICON:
+		if (arg >= 0 && arg <= 4) { app.nav_icon_idx = arg; config_save(); }
 		break;
 	case ACT_APN_FIELD:
 		apn_focus = arg;
@@ -2486,7 +2931,37 @@ static void activate(int action, int arg) {
     case ACT_DATE_SAVE:
         date_focus = -1; zmc_keyboard(false); date_job(true);
         break;
+	case ACT_APP_SELECT:
+		if (arg >= 0 && arg < installed_count) {
+			installed_selected = arg;
+			background_error[0] = 0;
+			bg_reload();
+			zmc_go(PAGE_APP_DETAIL, 1);
+		}
+		break;
+	case ACT_APP_BATCH:
+		zmc_turn(arg);
+		installed_batch += arg * SETTINGS_APPS_BATCH;
+		if (installed_batch < 0) installed_batch = 0;
+		break;
+	case ACT_APP_BACKGROUND:
+		if (installed_selected >= 0 && installed_selected < installed_count) {
+			const char *id = installed_apps[installed_selected].id;
+			bg_reload();
+			bool on = !bg_contains(id);
+			if (!bg_set(id, on)) {
+				int error = errno;
+				bg_reload();
+				snprintf(background_error, sizeof(background_error), "Could not save background apps: %s", strerror(error));
+			} else {
+				background_error[0] = 0;
+				char ctl[768];
+				pipe_tell(runtime_file(ctl, sizeof(ctl), "ztmetro.ctl"), "background\n");
+			}
+		}
+		break;
 	case ACT_OPEN_PAGE:
+		if (arg == PAGE_INSTALLED_APPS) installed_load();
 		if (arg == PAGE_MAIN || arg == PAGE_APPS) {
 			hub_tab = arg;	/* where back returns to from a page under it */
 		}
@@ -2520,7 +2995,7 @@ static void activate(int action, int arg) {
 			for (int i = 0; i < n && i < 6; i++) {	/* their photos come in with them */
 				wall_arrive[cat_first[arg] + i] = wall_open_at + (i % 3) * 60 + (i / 3) * 60;
 			}
-			wall_busy_until = now + WALL_TURN_MS + 240 + 300;	/* the cells' last swivel */
+			wall_busy_until = now + WALL_TURN_MS + 360 + WALL_SWIVEL_IN_MS;	/* the cells' last swivel */
 			wall_kick();
 			zmc_turn(1);
 			wall_cat_open = arg;
@@ -2726,6 +3201,18 @@ static void activate(int action, int arg) {
 		perf_tell(command);
 		break;
 	}
+	case ACT_IB_MODE: {
+		static const char *names[] = { "off", "shadow", "on" };
+		char command[32];
+		snprintf(command, sizeof(command), "ib %s\n", names[arg < 0 || arg > 2 ? 1 : arg]);
+		perf_tell(command);
+		snprintf(ib.mode, sizeof(ib.mode), "%s", names[arg < 0 || arg > 2 ? 1 : arg]);
+		break;
+	}
+	case ACT_IB_ENGINE:
+		perf_tell(arg == 1 ? "ib engine score\n" : "ib engine cpu\n");
+		snprintf(ib.prefer, sizeof(ib.prefer), "%s", arg == 1 ? "score" : "cpu");
+		break;
 	case ACT_PERF_DEEPSLEEP:
 		app.perf_deepsleep = !app.perf_deepsleep;
 		perf_tell(app.perf_deepsleep ? "deepsleep on\n" : "deepsleep off\n");
@@ -2761,6 +3248,17 @@ static void activate(int action, int arg) {
 	case ACT_DEV_LOCK:
 		app.dev_lock = !app.dev_lock;
 		config_save();
+		break;
+	case ACT_DEV_DEMOLOOP: {
+		char demo_flag[256];
+		if (access(runtime_file(demo_flag, sizeof(demo_flag), "ztos-demoloop.active"), F_OK) == 0)
+			system("systemctl --user stop ztos-demoloop.service >/dev/null 2>&1");
+		else
+			system("systemctl --user start ztos-demoloop.service >/dev/null 2>&1");
+		break;
+	}
+	case ACT_DEV_DEMOLOOP_STOP:
+		system("systemctl --user stop ztos-demoloop.service >/dev/null 2>&1");
 		break;
 	case ACT_DEV_OPEN_TEST:
 		if (system("zrndevtest >/dev/null 2>&1 &") != 0) {}
@@ -2821,11 +3319,31 @@ static void activate(int action, int arg) {
 		app.ring_vol = (app.ring_vol >= 100) ? 0 : app.ring_vol + 20;
 		config_save();
 		break;
+	case ACT_RINGTONE:
+		ringtone_choose(arg);
+		break;
+	case ACT_VIBE_PATTERN:
+		if (arg >= 0 && arg < VIBE_N_KINDS) {
+			snprintf(vibe_pattern, sizeof(vibe_pattern), "%s", VIBE_KINDS[arg].id);
+			ring_preferences(true);
+			ringtone_stop();
+			vibe_preview_play(true);
+		}
+		break;
+	case ACT_OPEN_SOUND:
+		if (system("ztsound >/dev/null 2>&1 &") != 0) {}
+		break;
+	case ACT_VIBE_PREVIEW:
+		ringtone_stop();
+		vibe_preview_play(true);
+		break;
 	case ACT_VIBRATE_RING:
 		app.vibrate_ring = !app.vibrate_ring;
+		ring_preferences(true);
 		break;
 	case ACT_VIBRATE_SILENT:
 		app.vibrate_silent = !app.vibrate_silent;
+		ring_preferences(true);
 		break;
 	case ACT_BATTERY_SAVER:
 		app.battery_saver = !app.battery_saver;
@@ -2866,7 +3384,7 @@ static void activate(int action, int arg) {
 		}
 		{
 			char cmd[128];
-			snprintf(cmd, sizeof(cmd), "ztos-auth sh -c 'echo %s > /sys/class/devfreq/17500000.gpu/governor' 2>/dev/null &", app.gpu_gov);
+			snprintf(cmd, sizeof(cmd), "ztos-auth sh -c 'echo %s > %s/governor' 2>/dev/null &", app.gpu_gov, hw_gpu());
 			if (system(cmd) != 0) {}
 		}
 		break;
@@ -3042,6 +3560,8 @@ static bool back(void) {
 	if (zmc.page == PAGE_MAIN || zmc.page == PAGE_APPS) {
 		return false;	/* either tab of the hub: back leaves the app */
 	}
+	if (zmc.page == PAGE_APP_DETAIL) { zmc_go(PAGE_INSTALLED_APPS, -1); return true; }
+	if (zmc.page == PAGE_INSTALLED_APPS) { zmc_go(PAGE_APPS, -1); return true; }
 	zmc_every(0, NULL);	/* the performance page's refresh, if it was running */
 	if (zmc.page == PAGE_WIFI && wifi_menu >= 0) {
 		wifi_menu = -1;	/* back puts the menu away first */
@@ -3086,6 +3606,7 @@ static bool back(void) {
 }
 
 static void arrived(int page) {
+	if (page != PAGE_AUDIO) ringtone_stop();
     if (page == PAGE_DATE) { date_focus = -1; date_job(false); }
 	if (page == PAGE_MAIN || page == PAGE_APPS) {
 		hub_tab = page;	/* swiped to: where back returns to from under it */
@@ -3111,6 +3632,10 @@ static void arrived(int page) {
 	} else if (page == PAGE_PERF) {
 		perf_load();
 		zmc_every(2000, perf_tick);	/* "Tickle now", while this page is open */
+	} else if (page == PAGE_BOOST) {
+		ib.text_at = 0;
+		ib_tick();
+		zmc_every(IB_FRAME_MS, ib_tick);	/* the network moves while this page is open */
 	} else if (page == PAGE_DISPLAY) {
 		display_tick();
 		zmc_every(700, display_tick);
@@ -3134,18 +3659,18 @@ static bool held(int action, int arg) {
 static const struct zmc_app settings = {
 	.app_id = "ztsettings", .title = "Settings", .caps = "SETTINGS",
 	.render = render_page_content, .activate = activate, .slide = slide,
-	.back = back, .arrived = arrived, .text = typed, .hold = held, .overlay = wall_overlay,
+	.back = back, .arrived = arrived, .text = typed, .hold = held, .overlay = settings_overlay,
 };
 
 /* --render PAGE FILE: draw one page into a PNG and leave, touching no display.
  * That is how the look is checked without opening the app on the phone. */
 /* Pages by name: --render PAGE, and `ztsettings PAGE` (Hyperscan opens one). */
 static const struct { const char *name; enum page page; } pages[] = {
-	{ "date", PAGE_DATE }, { "main", PAGE_MAIN }, { "apps", PAGE_APPS }, { "theme", PAGE_THEME }, { "accents", PAGE_ACCENTS }, { "wallpapers", PAGE_WALLS }, { "display", PAGE_DISPLAY },
+	{ "date", PAGE_DATE }, { "main", PAGE_MAIN }, { "apps", PAGE_APPS }, { "installed-apps", PAGE_INSTALLED_APPS }, { "theme", PAGE_THEME }, { "accents", PAGE_ACCENTS }, { "wallpapers", PAGE_WALLS }, { "display", PAGE_DISPLAY },
 	{ "wifi", PAGE_WIFI }, { "bluetooth", PAGE_BLUETOOTH }, { "mobile", PAGE_MOBILE }, { "audio", PAGE_AUDIO },
 	{ "battery", PAGE_BATTERY }, { "cpu", PAGE_CPU }, { "vm", PAGE_VM },
 	{ "gpu", PAGE_GPU }, { "keyboard", PAGE_KEYBOARD }, { "about", PAGE_ABOUT },
-	{ "perf", PAGE_PERF }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET },
+	{ "perf", PAGE_PERF }, { "boost", PAGE_BOOST }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET },
 };
 
 static int page_named(const char *name) {
@@ -3161,8 +3686,11 @@ static int render_to_file(const char *name, const char *path) {
 			if (pages[i].page == PAGE_WIFI) {
 				wifi_load();
 			}
-			/* 664 points: the app area on the phone */
-			return zmc_render_png(&settings, pages[i].page, 664, path);
+			if (pages[i].page == PAGE_INSTALLED_APPS) installed_load();
+			if (pages[i].page == PAGE_BOOST) ib_render_prepare();
+			/* 664 points: the app area on the phone; ZT_RENDER_HEIGHT for a whole long page */
+			int height = getenv("ZT_RENDER_HEIGHT") ? atoi(getenv("ZT_RENDER_HEIGHT")) : 664;
+			return zmc_render_png(&settings, pages[i].page, height > 0 ? height : 664, path);
 		}
 	}
 	fprintf(stderr, "ztsettings: no page called %s\n", name);
@@ -3172,6 +3700,8 @@ static int render_to_file(const char *name, const char *path) {
 int main(int argc, char **argv) {
 	signal(SIGCHLD, SIG_DFL);
 	config_load();
+	ring_preferences(false);
+	atexit(ringtone_stop);
 	if (argc == 4 && strcmp(argv[1], "--render") == 0) {
 		/* ZT_OPEN_PICKER=ACTION draws that list picker open, for reviews */
 		if (getenv("ZT_OPEN_PICKER")) {
@@ -3185,6 +3715,7 @@ int main(int argc, char **argv) {
 	if (argc == 2 && page_named(argv[1]) >= 0) {
 		int page = page_named(argv[1]);
 		if (page == PAGE_WIFI) wifi_load();
+		if (page == PAGE_INSTALLED_APPS) installed_load();
 		return zmc_run(&settings, page);
 	}
 	if (argc > 1) {

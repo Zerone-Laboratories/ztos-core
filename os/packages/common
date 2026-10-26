@@ -11,6 +11,7 @@ wpa_supplicant
 iw
 openssh
 xdg-user-dirs
+desktop-file-utils
 alsa-utils
 brightnessctl
 pipewire
@@ -64,3 +65,16 @@ npm
 firefox
 chromium
 gnome-terminal
+
+# Android apps: Waydroid (the GSI ships its recipe; ztos-waydroid-images fetches
+# and strips the pinned Android 13 image at first boot), with what its scripts use
+waydroid
+lxc
+python-gbinder
+nftables
+dnsmasq
+python-dbus
+python-gobject
+curl
+unzip
+e2fsprogs

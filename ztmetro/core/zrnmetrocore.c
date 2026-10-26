@@ -78,6 +78,7 @@ static void (*timer_tick)(void);
 
 #define rowset zmc_rowset
 static void present(void);
+static bool toplevel_active, toplevel_ever_active;	/* (xdg_toplevel_configure) */
 static double scroll_max(void);
 
 /*
@@ -779,6 +780,14 @@ void zmc_scroll_end(void) {
 
 void zmc_redraw(void) {
 	zmc.cache_stale = true;
+	/* Out of the front, nothing is drawn: no one sees it, and apps that tick
+	 * in the background (Power Management's every second, Settings' pages)
+	 * kept a core busy redrawing for nobody (ztpower 0.7-0.9 of a core,
+	 * 2026-10-26). Coming back to the front commits a fresh buffer anyway
+	 * (xdg_toplevel_configure). An app never yet in front still draws: its
+	 * first buffer maps the window. */
+	if (toplevel_ever_active && !toplevel_active)
+		return;
 	back_forget();
 	if (!zmc.slide_active && !zmc.swiping && !zmc.spring) {
 		pivot_forget();	/* drawn again when idle */
@@ -1288,6 +1297,7 @@ static int present_list(int scale) {
 
 /* A GPU frame samples cached page textures. Cairo only runs when the app
  * changes a page, never to copy, rotate or scale it on each motion frame. */
+static uint32_t gpu_retry_at;
 static void present_gpu(uint32_t ms) {
 	static int frames;
 	if (frames < 3) {
@@ -1313,12 +1323,18 @@ static void present_gpu(uint32_t ms) {
 		if (slider_live >= 0 && zmc.sliding) {
 			draw_slider_live(s);
 		}
+		if (zmc.app->overlay_above_header) {
+			gpu_surface_rect(zmc.cache, 0, 0, zmc.width*s, HEADER_H*s,
+				0, 0, zmc.width, HEADER_H, 1);
+		}
 		if (zmc.app->overlay && !zmc.slide_active && !zmc.swiping && !zmc.spring) {
 			zmc.app->overlay(zmc.page);
 		}
-		/* the title last: an overlay scrolling under it goes under it */
-		gpu_surface_rect(zmc.cache, 0, 0, zmc.width*s, HEADER_H*s,
-			0, 0, zmc.width, HEADER_H, 1);
+		if (!zmc.app->overlay_above_header) {
+			/* the title last: an overlay scrolling under it goes under it */
+			gpu_surface_rect(zmc.cache, 0, 0, zmc.width*s, HEADER_H*s,
+				0, 0, zmc.width, HEADER_H, 1);
+		}
 	}
 	if (zmc.busy && !zmc.anim_active) {
 		uint32_t t = (now_ms() - zmc.busy_since) % 2600;
@@ -1336,7 +1352,8 @@ static void present_gpu(uint32_t ms) {
 	if (!zmg_end()) {
 		wl_callback_destroy(zmc.frame);
 		zmc.frame = NULL;
-		zmc.running = false;
+		zmc.dirty = true;
+		gpu_retry_at = now_ms() + 100;
 	}
 }
 
@@ -1771,7 +1788,7 @@ static void touch_down(void *data, struct wl_touch *touch, uint32_t serial, uint
 	for (int i = 0; i < zmc.n_hits && !zmc.moved; i++) {
 		struct zmc_hit *h = &zmc.hits[i];
 		if (h->slider && zmc.down_x >= h->x - MARGIN && zmc.down_x < h->x + h->w + MARGIN &&
-				cy >= h->y && cy < h->y + h->h) {
+				cy >= h->y - 12 && cy < h->y + h->h + 16) {
 			zmc.sliding = true;
 			zmc.slider = *h;
 			zmc.last_y = zmc.down_x;
@@ -2155,6 +2172,7 @@ static void xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel
 		settle_when_configured = true;
 	if (active) toplevel_ever_active = true;
 	toplevel_active = active;
+	zmc.active = active;	/* apps pause what they hold when they lose the front */
 	if (width > 0 && height > 0) {
 		configure_resized |= zmc.width != width || zmc.height != height;
 		zmc.width = width;
@@ -2556,13 +2574,18 @@ static void round_glyph(cairo_t *cr, const char *g) {
 	}
 }
 
-void zmc_gpu_quad(cairo_surface_t *source, unsigned revision, const double c[4][3], double alpha) {
+void zmc_gpu_quad_region(cairo_surface_t *source, unsigned revision, double x, double y,
+		double w, double h, const double c[4][3], double alpha) {
 	struct zmg_vertex q[4];
 	for (int i = 0; i < 4; i++) {
 		q[i] = (struct zmg_vertex){ (float)c[i][0], (float)c[i][1], (float)c[i][2] };
 	}
-	zmg_surface(source, revision, 0, 0, cairo_image_surface_get_width(source),
-		cairo_image_surface_get_height(source), q, (float)alpha);
+	zmg_surface(source, revision, x, y, x + w, y + h, q, (float)alpha);
+}
+
+void zmc_gpu_quad(cairo_surface_t *source, unsigned revision, const double c[4][3], double alpha) {
+	zmc_gpu_quad_region(source, revision, 0, 0, cairo_image_surface_get_width(source),
+		cairo_image_surface_get_height(source), c, alpha);
 }
 
 void *zmc_gpu_dmabuf_import(int w, int h, uint32_t fourcc, uint64_t modifier, int planes,
@@ -2971,6 +2994,11 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 		}
 		/* a finger resting on something: a hold, when it has rested long enough */
 		int wait = pivot_wants_prepare() || back_wants_prepare() ? 150 : -1;
+		if (gpu_retry_at) {
+			int32_t left = (int32_t)(gpu_retry_at - now_ms());
+			if (left < 0) left = 0;
+			if (wait < 0 || left < wait) wait = left;
+		}
 		if (zmc.entrance && zmc.anim_active && !zmc.frame) {
 			int32_t left = (int32_t)(zmc.anim_start - now_ms());
 			if (left > 0 && (wait < 0 || left < wait)) {
@@ -2996,6 +3024,12 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 		}
 		/* idle for a moment with a pivot in front: draw both tabs ahead */
 		int ready = poll(fds, n, wait);
+		if (gpu_retry_at && (int32_t)(now_ms() - gpu_retry_at) >= 0) {
+			wl_display_cancel_read(zmc.display);
+			gpu_retry_at = 0;
+			present();
+			continue;
+		}
 		if (ready == 0 && zmc.entrance && zmc.anim_active && !zmc.frame &&
 				(int32_t)(now_ms() - zmc.anim_start) >= 0) {
 			wl_display_cancel_read(zmc.display);
