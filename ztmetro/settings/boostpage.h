@@ -27,6 +27,8 @@
 #define IB_OUT		5
 #define IB_FRAME_MS	33	/* the pulses, on the GPU, while the page is open */
 #define IB_TEXT_MS	2000	/* the page's numbers: at most this often */
+#define IB_NET_MS	1000	/* the network's picture: at most this often (samples come 4 a second) */
+#define IB_FAINT	0.06f	/* a connection weaker than this (of the strongest) is not drawn */
 
 static const char *const ib_rungs[IB_OUT] = { "idle0", "nominal", "interactive", "big", "rapid" };
 static const char *const ib_inputs[IB_IN] = {
@@ -56,6 +58,7 @@ static struct {
 	double x0, x1, x2, yi[IB_IN], yh[IB_HID_MAX], yo[IB_OUT];	/* from the network's top */
 	int top1[12], t1, top2[8], t2, win;	/* the pulses' paths */
 	uint32_t text_at;		/* when the page's numbers were last drawn */
+	uint32_t net_at;		/* when the network's picture was last drawn */
 	/* the model's weights, read once (again if the file changes) */
 	float w1[IB_IN * IB_HID_MAX], w2[IB_HID_MAX * IB_OUT];
 	int m_hid;
@@ -189,17 +192,13 @@ static void ib_rgba(cairo_t *cr, uint32_t rgb, double a) {
 /* a neuron: a dark disc, filled with the accent as far as it fires, a halo when it does */
 static void ib_neuron(cairo_t *cr, double x, double y, double r, double level, bool lit) {
 	level = level < 0 ? 0 : level > 1 ? 1 : level;
-	if (level > 0.02) {
-		cairo_pattern_t *g = cairo_pattern_create_radial(x, y, r * 0.6, x, y, r * (2.2 + 1.2 * level));
-		double a = 0.45 * level;
-		cairo_pattern_add_color_stop_rgba(g, 0, ((zmc.accent >> 16) & 255) / 255.0,
-			((zmc.accent >> 8) & 255) / 255.0, (zmc.accent & 255) / 255.0, a);
-		cairo_pattern_add_color_stop_rgba(g, 1, ((zmc.accent >> 16) & 255) / 255.0,
-			((zmc.accent >> 8) & 255) / 255.0, (zmc.accent & 255) / 255.0, 0);
-		cairo_set_source(cr, g);
+	if (level > 0.02) {	/* the halo: two flat discs (a gradient per neuron cost too much) */
+		ib_rgba(cr, zmc.accent, 0.12 * level);
 		cairo_arc(cr, x, y, r * (2.2 + 1.2 * level), 0, 2 * M_PI);
 		cairo_fill(cr);
-		cairo_pattern_destroy(g);
+		ib_rgba(cr, zmc.accent, 0.2 * level);
+		cairo_arc(cr, x, y, r * 1.5, 0, 2 * M_PI);
+		cairo_fill(cr);
 	}
 	cairo_set_source_rgb(cr, 0.13, 0.13, 0.13);
 	cairo_arc(cr, x, y, r, 0, 2 * M_PI);
@@ -323,6 +322,7 @@ static void ib_network(cairo_t *cr) {
 	for (int i = 0; i < IB_IN; i++)
 		for (int j = 0; j < n; j++) {
 			float v = f1[i * n + j] / m1;
+			if (fabsf(v) < IB_FAINT) continue;
 			ib_rgba(cr, v >= 0 ? zmc.accent : IB_NEGATIVE, 0.05 + 0.6 * fabsf(v));
 			cairo_set_line_width(cr, 0.5 + 1.6 * fabsf(v));
 			cairo_move_to(cr, x0, ib.yi[i]);
@@ -332,6 +332,7 @@ static void ib_network(cairo_t *cr) {
 	for (int j = 0; j < n; j++)
 		for (int k = 0; k < IB_OUT; k++) {
 			float v = f2[j * IB_OUT + k] / m2;
+			if (fabsf(v) < IB_FAINT) continue;
 			ib_rgba(cr, v >= 0 ? zmc.accent : IB_NEGATIVE, 0.05 + 0.6 * fabsf(v));
 			cairo_set_line_width(cr, 0.5 + 1.8 * fabsf(v));
 			cairo_move_to(cr, x1, ib.yh[j]);
@@ -391,7 +392,9 @@ static void ib_overlay(int page) {
 		ib.net = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, sw, sh);
 		ib.net_dirty = true;
 	}
-	if (ib.net_dirty) {
+	uint32_t now = zmc_now_ms();
+	if (ib.net_dirty && (now - ib.net_at >= IB_NET_MS || !ib.net_rev)) {
+		ib.net_at = now;
 		cairo_t *cr = cairo_create(ib.net);
 		cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
 		cairo_paint(cr);
